@@ -119,12 +119,4 @@ npm.cmd run dev
 - run 恢复、超时重试与 orphan task 回收
 - 独立工作区生成与端到端实测
 
-## GitHub 上传说明
 
-仓库默认忽略以下运行期产物：
-
-- `backend/workspace/runs/`
-- `APP/` 下的生成项目目录
-- 本地环境、缓存和日志文件
-
-这样可以保证推送到 GitHub 的内容以源码、文档和配置为主，不会把测试 run 和生成项目一并上传。
