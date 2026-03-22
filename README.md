@@ -389,26 +389,4 @@ npm run build
 
 ---
 
-## 12. 上传到 GitHub / 发布 v2 注意事项
 
-仓库建议只提交源码、配置模板和文档，不提交运行期产物。
-
-通常不应提交：
-
-- `backend/workspace/runs/`
-- `APP/` 下的生成项目
-- 虚拟环境目录
-- 本地日志和缓存
-
-建议在发版前确认：
-
-- `README.md` 为当前版本
-- `backend/.env.example` 与真实读取逻辑一致
-- 前后端能在新机器上按本文档步骤启动
-
----
-
-## 13. 当前版本一句话说明
-
-当前版本已经是一个**真实多 Agent、run 级调度、白盒可观测、支持 continue 的 Coding 系统**，并且长期记忆已收敛到 mem0 主导的 `preference / episode / failure_fix` 三类模型。
->>>>>>> Stashed changes
