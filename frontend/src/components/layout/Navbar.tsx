@@ -1,6 +1,15 @@
 "use client";
 
-import { Activity, FileStack, Play, Sparkles, Square, Trash2 } from "lucide-react";
+import {
+  Activity,
+  Brain,
+  FilePlus2,
+  FileStack,
+  Play,
+  Sparkles,
+  Square,
+  Trash2
+} from "lucide-react";
 
 import { useAppStore } from "@/lib/store";
 
@@ -11,11 +20,16 @@ export function Navbar() {
     tasks,
     appError,
     appNotice,
+    isStreaming,
+    ragModeBusy,
+    ragModeEnabled,
+    prepareNewRun,
     refreshCurrentRun,
     cancelCurrentRun,
     resumeCurrentRun,
     clearAllRuns,
-    clearAllSessions
+    clearAllSessions,
+    toggleRagMode
   } = useAppStore();
 
   const completedTasks = tasks.filter((task) => task.status === "completed").length;
@@ -43,6 +57,24 @@ export function Navbar() {
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
+          <button
+            className="flex items-center gap-2 rounded-full border border-[var(--color-line)] bg-white/60 px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={ragModeBusy}
+            onClick={() => void toggleRagMode()}
+            type="button"
+          >
+            <Brain size={16} />
+            {ragModeBusy ? "Updating RAG..." : ragModeEnabled ? "RAG On" : "RAG Off"}
+          </button>
+          <button
+            className="flex items-center gap-2 rounded-full border border-[var(--color-line)] bg-white/60 px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={isStreaming}
+            onClick={prepareNewRun}
+            type="button"
+          >
+            <FilePlus2 size={16} />
+            New Session
+          </button>
           <button
             className="flex items-center gap-2 rounded-full border border-[var(--color-line)] bg-white/60 px-4 py-2 text-sm"
             onClick={() => void refreshCurrentRun()}

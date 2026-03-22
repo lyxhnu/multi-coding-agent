@@ -17,6 +17,8 @@ backend/storage/memory_index/*
 !backend/storage/memory_index/.gitkeep
 backend/storage/knowledge/*
 !backend/storage/knowledge/.gitkeep
+backend/memory/MEM0_AUDIT.ndjson
+backend/memory/cards/
 backend/workspace/runs/
 APP/*
 !APP/README.md

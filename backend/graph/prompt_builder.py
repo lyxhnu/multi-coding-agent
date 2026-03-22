@@ -32,11 +32,11 @@ def build_system_prompt(base_dir: Path, rag_mode: bool) -> str:
     parts: list[str] = []
 
     for label, relative_path in SYSTEM_COMPONENTS:
-        if rag_mode and relative_path == "memory/MEMORY.md":
+        if relative_path == "memory/MEMORY.md":
             parts.append(
                 "<!-- Long-term Memory -->\n"
-                "长期记忆将通过检索动态注入。你应优先使用当次检索到的 MEMORY 片段，"
-                "不要假设未检索到的记忆仍然有效。"
+                "长期记忆主要通过 mem0 检索动态注入。"
+                "不要把 MEMORY.md 当作默认长期记忆上下文；只有当前检索到的长期记忆才应视为有效。"
             )
             continue
 

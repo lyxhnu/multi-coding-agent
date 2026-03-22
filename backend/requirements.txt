@@ -9,6 +9,7 @@ langchain>=1.0.0,<2.0.0
 langgraph>=1.0.0,<2.0.0
 langchain-openai>=1.0.0,<2.0.0
 langchain-deepseek>=1.0.0,<2.0.0
+mem0ai>=1.0.0,<2.0.0
 llama-index-core>=0.12.0,<0.13.0
 llama-index-embeddings-openai>=0.3.0,<0.4.0
 pdfplumber>=0.11.0,<1.0.0

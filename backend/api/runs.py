@@ -18,6 +18,11 @@ class CreateRunRequest(BaseModel):
     stream: bool = True
 
 
+class ContinueRunRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    stream: bool = True
+
+
 class SpawnAgentRequest(BaseModel):
     run_id: str
     role: str
@@ -57,6 +62,26 @@ async def create_run(payload: CreateRunRequest):
             session_id=payload.session_id,
         )
         return JSONResponse(run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/continue")
+async def continue_run(run_id: str, payload: ContinueRunRequest):
+    if not payload.stream:
+        raise HTTPException(status_code=400, detail="Continue run currently requires stream=true.")
+
+    try:
+        async def event_generator():
+            async for event in multi_agent_orchestrator.astream_followup_run(
+                run_id=run_id,
+                user_request=payload.message,
+            ):
+                event_type = str(event.get("type", "message"))
+                data = {key: value for key, value in event.items() if key != "type"}
+                yield _sse(event_type, data)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

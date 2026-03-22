@@ -51,7 +51,11 @@ class ProgressTracker:
         raise KeyError(f"Unknown task: {task_id}")
 
     def summarize(self, task_board: dict[str, Any]) -> dict[str, Any]:
-        tasks = task_board.get("tasks", [])
+        tasks = [
+            task
+            for task in task_board.get("tasks", [])
+            if task.get("status") != "superseded"
+        ]
         total = len(tasks)
         if total == 0:
             return {"progress": 0, "status_counts": {}}
@@ -59,7 +63,7 @@ class ProgressTracker:
         status_counts: dict[str, int] = {}
         total_progress = 0
         for task in tasks:
-            status = str(task.get("status", "pending"))
+            status = str(task.get("status", "queued"))
             status_counts[status] = status_counts.get(status, 0) + 1
             total_progress += int(task.get("progress", 0) or 0)
 

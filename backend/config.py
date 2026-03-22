@@ -66,9 +66,15 @@ class Settings:
     embedding_model: str
     embedding_api_key: str | None
     embedding_base_url: str
+    mem0_provider: str
+    mem0_api_key: str | None
+    mem0_org_id: str | None
+    mem0_project_id: str | None
+    mem0_app_id: str
+    mem0_user_id: str
     component_char_limit: int = 20_000
     terminal_timeout_seconds: int = 120
-    multi_agent_task_timeout_seconds: int = 600
+    multi_agent_task_timeout_seconds: int = 1000000
 
 
 def _load_env_file() -> Path:
@@ -172,6 +178,15 @@ def _resolve_embedding_base_url(provider: str) -> str:
     )
 
 
+def _resolve_mem0_provider() -> str:
+    explicit = (_first_env("MEM0_PROVIDER") or "").strip().lower()
+    if explicit in {"platform", "oss"}:
+        return explicit
+    if _first_env("MEM0_API_KEY"):
+        return "platform"
+    return "oss"
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     backend_dir = _load_env_file()
@@ -199,6 +214,12 @@ def get_settings() -> Settings:
         embedding_model=_resolve_embedding_model(embedding_provider),
         embedding_api_key=_resolve_embedding_api_key(embedding_provider),
         embedding_base_url=_resolve_embedding_base_url(embedding_provider),
+        mem0_provider=_resolve_mem0_provider(),
+        mem0_api_key=_first_env("MEM0_API_KEY"),
+        mem0_org_id=_first_env("MEM0_ORG_ID"),
+        mem0_project_id=_first_env("MEM0_PROJECT_ID"),
+        mem0_app_id=_first_env("MEM0_APP_ID") or "multi-coding-agent",
+        mem0_user_id=_first_env("MEM0_USER_ID") or "local-user",
         component_char_limit=_positive_int_env("COMPONENT_CHAR_LIMIT", default=20_000),
         terminal_timeout_seconds=_positive_int_env("TERMINAL_TIMEOUT_SECONDS", default=120),
         multi_agent_task_timeout_seconds=_positive_int_env(

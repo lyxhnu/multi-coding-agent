@@ -226,6 +226,17 @@ export async function clearSessions() {
   });
 }
 
+export async function getRagMode() {
+  return request<{ enabled: boolean }>("/config/rag-mode");
+}
+
+export async function setRagMode(enabled: boolean) {
+  return request<{ enabled: boolean }>("/config/rag-mode", {
+    method: "PUT",
+    body: JSON.stringify({ enabled })
+  });
+}
+
 export async function listSkills() {
   return request<Array<{ name: string; description: string; path: string }>>("/skills");
 }
@@ -277,6 +288,88 @@ export async function streamRun(
 
   if (!response.ok || !response.body) {
     throw new Error(`Run request failed: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const flushBlock = (block: string) => {
+    const lines = block.split("\n");
+    let event = "message";
+    const dataLines: string[] = [];
+
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trim());
+      }
+    }
+
+    if (!dataLines.length) {
+      return;
+    }
+
+    const data = JSON.parse(dataLines.join("\n")) as Record<string, unknown>;
+    handlers.onEvent(event, data);
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      flushBlock(buffer.slice(0, boundary));
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+    }
+
+    if (done) {
+      if (buffer.trim()) {
+        flushBlock(buffer);
+      }
+      break;
+    }
+  }
+}
+
+export async function streamRunFollowup(
+  runId: string,
+  payload: {
+    message: string;
+  },
+  handlers: StreamHandlers
+) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), STREAM_CONNECT_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(`${getApiBase()}/runs/${runId}/continue`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        ...payload,
+        stream: true
+      }),
+      signal: controller.signal
+    });
+  } catch (error) {
+    throw toNetworkError(
+      error,
+      "Follow-up request timed out. Check whether the backend runs API is reachable."
+    );
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Follow-up request failed: ${response.status}`);
   }
 
   const reader = response.body.getReader();

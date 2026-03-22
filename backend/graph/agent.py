@@ -13,8 +13,8 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
     ChatDeepSeek = None
 
 from config import get_settings, runtime_config
-from graph.memory_indexer import memory_indexer
 from graph.prompt_builder import build_system_prompt
+from graph.semantic_memory import semantic_memory
 from graph.session_manager import SessionManager
 from tools import get_all_tools
 
@@ -106,7 +106,7 @@ class AgentManager:
         rag_mode = runtime_config.get_rag_mode()
         augmented_history = list(history)
         if rag_mode:
-            retrievals = memory_indexer.retrieve(message, top_k=3)
+            retrievals = await semantic_memory.aretrieve(message, top_k=3)
             yield {"type": "retrieval", "query": message, "results": retrievals}
             if retrievals:
                 augmented_history.append(

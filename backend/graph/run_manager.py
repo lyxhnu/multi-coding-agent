@@ -43,6 +43,7 @@ class RunPaths:
     run_json: Path
     agents_json: Path
     task_board_json: Path
+    conversation_ndjson: Path
     messages_ndjson: Path
     events_ndjson: Path
     project_config_yaml: Path
@@ -60,6 +61,10 @@ class RunPaths:
     worktrees_dir: Path
     histories_dir: Path
     logs_dir: Path
+    summaries_dir: Path
+    summaries_history_dir: Path
+    conversation_summary_json: Path
+    phase_current_json: Path
 
 
 class RunManager:
@@ -120,6 +125,7 @@ class RunManager:
             run_json=root / "run.json",
             agents_json=root / "agents.json",
             task_board_json=root / "task-board.json",
+            conversation_ndjson=root / "conversation.ndjson",
             messages_ndjson=root / "messages.ndjson",
             events_ndjson=root / "events.ndjson",
             project_config_yaml=root / "project-config.yaml",
@@ -137,6 +143,10 @@ class RunManager:
             worktrees_dir=root / "worktrees",
             histories_dir=root / "histories",
             logs_dir=root / "logs",
+            summaries_dir=root / "summaries",
+            summaries_history_dir=root / "summaries" / "history",
+            conversation_summary_json=root / "summaries" / "conversation.json",
+            phase_current_json=root / "summaries" / "phase-current.json",
         )
 
     def _agent_fs_key(self, agent_id: str) -> str:
@@ -152,6 +162,8 @@ class RunManager:
             paths.worktrees_dir,
             paths.histories_dir,
             paths.logs_dir,
+            paths.summaries_dir,
+            paths.summaries_history_dir,
             paths.snapshots_index_json.parent,
         ):
             folder.mkdir(parents=True, exist_ok=True)
@@ -274,6 +286,7 @@ class RunManager:
             paths.task_board_json,
             json.dumps(task_board, ensure_ascii=False, indent=2),
         )
+        _atomic_write(paths.conversation_ndjson, "")
         _atomic_write(
             paths.agents_json,
             json.dumps(agents, ensure_ascii=False, indent=2),
@@ -308,6 +321,44 @@ class RunManager:
         _atomic_write(
             paths.shared_memory_md,
             "# Shared Memory\n\nPending shared notes.\n",
+        )
+        _atomic_write(
+            paths.conversation_summary_json,
+            json.dumps(
+                {
+                    "summary_type": "conversation_summary",
+                    "version": 1,
+                    "updated_at": _utc_ts(),
+                    "covers_messages_up_to": 1,
+                    "user_goal": user_request,
+                    "constraints": [],
+                    "archived_completed_work": [],
+                    "key_decisions": [],
+                    "user_clarifications": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        _atomic_write(
+            paths.phase_current_json,
+            json.dumps(
+                {
+                    "summary_type": "phase_summary",
+                    "phase": "startup",
+                    "version": 1,
+                    "updated_at": _utc_ts(),
+                    "status": "queued",
+                    "completed_tasks": [],
+                    "in_progress_tasks": [],
+                    "blocked_tasks": [],
+                    "failed_tasks": [],
+                    "files_changed": [],
+                    "phase_decisions": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
         )
         _atomic_write(
             paths.agent_status_json,
@@ -387,7 +438,15 @@ class RunManager:
         return payload
 
     def load_task_board(self, run_id: str) -> dict[str, Any]:
-        return json.loads(self._paths(run_id).task_board_json.read_text(encoding="utf-8"))
+        payload = json.loads(self._paths(run_id).task_board_json.read_text(encoding="utf-8"))
+        changed = False
+        for task in payload.get("tasks", []):
+            if task.get("status") == "pending":
+                task["status"] = "queued"
+                changed = True
+        if changed:
+            self.save_task_board(run_id, payload)
+        return payload
 
     def save_task_board(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         payload["updated_at"] = _utc_ts()
@@ -409,6 +468,43 @@ class RunManager:
             with self._paths(run_id).messages_ndjson.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         return normalized
+
+    def append_conversation_message(
+        self,
+        run_id: str,
+        role: str,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        followup_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "id": f"conv-{uuid.uuid4().hex[:12]}",
+            "role": role,
+            "content": content,
+            "timestamp": _utc_ts(),
+            "metadata": metadata or {},
+        }
+        if followup_meta:
+            payload["followup_meta"] = followup_meta
+        with self._lock:
+            with self._paths(run_id).conversation_ndjson.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return payload
+
+    def read_conversation(self, run_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        path = self._paths(run_id).conversation_ndjson
+        if not path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return rows[-limit:]
 
     def append_event(
         self,
@@ -483,6 +579,125 @@ class RunManager:
             except json.JSONDecodeError:
                 continue
         return rows[-limit:]
+
+    def _read_json_file(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def write_conversation_summary(
+        self,
+        run_id: str,
+        agent_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        paths = self._paths(run_id)
+        current = self.read_conversation_summary(run_id)
+        previous_version = int(current.get("version", 0) or 0)
+        next_version = previous_version + 1 if previous_version else int(payload.get("version", 1) or 1)
+        normalized = {
+            **payload,
+            "summary_type": "conversation_summary",
+            "version": next_version,
+            "updated_at": _utc_ts(),
+        }
+        if current:
+            history_path = (
+                f"backend/workspace/runs/{run_id}/summaries/history/"
+                f"conversation-v{previous_version}.json"
+            )
+            self.write_project_text(
+                run_id,
+                agent_id,
+                history_path,
+                json.dumps(current, ensure_ascii=False, indent=2) + "\n",
+            )
+        entry = self.write_project_text(
+            run_id,
+            agent_id,
+            f"backend/workspace/runs/{run_id}/summaries/conversation.json",
+            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
+        )
+        self.append_event(
+            run_id,
+            "summary_updated",
+            {
+                "agent_id": agent_id,
+                "summary_type": "conversation_summary",
+                "path": entry["path"],
+                "version": entry["version"],
+                "snapshot_id": entry["snapshot_id"],
+                "summary": "Conversation summary refreshed.",
+            },
+        )
+        return entry
+
+    def read_conversation_summary(self, run_id: str) -> dict[str, Any]:
+        return self._read_json_file(self._paths(run_id).conversation_summary_json)
+
+    def read_phase_summary(self, run_id: str, phase: str | None = None) -> dict[str, Any]:
+        current = self._read_json_file(self._paths(run_id).phase_current_json)
+        if not phase or not current:
+            return current
+        if str(current.get("phase", "")) == phase:
+            return current
+        history_dir = self._paths(run_id).summaries_history_dir
+        candidates = sorted(history_dir.glob(f"phase-{phase}-v*.json"))
+        if not candidates:
+            return {}
+        return self._read_json_file(candidates[-1])
+
+    def write_phase_summary(
+        self,
+        run_id: str,
+        phase: str,
+        agent_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        current = self.read_phase_summary(run_id)
+        previous_version = int(current.get("version", 0) or 0)
+        next_version = previous_version + 1 if previous_version else int(payload.get("version", 1) or 1)
+        normalized = {
+            **payload,
+            "summary_type": "phase_summary",
+            "phase": phase,
+            "version": next_version,
+            "updated_at": _utc_ts(),
+        }
+        if current:
+            history_path = (
+                f"backend/workspace/runs/{run_id}/summaries/history/"
+                f"phase-{str(current.get('phase', phase))}-v{previous_version}.json"
+            )
+            self.write_project_text(
+                run_id,
+                agent_id,
+                history_path,
+                json.dumps(current, ensure_ascii=False, indent=2) + "\n",
+            )
+        entry = self.write_project_text(
+            run_id,
+            agent_id,
+            f"backend/workspace/runs/{run_id}/summaries/phase-current.json",
+            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
+        )
+        self.append_event(
+            run_id,
+            "summary_updated",
+            {
+                "agent_id": agent_id,
+                "summary_type": "phase_summary",
+                "phase": phase,
+                "path": entry["path"],
+                "version": entry["version"],
+                "snapshot_id": entry["snapshot_id"],
+                "summary": f"Phase summary refreshed for {phase}.",
+            },
+        )
+        return entry
 
     def write_project_text(
         self,

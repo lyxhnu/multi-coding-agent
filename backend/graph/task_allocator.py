@@ -36,7 +36,7 @@ class TaskAllocator:
             phase="startup",
             priority="high",
             request=request,
-            timeout_seconds=240,
+            timeout_seconds=600,
         )
         architecture = self._task(
             role="CA",
@@ -45,7 +45,7 @@ class TaskAllocator:
             phase="design",
             priority="high",
             request=request,
-            timeout_seconds=420,
+            timeout_seconds=900,
             target_paths=[
                 f"backend/workspace/runs/{run_id}/architecture.md",
                 f"backend/workspace/runs/{run_id}/shared-memory.md",
@@ -59,7 +59,7 @@ class TaskAllocator:
             phase="testing",
             priority="medium",
             request=request,
-            timeout_seconds=420,
+            timeout_seconds=1200,
             target_paths=explicit_paths,
         )
         qa = self._task(
@@ -69,7 +69,7 @@ class TaskAllocator:
             phase="testing",
             priority="high",
             request=request,
-            timeout_seconds=420,
+            timeout_seconds=1200,
             target_paths=explicit_paths,
         )
         delivery = self._task(
@@ -82,7 +82,7 @@ class TaskAllocator:
             phase="delivery",
             priority="high",
             request=request,
-            timeout_seconds=240,
+            timeout_seconds=900,
             target_paths=explicit_paths,
         )
 
@@ -118,6 +118,195 @@ class TaskAllocator:
             },
             "tasks": tasks,
         }
+
+    def create_followup_tasks(
+        self,
+        run_id: str,
+        request: str,
+    ) -> list[dict[str, Any]]:
+        return self.create_delta_tasks(run_id, request)
+
+    def create_delta_tasks(
+        self,
+        run_id: str,
+        request: str,
+    ) -> list[dict[str, Any]]:
+        profile = self._classify_request(request)
+        explicit_paths = self._extract_explicit_paths(request)
+        tasks = self._implementation_tasks(profile, request, explicit_paths)
+
+        needs_devops = self._looks_like_devops_request(request, explicit_paths)
+        if needs_devops or not tasks:
+            tasks.append(
+                self._task(
+                    role="DE",
+                    title=self._followup_devops_title(profile),
+                    description=self._devops_description(profile),
+                    phase="development",
+                    priority="high" if needs_devops else "medium",
+                    request=request,
+                    timeout_seconds=1200,
+                    target_paths=explicit_paths,
+                )
+            )
+
+        qa = self._task(
+            role="QT",
+            title=self._followup_qa_title(profile),
+            description=self._qa_description(profile),
+            phase="testing",
+            priority="high",
+            request=request,
+            timeout_seconds=1200,
+            target_paths=explicit_paths,
+        )
+        delivery = self._task(
+            role="PC",
+            title="Summarize the follow-up delivery result",
+            description=(
+                "Summarize the incremental work completed for the latest user follow-up,"
+                " including what changed, how it was verified, and any residual risks."
+            ),
+            phase="delivery",
+            priority="high",
+            request=request,
+            timeout_seconds=900,
+            target_paths=explicit_paths,
+        )
+
+        for task in tasks:
+            task["dependencies"] = []
+        implementation_dependency_ids = [task["task_id"] for task in tasks]
+        qa["dependencies"] = implementation_dependency_ids[:]
+        delivery["dependencies"] = [qa["task_id"]]
+        return [*tasks, qa, delivery]
+
+    def build_retry_task(self, original_task: dict[str, Any], now_iso: str) -> dict[str, Any]:
+        retry_count = int(original_task.get("retry_count", 0) or 0) + 1
+        retry_task_id = f"{original_task['task_id']}-retry-{retry_count}"
+        return {
+            "task_id": retry_task_id,
+            "owner_role": original_task.get("owner_role", ""),
+            "assigned_to": original_task.get("owner_role", ""),
+            "title": original_task.get("title", "Retry unfinished task"),
+            "description": original_task.get("description", ""),
+            "phase": original_task.get("phase", "development"),
+            "priority": "high",
+            "status": "queued",
+            "progress": 0,
+            "request": original_task.get("request", ""),
+            "attempts": 0,
+            "max_attempts": int(original_task.get("max_attempts", 3) or 3),
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "timeout_seconds": original_task.get("timeout_seconds"),
+            "dependencies": list(original_task.get("dependencies", [])),
+            "next_steps": [],
+            "verify_command": "",
+            "latest_summary": "",
+            "latest_error": "",
+            "blocked_reason": "",
+            "assigned_agent_id": None,
+            "target_paths": list(original_task.get("target_paths", [])),
+            "acceptance_criteria": list(original_task.get("acceptance_criteria", [])),
+            "retry_of": original_task["task_id"],
+            "retry_count": retry_count,
+            "retry_context": {
+                "previous_status": original_task.get("status", ""),
+                "previous_error": original_task.get("blocked_reason", "") or original_task.get("latest_error", ""),
+                "previous_result_ref": original_task.get("result_ref", ""),
+            },
+            "created_by": "PC",
+        }
+
+    def prioritize_resumable(
+        self,
+        failed_tasks: list[dict[str, Any]],
+        blocked_tasks: list[dict[str, Any]],
+        queued_tasks: list[dict[str, Any]],
+        task_status_lookup: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+
+        for task in sorted(failed_tasks, key=self._task_updated_sort_key, reverse=True):
+            candidates.append(
+                {
+                    "task": task,
+                    "resume_type": "retry",
+                    "priority": 1,
+                    "reason": f"failed task: {task.get('blocked_reason', '') or task.get('latest_error', '')}".strip(),
+                }
+            )
+
+        for task in blocked_tasks:
+            dependencies = list(task.get("dependencies", []))
+            if all(task_status_lookup.get(dep) == "completed" for dep in dependencies):
+                candidates.append(
+                    {
+                        "task": task,
+                        "resume_type": "unblock",
+                        "priority": 2,
+                        "reason": "blocked task dependencies are satisfied",
+                    }
+                )
+
+        for task in queued_tasks:
+            dependencies = list(task.get("dependencies", []))
+            if all(task_status_lookup.get(dep) == "completed" for dep in dependencies):
+                candidates.append(
+                    {
+                        "task": task,
+                        "resume_type": "start",
+                        "priority": 3,
+                        "reason": "queued task dependencies are satisfied",
+                    }
+                )
+
+        candidates.sort(
+            key=lambda item: (
+                int(item["priority"]),
+                -self._task_updated_sort_key(item["task"]),
+            )
+        )
+        return candidates
+
+    def _looks_like_devops_request(self, request: str, explicit_paths: list[str]) -> bool:
+        lowered = request.lower()
+        if any(path.startswith("backend/") and path.endswith((".yml", ".yaml", ".json", ".toml", ".env", ".ps1", ".sh")) for path in explicit_paths):
+            return True
+        devops_terms = (
+            "deploy",
+            "deployment",
+            "docker",
+            "compose",
+            "build",
+            "script",
+            "env",
+            "environment",
+            "ci",
+            "cd",
+            "pipeline",
+            "vercel",
+            "nginx",
+            "kubernetes",
+            "infra",
+            "运维",
+            "部署",
+            "环境",
+            "脚本",
+            "构建",
+        )
+        return any(term in lowered or term in request for term in devops_terms)
+
+    def _task_updated_sort_key(self, task: dict[str, Any]) -> float:
+        raw = str(task.get("updated_at", "") or "")
+        if not raw:
+            return 0.0
+        try:
+            stamp = time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return 0.0
+        return time.mktime(stamp)
 
     def _extract_explicit_paths(self, request: str) -> list[str]:
         matches = re.findall(
@@ -279,6 +468,15 @@ class TaskAllocator:
             return "Design the backend architecture and service contracts"
         return "Design the system architecture and shared contracts"
 
+    def _followup_architecture_title(self, profile: RequestProfile) -> str:
+        if profile.kind == "frontend_game":
+            return "Plan the gameplay follow-up changes and update implementation order"
+        if profile.kind == "frontend_only":
+            return "Plan the frontend follow-up changes and update contracts"
+        if profile.kind == "backend_only":
+            return "Plan the backend follow-up changes and update service contracts"
+        return "Plan the follow-up changes and update shared contracts"
+
     def _architecture_description(self, profile: RequestProfile) -> str:
         focus = " ".join(profile.focus_notes)
         if profile.kind == "frontend_game":
@@ -305,6 +503,32 @@ class TaskAllocator:
             f"{focus}".strip()
         )
 
+    def _followup_architecture_description(self, profile: RequestProfile) -> str:
+        focus = " ".join(profile.focus_notes)
+        if profile.kind == "frontend_game":
+            return (
+                "Interpret the latest follow-up request, update the gameplay architecture or state model"
+                " if needed, and leave concise implementation notes for the next coding pass. "
+                f"{focus}".strip()
+            )
+        if profile.kind == "frontend_only":
+            return (
+                "Interpret the latest follow-up request, update the relevant route or component contracts,"
+                " and leave concise implementation notes for the next coding pass. "
+                f"{focus}".strip()
+            )
+        if profile.kind == "backend_only":
+            return (
+                "Interpret the latest follow-up request, update APIs or runtime contracts if needed,"
+                " and leave concise implementation notes for the next coding pass. "
+                f"{focus}".strip()
+            )
+        return (
+            "Interpret the latest follow-up request, update shared contracts where needed, and leave"
+            " concise implementation notes for the next coding pass. "
+            f"{focus}".strip()
+        )
+
     def _implementation_tasks(
         self,
         profile: RequestProfile,
@@ -324,7 +548,7 @@ class TaskAllocator:
                         phase="development",
                         priority="high",
                         request=request,
-                        timeout_seconds=600,
+                        timeout_seconds=1200,
                         target_paths=backend_targets,
                     )
                 )
@@ -343,7 +567,7 @@ class TaskAllocator:
                         phase="development",
                         priority="high",
                         request=request,
-                        timeout_seconds=600,
+                        timeout_seconds=1200,
                         target_paths=frontend_targets,
                     ),
                     self._task(
@@ -357,7 +581,7 @@ class TaskAllocator:
                         phase="development",
                         priority="high",
                         request=request,
-                        timeout_seconds=600,
+                        timeout_seconds=1200,
                         target_paths=frontend_targets,
                     ),
                 ]
@@ -371,7 +595,7 @@ class TaskAllocator:
                     phase="development",
                     priority="high",
                     request=request,
-                    timeout_seconds=600,
+                    timeout_seconds=1200,
                     target_paths=frontend_targets,
                 )
             )
@@ -451,6 +675,15 @@ class TaskAllocator:
             return "Verify backend runtime commands and environment assumptions"
         return "Prepare verification and runtime execution notes"
 
+    def _followup_devops_title(self, profile: RequestProfile) -> str:
+        if profile.kind == "frontend_game":
+            return "Verify follow-up gameplay route wiring and runtime notes"
+        if profile.kind == "frontend_only":
+            return "Verify follow-up frontend wiring and runtime notes"
+        if profile.kind == "backend_only":
+            return "Verify follow-up backend runtime commands and assumptions"
+        return "Prepare verification notes for the follow-up changes"
+
     def _devops_description(self, profile: RequestProfile) -> str:
         focus = " ".join(profile.focus_notes)
         if profile.kind == "frontend_game":
@@ -486,6 +719,15 @@ class TaskAllocator:
             return "Validate the delivered backend feature"
         return "Validate the delivered implementation"
 
+    def _followup_qa_title(self, profile: RequestProfile) -> str:
+        if profile.kind == "frontend_game":
+            return "Validate the follow-up gameplay changes"
+        if profile.kind == "frontend_only":
+            return "Validate the follow-up frontend changes"
+        if profile.kind == "backend_only":
+            return "Validate the follow-up backend changes"
+        return "Validate the follow-up implementation changes"
+
     def _qa_description(self, profile: RequestProfile) -> str:
         focus = " ".join(profile.focus_notes)
         if profile.kind == "frontend_game":
@@ -520,7 +762,7 @@ class TaskAllocator:
             "description": description,
             "phase": phase,
             "priority": priority,
-            "status": "pending",
+            "status": "queued",
             "progress": 0,
             "request": request,
             "attempts": 0,
@@ -551,7 +793,7 @@ class TaskAllocator:
         for task in tasks:
             if task.get("task_id") in active_task_ids:
                 continue
-            if task.get("status") not in {"pending", "queued"}:
+            if task.get("status") != "queued":
                 continue
             dependencies = task.get("dependencies", [])
             if all(by_id.get(dep, {}).get("status") == "completed" for dep in dependencies):

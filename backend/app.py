@@ -14,8 +14,9 @@ from api.sessions import router as sessions_router
 from api.tokens import router as tokens_router
 from config import get_settings
 from graph.agent import agent_manager
-from graph.memory_indexer import memory_indexer
 from graph.orchestrator import multi_agent_orchestrator
+from graph.semantic_memory import semantic_memory
+from memory.card_store import card_store
 from tools.skills_scanner import refresh_snapshot
 
 
@@ -24,11 +25,15 @@ async def lifespan(_: FastAPI):
     settings = get_settings()
     refresh_snapshot(settings.backend_dir)
     agent_manager.initialize(settings.backend_dir)
-    memory_indexer.configure(settings.backend_dir)
-    memory_indexer.rebuild_index()
+    semantic_memory.configure(settings.backend_dir)
+    semantic_memory.rebuild_local_index()
+    card_store.initialize(settings.backend_dir)
     multi_agent_orchestrator.initialize(settings.backend_dir, settings.project_root)
     await multi_agent_orchestrator.recover_incomplete_runs()
-    yield
+    try:
+        yield
+    finally:
+        await semantic_memory.aclose()
 
 
 app = FastAPI(

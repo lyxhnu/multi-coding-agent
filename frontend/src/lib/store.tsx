@@ -15,6 +15,7 @@ import {
   clearRuns as clearRunsApi,
   clearSessions as clearSessionsApi,
   getAgentHistory,
+  getRagMode,
   getRun,
   getRunEvents,
   getRunFiles,
@@ -23,7 +24,9 @@ import {
   loadFile,
   resumeRun,
   saveFile,
+  setRagMode,
   streamRun,
+  streamRunFollowup,
   type AgentHistoryEntry,
   type AgentRecord,
   type RunDetails,
@@ -42,6 +45,8 @@ type AppStore = {
   selectedAgentId: string | null;
   selectedAgentHistory: AgentHistoryEntry[];
   isStreaming: boolean;
+  ragModeEnabled: boolean;
+  ragModeBusy: boolean;
   appError: string | null;
   appNotice: string | null;
   inspectorError: string | null;
@@ -53,12 +58,16 @@ type AppStore = {
   inspectorDirty: boolean;
   sidebarWidth: number;
   inspectorWidth: number;
+  submitPrompt: (value: string) => Promise<void>;
   startRun: (value: string) => Promise<void>;
+  startNewRun: (value: string) => Promise<void>;
+  prepareNewRun: () => void;
   selectRun: (runId: string) => Promise<void>;
   cancelCurrentRun: () => Promise<void>;
   resumeCurrentRun: () => Promise<void>;
   clearAllRuns: () => Promise<void>;
   clearAllSessions: () => Promise<void>;
+  toggleRagMode: () => Promise<void>;
   selectAgent: (agentId: string | null) => Promise<void>;
   loadInspectorFile: (path: string) => Promise<void>;
   updateInspectorContent: (value: string) => void;
@@ -110,6 +119,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [selectedAgentHistory, setSelectedAgentHistory] = useState<AgentHistoryEntry[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [ragModeEnabled, setRagModeEnabled] = useState(false);
+  const [ragModeBusy, setRagModeBusy] = useState(false);
   const [appError, setAppError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
   const [inspectorError, setInspectorError] = useState<string | null>(null);
@@ -202,6 +213,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setRuns(await listRuns());
   }
 
+  async function refreshRagMode() {
+    const response = await getRagMode();
+    setRagModeEnabled(Boolean(response.enabled));
+  }
+
   async function refreshCurrentRun() {
     if (!currentRunId) {
       return;
@@ -280,11 +296,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
     appendEvent(eventRecord);
 
-    if (eventType === "run_created" || eventType === "run_started" || eventType === "run_complete" || eventType === "run_blocked" || eventType === "run_cancelled") {
+    if (
+      eventType === "run_created" ||
+      eventType === "run_started" ||
+      eventType === "run_complete" ||
+      eventType === "run_blocked" ||
+      eventType === "run_cancelled" ||
+      eventType === "followup_started" ||
+      eventType === "followup_planned" ||
+      eventType === "user_message" ||
+      eventType === "assistant_message"
+    ) {
       upsertRun({
         run_id: runId,
         session_id: null,
-        status: String(data.status ?? "queued"),
+        status: String(data.status ?? currentRunRef.current?.status ?? "queued"),
         phase: String(data.phase ?? currentRunRef.current?.phase ?? "startup"),
         request: currentRunRef.current?.request ?? "",
         created_at: currentRunRef.current?.created_at ?? Date.now() / 1000,
@@ -329,7 +355,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function startRun(value: string) {
+  async function launchNewRun(value: string) {
     if (!value.trim() || isStreaming) {
       return;
     }
@@ -372,6 +398,65 @@ export function AppProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsStreaming(false);
     }
+  }
+
+  async function continueCurrentRun(value: string) {
+    const runId = currentRunIdRef.current;
+    if (!value.trim() || isStreaming || !runId) {
+      return;
+    }
+
+    setIsStreaming(true);
+    setAppError(null);
+    setAppNotice(null);
+
+    try {
+      await streamRunFollowup(
+        runId,
+        { message: value.trim() },
+        {
+          onEvent(event, data) {
+            patchFromEvent(event, data);
+          }
+        }
+      );
+      await refreshRuns();
+      await selectRun(runId);
+      setAppError(null);
+    } catch (error) {
+      setAppError(toErrorMessage(error, "Unable to continue the current run."));
+    } finally {
+      setIsStreaming(false);
+    }
+  }
+
+  async function submitPrompt(value: string) {
+    if (currentRunIdRef.current) {
+      await continueCurrentRun(value);
+      return;
+    }
+    await launchNewRun(value);
+  }
+
+  function prepareNewRun() {
+    if (isStreaming) {
+      return;
+    }
+    setCurrentRunId(null);
+    currentRunIdRef.current = null;
+    setCurrentRun(null);
+    currentRunRef.current = null;
+    setAgents([]);
+    agentsRef.current = [];
+    setTasks([]);
+    tasksRef.current = [];
+    setEvents([]);
+    eventsRef.current = [];
+    setRunFiles([]);
+    setSelectedAgentId(null);
+    setSelectedAgentHistory([]);
+    setAppError(null);
+    setAppNotice("Ready to start a fresh run.");
   }
 
   async function cancelCurrentRun() {
@@ -447,6 +532,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  async function toggleRagMode() {
+    if (ragModeBusy) {
+      return;
+    }
+
+    setRagModeBusy(true);
+    try {
+      const response = await setRagMode(!ragModeEnabled);
+      const enabled = Boolean(response.enabled);
+      setRagModeEnabled(enabled);
+      setAppError(null);
+      setAppNotice(`RAG mode ${enabled ? "enabled" : "disabled"}.`);
+    } catch (error) {
+      setAppError(toErrorMessage(error, "Unable to update RAG mode."));
+    } finally {
+      setRagModeBusy(false);
+    }
+  }
+
   async function loadInspectorFile(path: string) {
     setInspectorPath(path);
     setInspectorError(null);
@@ -497,6 +601,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setSkills(initialSkills);
         setInspectorPath(initialFile.path);
         setInspectorContent(initialFile.content);
+        try {
+          await refreshRagMode();
+        } catch {
+          setRagModeEnabled(false);
+        }
         if (initialRuns.length) {
           await selectRun(initialRuns[0].run_id);
         }
@@ -573,6 +682,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     selectedAgentId,
     selectedAgentHistory,
     isStreaming,
+    ragModeEnabled,
+    ragModeBusy,
     appError,
     appNotice,
     inspectorError,
@@ -584,12 +695,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     inspectorDirty,
     sidebarWidth,
     inspectorWidth,
-    startRun,
+    submitPrompt,
+    startRun: launchNewRun,
+    startNewRun: launchNewRun,
+    prepareNewRun,
     selectRun,
     cancelCurrentRun,
     resumeCurrentRun,
     clearAllRuns,
     clearAllSessions,
+    toggleRagMode,
     selectAgent,
     loadInspectorFile,
     updateInspectorContent,

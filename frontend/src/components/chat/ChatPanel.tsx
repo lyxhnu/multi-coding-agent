@@ -46,8 +46,16 @@ function compactTimeline(events: RunEvent[]): TimelineEvent[] {
 }
 
 export function ChatPanel() {
-  const { currentRun, events, selectedAgentId, selectedAgentHistory, startRun, isStreaming } =
-    useAppStore();
+  const {
+    currentRun,
+    events,
+    selectedAgentId,
+    selectedAgentHistory,
+    prepareNewRun,
+    submitPrompt,
+    startNewRun,
+    isStreaming
+  } = useAppStore();
   const endRef = useRef<HTMLDivElement | null>(null);
   const timelineEvents = useMemo(() => compactTimeline(events), [events]);
 
@@ -114,7 +122,13 @@ export function ChatPanel() {
         </div>
       </div>
 
-      <ChatInput disabled={isStreaming} onSend={startRun} />
+      <ChatInput
+        disabled={isStreaming}
+        hasActiveRun={Boolean(currentRun)}
+        onPrepareNewRun={prepareNewRun}
+        onNewRun={startNewRun}
+        onSend={submitPrompt}
+      />
     </section>
   );
 }
