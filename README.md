@@ -269,3 +269,4 @@ python harness.py --profile reasoning "What is the escape velocity of Mars?"
 - 清晰的模块边界
 - 可扩展的 profile 机制
 - 更适合真实任务执行的工程化结构
+  感谢https://github.com/lazyFrogLOL/Harness_Engineering提供的原型，本文在此基础进行修改
