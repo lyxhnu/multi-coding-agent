@@ -1,0 +1,71 @@
+node_modules/
+dist/
+.artifacts/
+*.log
+.DS_Store
+*.tsbuildinfo
+# packages/*/node_modules/
+packages/*/dist/
+packages/*/dist-chrome/
+packages/*/dist-firefox/
+packages/ai/src/providers/data/
+packages/ai/src/providers/.model-generation-*/
+*.cpuprofile
+
+# Environment
+.env
+
+# Editor files
+.vscode/
+.zed/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# Package specific
+.npm/
+coverage/
+.nyc_output/
+.pi_config/
+tui-debug.log
+compaction-results/
+.opencode/
+syntax.jsonl
+out.jsonl
+pi-*.html
+out.html
+packages/coding-agent/binaries/
+todo.md
+plans/
+.pi/hf-sessions/
+.pi/hf-sessions-backup/
+collect.sh
+
+# Evaluation rig (eval/): large local-only assets, generated results, and secrets.
+# The rig's own code is intentionally NOT ignored.
+eval/.venv/
+eval/assets/
+eval/local_tasks/
+eval/jobs/
+eval/run-records/
+eval/.env
+eval/**/__pycache__/
+
+# Local sessions, test evidence, caches and generated output.
+.test-results/
+artifacts/
+output/
+tmp/
+__pycache__/
+**/__pycache__/
+.blocked_cmds.jsonl
+
+# Reversible delivery artifacts are distributed out of band.
+PROJECT_SNAPSHOT.md
+pi-eval-supplement.tar.gz
+pi-eval-supplement.manifest.json
+
+# Harbor runtime tarball built from this tree by scripts/build-harbor-runtime.sh
+.harbor/
