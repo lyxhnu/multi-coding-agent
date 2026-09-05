@@ -1,4 +1,5 @@
 import type {
+	ContextBudget,
 	ImageContent,
 	Message,
 	Model,
@@ -7,7 +8,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { type PreparedAgentRequest, prepareAgentRequest, runAgentLoop, runAgentLoopPrepared } from "./agent-loop.ts";
 import { AppendOnlyContextManager } from "./append-only-context.ts";
 import { reduceAgentRunState } from "./run-state.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
@@ -27,6 +28,7 @@ import type {
 	BeforeToolCallResult,
 	GuardToolCallContext,
 	PrepareNextTurnContext,
+	QueuedAgentMessage,
 	QueueMode,
 	ShouldStopAfterTurnContext,
 	StreamFn,
@@ -34,6 +36,21 @@ import type {
 } from "./types.ts";
 
 export type { QueueMode } from "./types.ts";
+
+/** Opaque summary of an exact first provider request prepared by an Agent. */
+export interface PreparedContinuation {
+	readonly preparationId: string;
+	readonly baseContextFingerprint: string;
+	readonly requestFingerprint: string;
+	readonly budget: ContextBudget;
+	readonly queueRevision: string;
+	readonly reservedQueueItemIds: readonly string[];
+}
+
+export interface PrepareContinuationOptions {
+	signal?: AbortSignal;
+	requiredQueueItemIds?: readonly string[];
+}
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
@@ -94,6 +111,7 @@ export interface AgentOptions {
 	getContextBudgetOptions?: AgentLoopConfig["getContextBudgetOptions"];
 	initialState?: Partial<Omit<AgentState, "runState">>;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+	projectUsageContext?: AgentLoopConfig["projectUsageContext"];
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	streamFn: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
@@ -132,38 +150,67 @@ export interface AgentOptions {
 }
 
 class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
+	private items: Array<{ item: QueuedAgentMessage; reservationId?: string }> = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
 		this.mode = mode;
 	}
 
-	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
+	enqueue(item: QueuedAgentMessage): void {
+		this.items.push({ item });
 	}
 
 	hasItems(): boolean {
-		return this.messages.length > 0;
+		return this.items.some((entry) => entry.reservationId === undefined);
 	}
 
-	drain(): AgentMessage[] {
-		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
-			return drained;
-		}
+	drainItems(): QueuedAgentMessage[] {
+		const selected = this.availableItems();
+		const selectedIds = new Set(selected.map((item) => item.queueItemId));
+		this.items = this.items.filter((entry) => !selectedIds.has(entry.item.queueItemId));
+		return selected;
+	}
 
-		const first = this.messages[0];
-		if (!first) {
-			return [];
+	availableItems(): QueuedAgentMessage[] {
+		const available = this.items.filter((entry) => entry.reservationId === undefined).map((entry) => entry.item);
+		return this.mode === "all" ? available : available.slice(0, 1);
+	}
+
+	allItems(): QueuedAgentMessage[] {
+		return this.items.map((entry) => entry.item);
+	}
+
+	hasItem(queueItemId: string): boolean {
+		return this.items.some((entry) => entry.item.queueItemId === queueItemId);
+	}
+
+	reserve(queueItemIds: readonly string[], reservationId: string): void {
+		for (const queueItemId of queueItemIds) {
+			const entry = this.items.find((candidate) => candidate.item.queueItemId === queueItemId);
+			if (!entry || entry.reservationId !== undefined) {
+				throw new Error(`Queue item cannot be reserved: ${queueItemId}`);
+			}
+			entry.reservationId = reservationId;
 		}
-		this.messages = this.messages.slice(1);
-		return [first];
+	}
+
+	consumeReservation(reservationId: string): void {
+		this.items = this.items.filter((entry) => entry.reservationId !== reservationId);
+	}
+
+	releaseReservation(reservationId: string): void {
+		for (const entry of this.items) {
+			if (entry.reservationId === reservationId) entry.reservationId = undefined;
+		}
 	}
 
 	clear(): void {
-		this.messages = [];
+		this.items = this.items.filter((entry) => entry.reservationId !== undefined);
+	}
+
+	removeItems(queueItemIds: ReadonlySet<string>): void {
+		this.items = this.items.filter((entry) => !queueItemIds.has(entry.item.queueItemId));
 	}
 }
 
@@ -171,6 +218,16 @@ type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+};
+
+type PreparedContinuationRecord = {
+	key: string;
+	handle: PreparedContinuation;
+	baseContext: AgentContext;
+	config: AgentLoopConfig;
+	request: PreparedAgentRequest;
+	injectedItems: QueuedAgentMessage[];
+	state: "prepared" | "dispatching";
 };
 
 /**
@@ -187,6 +244,7 @@ export class Agent {
 	private readonly followUpQueue: PendingMessageQueue;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+	public projectUsageContext?: AgentLoopConfig["projectUsageContext"];
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	public streamFunction: StreamFn;
 	public getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
@@ -222,6 +280,9 @@ export class Agent {
 	public readonly appendOnlyContext?: AppendOnlyContextManager;
 	private activeRun?: ActiveRun;
 	private nextRunId = 1;
+	private nextPreparationId = 1;
+	private preparedContinuation?: PreparedContinuationRecord;
+	private preparationInFlight?: { key: string; promise: Promise<PreparedContinuation> };
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -238,6 +299,7 @@ export class Agent {
 		const runtimeOptions: Partial<AgentOptions> = options ?? {};
 		this._state = createMutableAgentState(runtimeOptions.initialState);
 		this.convertToLlm = runtimeOptions.convertToLlm ?? defaultConvertToLlm;
+		this.projectUsageContext = runtimeOptions.projectUsageContext;
 		this.transformContext = runtimeOptions.transformContext;
 		this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn();
 		this.getApiKey = runtimeOptions.getApiKey;
@@ -303,13 +365,15 @@ export class Agent {
 	}
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
-		this.steeringQueue.enqueue(message);
+	steer(item: QueuedAgentMessage): void {
+		this.assertUniqueQueueItemId(item.queueItemId);
+		this.steeringQueue.enqueue(item);
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
-		this.followUpQueue.enqueue(message);
+	followUp(item: QueuedAgentMessage): void {
+		this.assertUniqueQueueItemId(item.queueItemId);
+		this.followUpQueue.enqueue(item);
 	}
 
 	/** Remove all queued steering messages. */
@@ -326,6 +390,13 @@ export class Agent {
 	clearAllQueues(): void {
 		this.clearSteeringQueue();
 		this.clearFollowUpQueue();
+	}
+
+	/** Remove specific queued messages, including items held by a preparation reservation. */
+	discardQueuedItems(queueItemIds: readonly string[]): void {
+		const ids = new Set(queueItemIds);
+		this.steeringQueue.removeItems(ids);
+		this.followUpQueue.removeItems(ids);
 	}
 
 	/** Returns true when either queue still contains pending messages. */
@@ -383,29 +454,203 @@ export class Agent {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
-
-		const lastMessage = this._state.messages[this._state.messages.length - 1];
-		if (!lastMessage) {
-			throw new Error("No messages to continue from");
-		}
-
-		if (lastMessage.role === "assistant") {
-			const queuedSteering = this.steeringQueue.drain();
-			if (queuedSteering.length > 0) {
-				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
-				return;
-			}
-
-			const queuedFollowUps = this.followUpQueue.drain();
-			if (queuedFollowUps.length > 0) {
-				await this.runPromptMessages(queuedFollowUps);
-				return;
-			}
-
+		if (this._state.messages.length === 0) throw new Error("No messages to continue from");
+		const lastMessage = this._state.messages.at(-1);
+		if (lastMessage?.role === "assistant" && !this.hasQueuedMessages()) {
 			throw new Error("Cannot continue from message role: assistant");
 		}
 
-		await this.runContinuation();
+		const preparation = await this.prepareContinuation(this._state.messages);
+		await this.dispatchPreparedContinuation(preparation);
+	}
+
+	/** Prepare and freeze the first provider request for a future continuation. */
+	async prepareContinuation(
+		candidateMessages: AgentMessage[],
+		options: PrepareContinuationOptions = {},
+	): Promise<PreparedContinuation> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before preparing a continuation.");
+		}
+		const baseContext: AgentContext = {
+			systemPrompt: this._state.systemPrompt,
+			messages: candidateMessages.slice(),
+			tools: this._state.tools.slice(),
+		};
+		const key = fingerprintValue({
+			baseContextFingerprint: fingerprintAgentContext(baseContext),
+			model: {
+				provider: this._state.model.provider,
+				id: this._state.model.id,
+				api: this._state.model.api,
+				baseUrl: this._state.model.baseUrl,
+				contextWindow: this._state.model.contextWindow,
+				maxTokens: this._state.model.maxTokens,
+			},
+			thinkingLevel: this._state.thinkingLevel,
+			queueRevision: this.queueRevision(),
+			requiredQueueItemIds: options.requiredQueueItemIds ?? null,
+		});
+		if (this.preparedContinuation) {
+			if (this.preparedContinuation.key === key) return this.preparedContinuation.handle;
+			throw new Error("Agent already has an unsettled prepared continuation from a different source");
+		}
+		if (this.preparationInFlight) {
+			if (this.preparationInFlight.key === key) return await this.preparationInFlight.promise;
+			throw new Error("Agent is preparing a continuation from a different source");
+		}
+
+		const promise = this.createPreparedContinuation(key, baseContext, options);
+		this.preparationInFlight = { key, promise };
+		try {
+			return await promise;
+		} finally {
+			if (this.preparationInFlight?.promise === promise) this.preparationInFlight = undefined;
+		}
+	}
+
+	private async createPreparedContinuation(
+		key: string,
+		baseContext: AgentContext,
+		options: PrepareContinuationOptions,
+	): Promise<PreparedContinuation> {
+		const preparationId = `preparation-${this.nextPreparationId++}`;
+		const selectedQueueItems = this.selectQueueItems(baseContext.messages, options.requiredQueueItemIds);
+		const selectedIds = selectedQueueItems.map((item) => item.queueItemId);
+		this.reserveQueueItems(selectedIds, preparationId);
+		const requestContext: AgentContext = {
+			...baseContext,
+			messages: [...baseContext.messages, ...selectedQueueItems.map((item) => item.message)],
+		};
+		const config = this.createLoopConfig();
+		let request: PreparedAgentRequest;
+		try {
+			request = { ...(await prepareAgentRequest(requestContext, config, options.signal)), preparationId };
+		} catch (error) {
+			this.releaseQueueReservation(preparationId);
+			throw error;
+		}
+		const handle: PreparedContinuation = Object.freeze({
+			preparationId,
+			baseContextFingerprint: fingerprintAgentContext(baseContext),
+			requestFingerprint: request.requestFingerprint,
+			budget: request.budget,
+			queueRevision: this.queueRevision(),
+			reservedQueueItemIds: Object.freeze(selectedIds.slice()),
+		});
+		this.preparedContinuation = {
+			key,
+			handle,
+			baseContext,
+			config,
+			request,
+			injectedItems: selectedQueueItems,
+			state: "prepared",
+		};
+		return handle;
+	}
+
+	/** Dispatch a previously prepared continuation exactly once. */
+	async dispatchPreparedContinuation(preparation: PreparedContinuation): Promise<void> {
+		const record = this.preparedContinuation;
+		if (!record || record.handle.preparationId !== preparation.preparationId) {
+			throw new Error("Prepared continuation is unknown or already settled");
+		}
+		if (record.state !== "prepared") {
+			throw new Error("Prepared continuation is already dispatching");
+		}
+		record.state = "dispatching";
+		this.consumeQueueReservation(record.handle.preparationId);
+		this._state.messages = record.baseContext.messages;
+		if (record.request.appendOnlyContext && this.appendOnlyContext) {
+			this.appendOnlyContext.replaceWith(record.request.appendOnlyContext);
+		}
+
+		try {
+			await this.runWithLifecycle(async (signal) => {
+				await runAgentLoopPrepared(
+					record.baseContext,
+					record.injectedItems,
+					record.request,
+					record.config,
+					(event) => this.processEvents(event),
+					signal,
+					this.streamFunction,
+				);
+			});
+		} finally {
+			this.preparedContinuation = undefined;
+		}
+	}
+
+	/** Release a prepared continuation without mutating transcript or append-only state. */
+	releasePreparedContinuation(preparation: PreparedContinuation): void {
+		const record = this.preparedContinuation;
+		if (!record || record.handle.preparationId !== preparation.preparationId) {
+			throw new Error("Prepared continuation is unknown or already settled");
+		}
+		if (record.state !== "prepared") {
+			throw new Error("Cannot release a continuation after dispatch started");
+		}
+		this.releaseQueueReservation(record.handle.preparationId);
+		this.preparedContinuation = undefined;
+	}
+
+	private selectQueueItems(
+		candidateMessages: AgentMessage[],
+		requiredQueueItemIds?: readonly string[],
+	): QueuedAgentMessage[] {
+		if (requiredQueueItemIds) {
+			if (requiredQueueItemIds.length === 0) return [];
+			const steeringItems = this.steeringQueue.allItems();
+			const followUpItems = this.followUpQueue.allItems();
+			const firstId = requiredQueueItemIds[0];
+			const sourceItems = steeringItems.some((item) => item.queueItemId === firstId) ? steeringItems : followUpItems;
+			const expectedPrefix = sourceItems.slice(0, requiredQueueItemIds.length);
+			if (expectedPrefix.length !== requiredQueueItemIds.length) {
+				throw new Error("Required queue item is missing or already delivered");
+			}
+			if (expectedPrefix.some((item, index) => item.queueItemId !== requiredQueueItemIds[index])) {
+				throw new Error("Required queue item order does not match the pending delivery order");
+			}
+			return expectedPrefix;
+		}
+
+		const lastMessage = candidateMessages[candidateMessages.length - 1];
+		if (!lastMessage) return [];
+		const steering = this.steeringQueue.availableItems();
+		if (steering.length > 0) return steering;
+		return lastMessage.role === "assistant" ? this.followUpQueue.availableItems() : [];
+	}
+
+	private reserveQueueItems(queueItemIds: readonly string[], reservationId: string): void {
+		const steeringIds = queueItemIds.filter((queueItemId) => this.steeringQueue.hasItem(queueItemId));
+		const followUpIds = queueItemIds.filter((queueItemId) => this.followUpQueue.hasItem(queueItemId));
+		this.steeringQueue.reserve(steeringIds, reservationId);
+		this.followUpQueue.reserve(followUpIds, reservationId);
+	}
+
+	private releaseQueueReservation(reservationId: string): void {
+		this.steeringQueue.releaseReservation(reservationId);
+		this.followUpQueue.releaseReservation(reservationId);
+	}
+
+	private consumeQueueReservation(reservationId: string): void {
+		this.steeringQueue.consumeReservation(reservationId);
+		this.followUpQueue.consumeReservation(reservationId);
+	}
+
+	private assertUniqueQueueItemId(queueItemId: string): void {
+		if (this.steeringQueue.hasItem(queueItemId) || this.followUpQueue.hasItem(queueItemId)) {
+			throw new Error(`Duplicate queue item ID: ${queueItemId}`);
+		}
+	}
+
+	private queueRevision(): string {
+		return fingerprintValue({
+			steering: this.steeringQueue.allItems(),
+			followUp: this.followUpQueue.allItems(),
+		});
 	}
 
 	private normalizePromptInput(
@@ -436,18 +681,6 @@ export class Agent {
 				messages,
 				this.createContextSnapshot(),
 				this.createLoopConfig(options),
-				(event) => this.processEvents(event),
-				signal,
-				this.streamFunction,
-			);
-		});
-	}
-
-	private async runContinuation(): Promise<void> {
-		await this.runWithLifecycle(async (signal) => {
-			await runAgentLoopContinue(
-				this.createContextSnapshot(),
-				this.createLoopConfig(),
 				(event) => this.processEvents(event),
 				signal,
 				this.streamFunction,
@@ -495,6 +728,7 @@ export class Agent {
 				: undefined,
 			appendOnlyContext: this.appendOnlyContext,
 			convertToLlm: this.convertToLlm,
+			projectUsageContext: this.projectUsageContext,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
 			getSteeringMessages: async () => {
@@ -502,10 +736,17 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.drain();
+				return await this.deliverQueuedItems(this.steeringQueue.drainItems());
 			},
-			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getFollowUpMessages: async () => await this.deliverQueuedItems(this.followUpQueue.drainItems()),
 		};
+	}
+
+	private async deliverQueuedItems(items: QueuedAgentMessage[]): Promise<AgentMessage[]> {
+		if (items.length > 0) {
+			await this.processEvents({ type: "queue_delivery", items });
+		}
+		return items.map((item) => item.message);
 	}
 
 	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
@@ -590,4 +831,27 @@ export class Agent {
 			await listener(event, signal);
 		}
 	}
+}
+
+function fingerprintAgentContext(context: AgentContext): string {
+	return fingerprintValue({
+		systemPrompt: context.systemPrompt,
+		messages: context.messages,
+		tools: context.tools?.map(({ name, description, parameters, constrainedSampling }) => ({
+			name,
+			description,
+			parameters,
+			constrainedSampling,
+		})),
+	});
+}
+
+function fingerprintValue(value: unknown): string {
+	const serialized = JSON.stringify(value);
+	let hash = 2166136261;
+	for (let index = 0; index < serialized.length; index++) {
+		hash ^= serialized.charCodeAt(index);
+		hash = Math.imul(hash, 16777619);
+	}
+	return (hash >>> 0).toString(36);
 }

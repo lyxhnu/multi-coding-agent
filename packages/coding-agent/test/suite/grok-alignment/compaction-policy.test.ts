@@ -2,13 +2,31 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { type AssistantMessage, createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import type {
+	ContextMaintenanceSnapshot,
+	ReductionAttemptResult,
+} from "../../../src/core/compaction/context-maintenance.ts";
 import { workspaceHash } from "../../../src/core/memory/memory-store.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 type SessionWithCompactionInternals = {
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
+	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
+	_runSoftCompaction: (
+		cause: "provider_overflow" | "threshold",
+		willRetry: boolean,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	) => Promise<ReductionAttemptResult>;
 	_maybeStartTwoPassPrefire: () => void;
 };
+
+async function compactOnce(
+	internals: SessionWithCompactionInternals,
+	cause: "provider_overflow" | "threshold" = "threshold",
+	willRetry = false,
+): Promise<ReductionAttemptResult> {
+	return await internals._runSoftCompaction(cause, willRetry, await internals._contextMaintenanceSnapshot(), 1);
+}
 
 function createUsage(totalTokens: number) {
 	return {
@@ -52,6 +70,46 @@ function useSummaryStreamFn(harness: Harness, summary: string): void {
 	harness.session.agent.streamFunction = (model, context) => {
 		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
+			const requestText = context.messages
+				.flatMap((message) =>
+					typeof message.content === "string"
+						? [message.content]
+						: message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+				)
+				.join("\n");
+			let responseText = summary;
+			if (requestText.includes("ContextRolloverNote v1")) {
+				const payload = JSON.parse(requestText.split("\n\n").at(-1)!) as {
+					sourceEntries: Array<{
+						id: string;
+						type: string;
+						message?: { role: string; content: string | Array<{ type: string; text?: string }> };
+					}>;
+				};
+				const objective = [...payload.sourceEntries]
+					.reverse()
+					.find((entry) => entry.type === "message" && entry.message?.role === "user");
+				if (!objective?.message) throw new Error("missing checkpoint objective");
+				const objectiveText =
+					typeof objective.message.content === "string"
+						? objective.message.content
+						: objective.message.content.map((part) => part.text ?? "").join("\n");
+				responseText = JSON.stringify({
+					checkpoint: {
+						version: 1,
+						objective: { text: objectiveText, sourceEntryIds: [objective.id] },
+						userConstraints: [],
+						acceptanceCriteria: { status: "not_specified", items: [] },
+						decisions: [],
+						completedWork: [],
+						currentState: { text: summary, evidenceEntryIds: [objective.id] },
+						failedAttempts: [],
+						nextAction: { text: "Continue compaction.", evidenceEntryIds: [] },
+						historyRefs: [],
+					},
+					noteUpdateCandidates: [],
+				});
+			}
 			const message: AssistantMessage = {
 				...fauxAssistantMessage(
 					context.systemPrompt?.includes("Extract durable")
@@ -65,7 +123,7 @@ function useSummaryStreamFn(harness: Harness, summary: string): void {
 									},
 								],
 							})
-						: summary,
+						: responseText,
 				),
 				api: model.api,
 				provider: model.provider,
@@ -91,11 +149,11 @@ describe("CompactionPolicy wiring (M4)", () => {
 		useSummaryStreamFn(harness, "auto summary");
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		const compacted = await sessionInternals._runAutoCompaction("threshold", false);
+		const compacted = await compactOnce(sessionInternals);
 
 		const compactionEntry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
 		expect(compactionEntry?.type).toBe("compaction");
-		expect(compacted).toBe(harness.session.agent.hasQueuedMessages());
+		expect(compacted.outcome).toBe("committed");
 		const details = compactionEntry?.type === "compaction" ? (compactionEntry.details as any) : undefined;
 		expect(details?.grokCompaction?.mode).toBe("single-pass");
 		expect(details?.grokCompaction?.policy?.autoCompactThresholdPercent).toBe(85);
@@ -116,7 +174,7 @@ describe("CompactionPolicy wiring (M4)", () => {
 		useSummaryStreamFn(harness, "auto summary");
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await sessionInternals._runAutoCompaction("threshold", false);
+		await compactOnce(sessionInternals);
 
 		const flush = harness.sessionManager
 			.getEntries()
@@ -164,7 +222,7 @@ describe("CompactionPolicy wiring (M4)", () => {
 		useSummaryStreamFn(harness, "unwitnessed summary");
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await sessionInternals._runAutoCompaction("threshold", false);
+		await compactOnce(sessionInternals);
 
 		expect(existsSync(harness.session.memoryStore.rootDir)).toBe(false);
 	});
@@ -196,7 +254,7 @@ describe("CompactionPolicy wiring (M4)", () => {
 		useSummaryStreamFn(harness, "dreamable summary");
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await sessionInternals._runAutoCompaction("threshold", false);
+		await compactOnce(sessionInternals);
 
 		const sessionsDir = join(harness.session.memoryStore.rootDir, workspaceHash(harness.tempDir), "sessions");
 		const noteFiles = readdirSync(sessionsDir).filter((f) => f.endsWith(".md"));
@@ -223,8 +281,8 @@ describe("CompactionPolicy wiring (M4)", () => {
 		useSummaryStreamFn(harness, "should never be used");
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		const compacted = await sessionInternals._runAutoCompaction("threshold", false);
-		expect(compacted).toBe(false);
+		const compacted = await compactOnce(sessionInternals);
+		expect(compacted).toMatchObject({ outcome: "failed", reason: "provider_failed" });
 
 		const compactionEntries = harness.sessionManager.getEntries().filter((e) => e.type === "compaction");
 		expect(compactionEntries).toHaveLength(0);
@@ -243,18 +301,18 @@ describe("CompactionPolicy wiring (M4)", () => {
 		useSummaryStreamFn(harness, "fallback summary");
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		const compacted = await sessionInternals._runAutoCompaction("threshold", false);
+		const compacted = await compactOnce(sessionInternals);
 
 		const compactionEntry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
 		expect(compactionEntry?.type === "compaction" ? compactionEntry.summary : undefined).toContain(
 			"fallback summary",
 		);
-		expect(compacted).toBe(harness.session.agent.hasQueuedMessages());
+		expect(compacted.outcome).toBe("committed");
 		const details = compactionEntry?.type === "compaction" ? (compactionEntry.details as any) : undefined;
 		expect(details?.compactModelWarning).toContain("could not be resolved");
 	});
 
-	it("two-pass compaction (spec 9.5): pass 1's speculative prefix summary is persisted to a session custom entry and reused by pass 2", async () => {
+	it("two-pass compaction (spec 9.5): pass 1 is atomically persisted in the checkpoint envelope and reused by pass 2", async () => {
 		const harness = await createHarness({
 			withConfiguredAuth: false,
 			settings: { compaction: { twoPassEnabled: true } },
@@ -273,16 +331,24 @@ describe("CompactionPolicy wiring (M4)", () => {
 		for (let i = 0; i < 40 && !prefireEntry; i++) {
 			prefireEntry = harness.sessionManager
 				.getEntries()
-				.find((e) => e.type === "custom" && e.customType === "two-pass-prefire");
+				.find((e) => e.type === "custom" && e.customType === "context-rollover-checkpoint");
 			if (!prefireEntry) await new Promise((resolve) => setTimeout(resolve, 25));
 		}
 		expect(prefireEntry).toBeTruthy();
-		expect((prefireEntry as { data?: { summary?: string } }).data?.summary).toContain("prefire prefix summary");
+		expect(
+			(prefireEntry as { data?: { checkpoint?: { compactionPrefix?: { summary?: string } } } }).data?.checkpoint
+				?.compactionPrefix?.summary,
+		).toContain("prefire prefix summary");
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "context-rollover-checkpoint"),
+		).toHaveLength(1);
 
 		// Pass 2: the real compaction should now report mode "two-pass" (it reused pass 1's prefix
 		// summary rather than summarizing cold).
 		useSummaryStreamFn(harness, "pass 2 tail summary");
-		await sessionInternals._runAutoCompaction("threshold", false);
+		await compactOnce(sessionInternals);
 		const compactionEntry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
 		const details = compactionEntry?.type === "compaction" ? (compactionEntry.details as any) : undefined;
 		expect(details?.grokCompaction?.mode).toBe("two-pass");

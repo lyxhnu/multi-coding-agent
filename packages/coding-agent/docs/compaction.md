@@ -113,7 +113,7 @@ The previous summary is retained even when there are no new complete history tur
 
 ### Incremental Prefix Checkpoints
 
-With `compaction.twoPassEnabled: true`, the session can start one background prefix summary at the configured threshold minus 10 percentage points. A completed checkpoint records the base compaction ID, covered start/end entry IDs, effective-input fingerprint, summary and usage in a `two-pass-prefire` custom entry. It is log data, not an extra LLM message.
+With `compaction.twoPassEnabled: true`, the session can start one background checkpoint at the configured threshold minus 10 percentage points. The single `context-rollover-checkpoint` envelope records the semantic checkpoint and its compaction prefix identity, summary, and usage atomically. It is log data, not an extra LLM message; no second prefix-checkpoint entry is written.
 
 Appending a tail preserves a valid checkpoint. The final compaction receives that summary plus only uncovered messages. Branch switches, rewritten prefix content (including shake) or a different base compaction invalidate it. Late results are checked before persistence; restored checkpoints are checked again before reuse. Session totals count prefix usage once, including when reused by a later compaction.
 

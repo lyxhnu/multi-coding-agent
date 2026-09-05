@@ -49,9 +49,9 @@ describe("AgentSession trace", () => {
 				expect.objectContaining({
 					provider: harness.getModel().provider,
 					model: harness.getModel().id,
-					systemPrompt: harness.session.systemPrompt,
 				}),
 			);
+			expect(requests[0]?.data.header).not.toHaveProperty("systemPrompt");
 			expect(requests[0]?.data.header.messages.map((message) => message.role)).toEqual(["user"]);
 			expect(requests[1]?.data.header.messages.map((message) => message.role)).toEqual([
 				"user",
@@ -62,9 +62,12 @@ describe("AgentSession trace", () => {
 			expect(toolCall?.event).toEqual(
 				expect.objectContaining({
 					type: "tool/call",
-					data: expect.objectContaining({ name: "echo", arguments: { text: "hello" } }),
+					data: expect.objectContaining({ name: "echo" }),
 				}),
 			);
+			expect(JSON.stringify(traceEntries)).not.toContain(harness.session.systemPrompt);
+			expect(JSON.stringify(traceEntries)).not.toContain('"text":"hello"');
+			expect(toolCall?.event.type === "tool/call" ? toolCall.event.data : undefined).not.toHaveProperty("arguments");
 
 			expect(harness.sessionManager.getBranch().every((entry) => entry.type !== "trace")).toBe(true);
 			expect(

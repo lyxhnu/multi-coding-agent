@@ -1,11 +1,29 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import type {
+	ContextMaintenanceSnapshot,
+	ReductionAttemptResult,
+} from "../../../src/core/compaction/context-maintenance.ts";
 import type { ExtensionFactory } from "../../../src/index.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 type SessionWithCompactionInternals = {
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
+	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
+	_runSoftCompaction: (
+		cause: "provider_overflow" | "threshold",
+		willRetry: boolean,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	) => Promise<ReductionAttemptResult>;
 };
+
+async function compactOnce(
+	internals: SessionWithCompactionInternals,
+	cause: "provider_overflow" | "threshold",
+	willRetry: boolean,
+): Promise<ReductionAttemptResult> {
+	return await internals._runSoftCompaction(cause, willRetry, await internals._contextMaintenanceSnapshot(), 1);
+}
 
 interface RecordedCompactionEvent {
 	type: "session_before_compact" | "session_compact";
@@ -71,7 +89,7 @@ describe("issue #5217 compaction reason on extension events", () => {
 		harnesses.push(harness);
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await sessionInternals._runAutoCompaction("threshold", false);
+		await compactOnce(sessionInternals, "threshold", false);
 
 		expect(recorded).toEqual([
 			{ type: "session_before_compact", reason: "threshold", willRetry: false },
@@ -85,7 +103,7 @@ describe("issue #5217 compaction reason on extension events", () => {
 		harnesses.push(harness);
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await sessionInternals._runAutoCompaction("overflow", true);
+		await compactOnce(sessionInternals, "provider_overflow", true);
 
 		expect(recorded).toEqual([
 			{ type: "session_before_compact", reason: "overflow", willRetry: true },

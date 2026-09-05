@@ -484,7 +484,7 @@ describe("Agent", () => {
 		const agent = new Agent({ streamFn: unusedStreamFunction });
 
 		const message = { role: "user" as const, content: "Steering message", timestamp: Date.now() };
-		agent.steer(message);
+		agent.steer({ queueItemId: "steer-1", message });
 
 		// The message is queued but not yet in state.messages
 		expect(agent.state.messages).not.toContainEqual(message);
@@ -494,7 +494,7 @@ describe("Agent", () => {
 		const agent = new Agent({ streamFn: unusedStreamFunction });
 
 		const message = { role: "user" as const, content: "Follow-up message", timestamp: Date.now() };
-		agent.followUp(message);
+		agent.followUp({ queueItemId: "follow-up-1", message });
 
 		// The message is queued but not yet in state.messages
 		expect(agent.state.messages).not.toContainEqual(message);
@@ -624,9 +624,12 @@ describe("Agent", () => {
 		];
 
 		agent.followUp({
-			role: "user",
-			content: [{ type: "text", text: "Queued follow-up" }],
-			timestamp: Date.now(),
+			queueItemId: "follow-up-1",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "Queued follow-up" }],
+				timestamp: Date.now(),
+			},
 		});
 
 		await expect(agent.continue()).resolves.toBeUndefined();
@@ -668,14 +671,20 @@ describe("Agent", () => {
 		];
 
 		agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "Steering 1" }],
-			timestamp: Date.now(),
+			queueItemId: "steer-1",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "Steering 1" }],
+				timestamp: Date.now(),
+			},
 		});
 		agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "Steering 2" }],
-			timestamp: Date.now() + 1,
+			queueItemId: "steer-2",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "Steering 2" }],
+				timestamp: Date.now() + 1,
+			},
 		});
 
 		await expect(agent.continue()).resolves.toBeUndefined();

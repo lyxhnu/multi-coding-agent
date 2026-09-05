@@ -121,6 +121,12 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	contextEpoch: number;
+	rolloverCount: number;
+	dispatchState: "none" | "prepared" | "started" | "finished" | "blocked" | "cancelled" | "outcome_unknown";
+	taskNoteActiveCount: number;
+	taskNoteStaleCount: number;
+	taskNoteLastFailureReason?: string;
 }
 
 // ============================================================================

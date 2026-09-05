@@ -1,0 +1,208 @@
+{
+  "meta": {
+    "project": "Pi 二开",
+    "purpose": "面试项目讲解与主张边界",
+    "target_role": "AI 应用 / Coding Agent / TypeScript 全栈工程师",
+    "generated_at": "2026-09-03",
+    "baseline": "earendil-works/pi v0.82.0 (083e61621276bff9f6faefab87ce07fcd98734e2)",
+    "local_head": "e2f2b17d820e785ca498cefbaa66379de994d9a5"
+  },
+  "claims": [
+    {
+      "id": "claim-scope-001",
+      "source_fact": "将本地 HEAD 与上游 v0.82.0 直接比较，差异覆盖 304 个文件，新增 29824 行、删除 599 行。",
+      "candidate_wording": "基于 Pi v0.82.0 进行系统级二开，改造范围覆盖 agent runtime、coding-agent orchestration、工具生态和评测基础设施。",
+      "sources": [
+        {
+          "type": "git-tree-diff",
+          "location": "git diff --stat refs/remotes/upstream-audit/v0.82.0 HEAD",
+          "public": false
+        }
+      ],
+      "responsibility_level": "主导方案或交付",
+      "verification_status": "已确认",
+      "allowed_uses": ["项目介绍", "面试讲解", "简历项目范围"],
+      "interview_details": ["说明基线版本", "按模块而不是按文件数展开", "强调系统改造而非从零开发 Pi"],
+      "boundary": "这是相对上游版本的代码差异，不等于能仅凭 Git 证明每一行均由个人独立完成。",
+      "risk_notes": ["仓库历史被压成单个根提交，个人独立贡献边界需要本人确认"],
+      "last_verified": "2026-09-03"
+    },
+    {
+      "id": "claim-positioning-002",
+      "source_fact": "核心改动集中在 length 截断恢复、每轮上下文预算守卫、Shake、压缩流程、Append-Only Context 和当前在研的 Context Maintenance 状态机。",
+      "candidate_wording": "我主要负责 Coding Agent 的长任务可靠性与上下文生命周期治理，目标是避免 agent 已经做对的工作因截断、溢出、错误续跑或静默成功而丢失。",
+      "sources": [
+        {
+          "type": "project-document",
+          "location": "PI_AGENT_CHANGES.md sections 1-6",
+          "public": false
+        },
+        {
+          "type": "source",
+          "location": "packages/agent/src/agent-loop.ts; packages/coding-agent/src/core/agent-session.ts",
+          "public": false
+        }
+      ],
+      "responsibility_level": "主导方案或交付",
+      "verification_status": "已确认",
+      "allowed_uses": ["项目介绍", "面试讲解", "简历项目亮点"],
+      "interview_details": ["从静默失败切入", "解释 output headroom 双门槛", "解释停止—缩减—重测—续跑闭环"],
+      "boundary": "Pi 的基础 agent loop、provider 适配和 CLI 来自上游；二开集中在可靠性控制面。",
+      "risk_notes": [],
+      "last_verified": "2026-09-03"
+    },
+    {
+      "id": "claim-context-003",
+      "source_fact": "对无 tool call 的 length 截断注入恢复消息，并使用有界 reasoning 降档；每轮使用 ContextBudget 决定是否优雅停止。",
+      "candidate_wording": "实现无工具调用的输出截断恢复与每轮上下文守卫，通过消息形状修复、推理档位下探和有界重试消除静默结束。",
+      "sources": [
+        {
+          "type": "source-and-test",
+          "location": "packages/agent/src/agent-loop.ts; packages/agent/test/agent-loop.test.ts",
+          "public": false
+        }
+      ],
+      "responsibility_level": "主导方案或交付",
+      "verification_status": "已确认",
+      "allowed_uses": ["简历", "项目介绍", "技术面试"],
+      "interview_details": ["为什么必须注入 user message", "为什么降档状态必须跨轮保存", "为什么有最多两次恢复上限"],
+      "boundary": "不声称提升模型智力，只声称提高运行时完成可靠性。",
+      "risk_notes": [],
+      "last_verified": "2026-09-03"
+    },
+    {
+      "id": "claim-eval-004",
+      "source_fact": "PI_AGENT_CHANGES.md 记录 40 个 Terminal-Bench 2.0 任务中完成率从 40.0% 提升到 57.5%，赢 8 输 1，McNemar p=0.0391。",
+      "candidate_wording": "在同一 40 题评测口径下，项目记录的完成率由 40.0% 提升至 57.5%；配对结果赢 8 输 1。",
+      "sources": [
+        {
+          "type": "project-evaluation-report",
+          "location": "PI_AGENT_CHANGES.md lines 797-824",
+          "public": false
+        },
+        {
+          "type": "evaluation-scripts",
+          "location": "eval/analysis; eval/benchmarks; .gate_check.py",
+          "public": false
+        }
+      ],
+      "responsibility_level": "主导方案或交付",
+      "verification_status": "待确认",
+      "allowed_uses": ["内部面试准备"],
+      "interview_details": ["说明样本数 n=40", "说明单轮评测与模型随机性", "补充扩到 87 题后结果为 48.2%"],
+      "boundary": "当前会话没有原始评测产物可复算；不得把全部提升归因于单一模块。",
+      "risk_notes": ["正式简历使用前应保存原始 result/trace 和运行配置", "不要省略评测噪声与环境修复影响"],
+      "last_verified": null
+    },
+    {
+      "id": "claim-security-005",
+      "source_fact": "新增命令分析、权限模式、审计日志和 macOS/Linux 沙箱接线；项目文档记录权限误拦截从 491 降至 0。",
+      "candidate_wording": "完善命令风险解析与 OS 级沙箱接线，修复重定向、前置环境变量、版本化工具链和命令名前缀碰撞等解析缺陷。",
+      "sources": [
+        {
+          "type": "source",
+          "location": "packages/coding-agent/src/core/permissions; packages/coding-agent/src/core/sandbox",
+          "public": false
+        },
+        {
+          "type": "project-evaluation-report",
+          "location": "PI_AGENT_CHANGES.md sections 8 and 12",
+          "public": false
+        }
+      ],
+      "responsibility_level": "负责模块",
+      "verification_status": "已确认",
+      "allowed_uses": ["项目介绍", "技术面试"],
+      "interview_details": ["2>&1 被误拆", "git+evil 前缀碰撞", "应用层审批与 OS 隔离的边界"],
+      "boundary": "491→0 是项目评测记录；对外使用该数字前仍建议附原始 trace。",
+      "risk_notes": ["Windows 沙箱支持不完整"],
+      "last_verified": "2026-09-03"
+    },
+    {
+      "id": "claim-memory-006",
+      "source_fact": "新增关键词与向量融合检索、时间衰减、MMR、分层降级、autoDream、tombstone 和 secret filter。",
+      "candidate_wording": "实现可选的长期记忆检索与治理链路：关键词/向量融合、时效加权、MMR 去重和年龄降级，并在未配置 embedding 时保持关键词路径。",
+      "sources": [
+        {
+          "type": "source",
+          "location": "packages/coding-agent/src/core/memory/*",
+          "public": false
+        },
+        {
+          "type": "design-document",
+          "location": "packages/coding-agent/docs/specs/memory-context-integrity.md",
+          "public": false
+        }
+      ],
+      "responsibility_level": "负责模块",
+      "verification_status": "已确认",
+      "allowed_uses": ["项目介绍", "技术面试"],
+      "interview_details": ["0.6/0.4 融合", "不同来源的半衰期", "为何 curated global memory 不自动写入"],
+      "boundary": "不将该模块直接归因于 TB2 分数提升。",
+      "risk_notes": [],
+      "last_verified": "2026-09-03"
+    },
+    {
+      "id": "claim-subagent-007",
+      "source_fact": "新增 SubagentCoordinator、TaskManager、child runner 和 task 工具，并修复前台 wait 定时器泄漏与 CLI 默认工具集未激活。",
+      "candidate_wording": "搭建受深度、能力和隔离约束的子代理编排链路，并修复定时器泄漏与真实 CLI 入口工具未激活问题。",
+      "sources": [
+        {
+          "type": "source-and-test",
+          "location": "packages/coding-agent/src/core/subagents; packages/coding-agent/src/core/tasks; related tests",
+          "public": false
+        }
+      ],
+      "responsibility_level": "负责模块",
+      "verification_status": "已确认",
+      "allowed_uses": ["项目介绍", "技术面试"],
+      "interview_details": ["为什么深度门控要物理移除工具", "为什么测试绕过 SDK 会漏真实入口 Bug", "为什么 Promise.race 必须 clearTimeout"],
+      "boundary": "架构已落地，但历史 TB2 评测未能证明它带来分数增益。",
+      "risk_notes": [],
+      "last_verified": "2026-09-03"
+    },
+    {
+      "id": "claim-state-machine-008",
+      "source_fact": "当前未提交改动新增 Context Maintenance 状态机与 PreparedContinuation；工作区仍在并行演进，文件数量不作为稳定主张。",
+      "candidate_wording": "正在将多条上下文缩减分支收敛为结构化状态机，并用 PreparedContinuation 固化 preview 与首次真实请求的一致性。",
+      "sources": [
+        {
+          "type": "working-tree",
+          "location": "packages/coding-agent/src/core/compaction/context-maintenance.ts; packages/agent/src/agent.ts; packages/agent/src/agent-loop.ts",
+          "public": false
+        }
+      ],
+      "responsibility_level": "主导方案或交付",
+      "verification_status": "待确认",
+      "allowed_uses": ["内部面试准备", "在研工作说明"],
+      "interview_details": ["结构化 attempt outcome", "source/request fingerprint", "最多三次 soft compaction", "同指纹 continuation 去重"],
+      "boundary": "完整 rollover、持久化 delivery/receipt、dispatch journal、crash recovery 仍主要停留在规格文档，不得表述为已交付。",
+      "risk_notes": ["当前环境缺少 vitest/dist/cli.js，新增定向测试未能执行", "工作区尚未提交"],
+      "last_verified": null
+    },
+    {
+      "id": "claim-tests-009",
+      "source_fact": "仓库文档记录 agent 304+、coding-agent 1889 个单测无新增失败；本次尝试执行两个新增定向测试时因 Vitest CLI 缺失而失败。",
+      "candidate_wording": "已为关键路径补充单元和回归测试；当前在研分支需要补齐依赖后重新执行定向测试与全量 check。",
+      "sources": [
+        {
+          "type": "project-document",
+          "location": "PI_AGENT_CHANGES.md line 824",
+          "public": false
+        },
+        {
+          "type": "local-command",
+          "location": "2026-09-03 test attempt: Cannot find node_modules/vitest/dist/cli.js",
+          "public": false
+        }
+      ],
+      "responsibility_level": "主导方案或交付",
+      "verification_status": "待确认",
+      "allowed_uses": ["内部面试准备"],
+      "interview_details": ["区分历史验证记录与当前工作树验证状态"],
+      "boundary": "不能在当前工作树上声称全部测试已通过。",
+      "risk_notes": ["补齐依赖后执行 npm run check 和定向测试"],
+      "last_verified": null
+    }
+  ]
+}

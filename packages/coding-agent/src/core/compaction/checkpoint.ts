@@ -50,7 +50,17 @@ export function createPrefixCheckpoint(
 		.slice(0, cut)
 		.reverse()
 		.find((entry) => entry.type !== "compaction" && sessionEntryToContextMessages(entry).length > 0);
-	const source = end && prefixSource(entries, end.id);
+	if (!end) throw new Error("Invalid prefix checkpoint source");
+	return createPrefixCheckpointFromBoundary(entries, end.id, summary, usage);
+}
+
+export function createPrefixCheckpointFromBoundary(
+	entries: SessionEntry[],
+	coveredEndEntryId: string,
+	summary: string,
+	usage?: Usage,
+): PrefixSummaryCheckpoint {
+	const source = prefixSource(entries, coveredEndEntryId);
 	if (!source || !summary.trim()) throw new Error("Invalid prefix checkpoint source");
 	const { count: _count, ...identity } = source;
 	return { ...identity, summary, usage };

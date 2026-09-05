@@ -444,6 +444,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "get_state": {
 				const runState = session.state.runState;
+				const contextRollover = session.contextRolloverState;
+				const taskNotes = session.taskNoteState;
 				const state: RpcSessionState = {
 					runState:
 						runState.status === "idle"
@@ -467,6 +469,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,
 					pendingMessageCount: session.pendingMessageCount,
+					contextEpoch: contextRollover.contextEpoch,
+					rolloverCount: contextRollover.rolloverCount,
+					dispatchState: contextRollover.dispatchState,
+					taskNoteActiveCount: taskNotes.activeCount,
+					taskNoteStaleCount: taskNotes.staleCount,
+					...(taskNotes.lastFailureReason === undefined
+						? {}
+						: { taskNoteLastFailureReason: taskNotes.lastFailureReason }),
 				};
 				return success(id, "get_state", state);
 			}

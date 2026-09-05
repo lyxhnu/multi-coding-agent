@@ -12,10 +12,33 @@ import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type {
+	ContextMaintenanceAction,
+	ContextMaintenanceBudget,
+	ContextMaintenanceSnapshot,
+	ContextMaintenanceTrigger,
+	ReductionAttemptResult,
+} from "../src/core/compaction/context-maintenance.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createTestResourceLoader } from "./utilities.ts";
+
+type SessionInternals = {
+	_checkCompaction: (
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck?: boolean,
+	) => Promise<ContextMaintenanceAction>;
+	_contextMaintenanceBudget: ContextMaintenanceBudget;
+	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
+	_runContextMaintenance: (trigger: ContextMaintenanceTrigger) => Promise<ContextMaintenanceAction>;
+	_runSoftCompaction: (
+		cause: "provider_overflow" | "threshold",
+		willRetry: boolean,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	) => Promise<ReductionAttemptResult>;
+};
 
 describe("AgentSession auto-compaction queue resume", () => {
 	let session: AgentSession;
@@ -114,11 +137,14 @@ describe("AgentSession auto-compaction queue resume", () => {
 		};
 
 		session.agent.followUp({
-			role: "custom",
-			customType: "test",
-			content: [{ type: "text", text: "Queued custom" }],
-			display: false,
-			timestamp: Date.now(),
+			queueItemId: "queued-custom",
+			message: {
+				role: "custom",
+				customType: "test",
+				content: [{ type: "text", text: "Queued custom" }],
+				display: false,
+				timestamp: Date.now(),
+			},
 		});
 
 		expect(session.pendingMessageCount).toBe(0);
@@ -126,18 +152,17 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
-		const runAutoCompaction = (
-			session as unknown as {
-				_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
-			}
-		)._runAutoCompaction.bind(session);
+		const internals = session as unknown as SessionInternals;
+		const runSoftCompaction = internals._runSoftCompaction.bind(internals);
 
-		await expect(runAutoCompaction("threshold", false)).resolves.toBe(true);
+		await expect(
+			runSoftCompaction("threshold", false, await internals._contextMaintenanceSnapshot(), 1),
+		).resolves.toMatchObject({ outcome: "committed" });
 
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
-	it("should not compact repeatedly after overflow recovery already attempted", async () => {
+	it("should not reduce again after the overflow retry budget is spent", async () => {
 		const model = session.model!;
 		const overflowMessage: AssistantMessage = {
 			role: "assistant",
@@ -158,38 +183,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now(),
 		};
 
-		const runAutoCompactionSpy = vi
-			.spyOn(
-				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
-				},
-				"_runAutoCompaction",
-			)
-			.mockResolvedValue();
+		const internals = session as unknown as SessionInternals;
+		internals._contextMaintenanceBudget.overflowRetriesUsed = 1;
+		const softCompactionSpy = vi.spyOn(internals, "_runSoftCompaction");
 
-		const events: Array<{ type: string; reason: string; errorMessage?: string }> = [];
-		session.subscribe((event) => {
-			if (event.type === "compaction_end") {
-				events.push({ type: event.type, reason: event.reason, errorMessage: event.errorMessage });
-			}
-		});
-
-		const checkCompaction = (
-			session as unknown as {
-				_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
-			}
-		)._checkCompaction.bind(session);
-
-		await checkCompaction(overflowMessage);
-		await checkCompaction({ ...overflowMessage, timestamp: Date.now() + 1 });
-
-		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(1);
-		expect(events).toContainEqual({
-			type: "compaction_end",
-			reason: "overflow",
-			errorMessage:
-				"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
-		});
+		await expect(internals._checkCompaction(overflowMessage)).resolves.toBe("stop");
+		expect(softCompactionSpy).not.toHaveBeenCalled();
 	});
 
 	it("should ignore stale pre-compaction assistant usage on pre-prompt compaction checks", async () => {
@@ -229,24 +228,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now(),
 		});
 
-		const runAutoCompactionSpy = vi
-			.spyOn(
-				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
-				},
-				"_runAutoCompaction",
-			)
-			.mockResolvedValue();
+		const internals = session as unknown as SessionInternals;
+		const maintenanceSpy = vi.spyOn(internals, "_runContextMaintenance").mockResolvedValue("wait");
 
-		const checkCompaction = (
-			session as unknown as {
-				_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
-			}
-		)._checkCompaction.bind(session);
+		await internals._checkCompaction(staleAssistant, false);
 
-		await checkCompaction(staleAssistant, false);
-
-		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+		expect(maintenanceSpy).not.toHaveBeenCalled();
 	});
 
 	it("should trigger threshold compaction for error messages using last successful usage", async () => {
@@ -310,24 +297,14 @@ describe("AgentSession auto-compaction queue resume", () => {
 			model,
 		);
 
-		const runAutoCompactionSpy = vi
-			.spyOn(
-				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
-				},
-				"_runAutoCompaction",
-			)
-			.mockResolvedValue();
+		const internals = session as unknown as SessionInternals;
+		const maintenanceSpy = vi.spyOn(internals, "_runContextMaintenance").mockResolvedValue("wait");
 
-		const checkCompaction = (
-			session as unknown as {
-				_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
-			}
-		)._checkCompaction.bind(session);
+		await internals._checkCompaction(errorAssistant);
 
-		await checkCompaction(errorAssistant);
-
-		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+		expect(maintenanceSpy).toHaveBeenCalledWith(
+			expect.objectContaining({ cause: "threshold", continuation: "forbidden" }),
+		);
 	});
 
 	it("should not trigger threshold compaction for error messages when no prior usage exists", async () => {
@@ -358,24 +335,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 			errorAssistant,
 		];
 
-		const runAutoCompactionSpy = vi
-			.spyOn(
-				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
-				},
-				"_runAutoCompaction",
-			)
-			.mockResolvedValue();
+		const internals = session as unknown as SessionInternals;
+		const maintenanceSpy = vi.spyOn(internals, "_runContextMaintenance").mockResolvedValue("wait");
 
-		const checkCompaction = (
-			session as unknown as {
-				_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
-			}
-		)._checkCompaction.bind(session);
+		await internals._checkCompaction(errorAssistant);
 
-		await checkCompaction(errorAssistant);
-
-		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+		expect(maintenanceSpy).not.toHaveBeenCalled();
 	});
 
 	it("should not trigger threshold compaction for error messages when only kept pre-compaction usage exists", async () => {
@@ -439,24 +404,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 			errorAssistant,
 		];
 
-		const runAutoCompactionSpy = vi
-			.spyOn(
-				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
-				},
-				"_runAutoCompaction",
-			)
-			.mockResolvedValue();
+		const internals = session as unknown as SessionInternals;
+		const maintenanceSpy = vi.spyOn(internals, "_runContextMaintenance").mockResolvedValue("wait");
 
-		const checkCompaction = (
-			session as unknown as {
-				_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
-			}
-		)._checkCompaction.bind(session);
-
-		await checkCompaction(errorAssistant);
+		await internals._checkCompaction(errorAssistant);
 
 		// Should NOT compact because the only usage data is from a kept pre-compaction message
-		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+		expect(maintenanceSpy).not.toHaveBeenCalled();
 	});
 });

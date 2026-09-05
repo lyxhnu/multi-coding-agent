@@ -33,7 +33,16 @@ export interface PlanModeState {
 export const OFF_PLAN_MODE_STATE: PlanModeState = { status: "off" };
 
 /** Read-only tool set Plan Mode narrows to, aligned with Grok's plan-mode toolbox (read/grep/find/ls + read-only LSP). */
-export const PLAN_MODE_READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "todo_write", "get_task_output", "history_get"];
+export const PLAN_MODE_READ_ONLY_TOOLS = [
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"todo_write",
+	"get_task_output",
+	"history_get",
+	"context_note",
+];
 
 export function buildPlanArtifact(input: {
 	title: string;

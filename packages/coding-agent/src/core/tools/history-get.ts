@@ -39,8 +39,18 @@ export function createHistoryGetToolDefinition(manager: SessionManager): ToolDef
 			const branch = manager.getBranch();
 			const entry = branch.find((item) => item.id === input.entryId);
 			const redactions = collectShakeRedactions(branch).filter((item) => item.targetId === input.entryId);
-			if (!entry || !redactions.length || (entry.type !== "message" && entry.type !== "custom_message"))
-				throw new Error("History source is not a shaken ancestor on this branch");
+			const latestRollover = [...branch].reverse().find((item) => item.type === "context_rollover");
+			const handoffAuthorization =
+				latestRollover?.type === "context_rollover"
+					? latestRollover.bundle.historyAllowlist.find((item) => item.entryId === input.entryId)
+					: undefined;
+			if (
+				!entry ||
+				(redactions.length === 0 && handoffAuthorization === undefined) ||
+				(entry.type !== "message" && entry.type !== "custom_message")
+			) {
+				throw new Error("History source is not authorized on this branch");
+			}
 			if (
 				entry.type === "message" &&
 				entry.message.role === "toolResult" &&
@@ -59,8 +69,14 @@ export function createHistoryGetToolDefinition(manager: SessionManager): ToolDef
 				content.forEach((block, index) => {
 					if (block.type === "text") blocks.push({ index, text: block.text });
 				});
-			const allowed = blocks.filter((block) =>
-				redactions.some((redaction) => redaction.kind === "toolResult" || redaction.blockIndex === block.index),
+			const allowed = blocks.filter(
+				(block) =>
+					redactions.some(
+						(redaction) => redaction.kind === "toolResult" || redaction.blockIndex === block.index,
+					) ||
+					(handoffAuthorization !== undefined &&
+						(handoffAuthorization.blockIndex === block.index ||
+							(handoffAuthorization.blockIndex === undefined && blocks.length === 1))),
 			);
 			if (input.blockIndex === undefined && allowed.length !== 1)
 				throw new Error("Specify blockIndex for a source with multiple readable text blocks");

@@ -25,7 +25,8 @@ describe("memory-context-integrity: request preflight", () => {
 				.filter((entry) => entry.type === "trace" && entry.event.type === "request/header"),
 		).toHaveLength(0);
 		const reopened = SessionManager.open(h.session.sessionFile!);
-		expect(reopened.getBranch().map((entry) => entry.type)).toEqual(["message"]);
+		expect(reopened.getBranch().map((entry) => entry.type)).toEqual(["custom", "message"]);
+		expect(reopened.getBranch()[0]).toMatchObject({ type: "custom", customType: "context-prompt-generation" });
 		expect(
 			reopened.getBranchWithTrace().some((entry) => entry.type === "trace" && entry.event.type === "context/budget"),
 		).toBe(true);

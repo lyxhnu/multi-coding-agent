@@ -13,6 +13,10 @@ import {
 	OUTPUT_HEADROOM_FACTOR,
 	OUTPUT_HEADROOM_MAX_TOKENS,
 } from "../../../src/core/compaction/compaction-policy.ts";
+import type {
+	ContextMaintenanceAction,
+	ContextMaintenanceBudget,
+} from "../../../src/core/compaction/context-maintenance.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 /**
@@ -142,7 +146,7 @@ describe("mid-prompt context guard", () => {
 	it("repeated budget checks do not spend the session reduction allowance", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const internals = harness.session as unknown as { _midPromptCompactions: number; _pendingRescueShake: boolean };
+		const internals = harness.session as unknown as { _contextMaintenanceBudget: ContextMaintenanceBudget };
 		const results: boolean[] = [];
 		for (let i = 0; i < 5; i++) {
 			results.push(await askGuard(harness, assistantWithUsage(harness, 120_000)));
@@ -151,7 +155,7 @@ describe("mid-prompt context guard", () => {
 		// buy a compaction. Past that the budget is spent and further stops request a rescue shake, which
 		// costs no model call (see AgentSession.shake).
 		expect(results).toEqual([true, true, true, true, true]);
-		expect(internals._midPromptCompactions).toBe(0);
+		expect(internals._contextMaintenanceBudget.softCompactionOperationsStarted).toBe(0);
 	});
 
 	it("still rejects an oversized request when auto-compaction is disabled", async () => {
@@ -172,7 +176,7 @@ describe("mid-prompt context guard", () => {
 	});
 
 	it("end to end: a prompt whose context fills mid-run gets compacted instead of running to exhaustion", async () => {
-		// Needs real auth wiring: this drives prompt(), unlike the tests that poke _runAutoCompaction.
+		// Needs real auth wiring: this drives prompt(), unlike tests that invoke one soft-compaction operation.
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
@@ -314,10 +318,10 @@ describe("mid-prompt context guard", () => {
 				message: AssistantMessage,
 				skipAbortedCheck?: boolean,
 				continueAfterReduction?: boolean,
-			) => Promise<boolean>;
+			) => Promise<ContextMaintenanceAction>;
 		};
 
-		await expect(internals._checkCompaction(msg, true, true)).resolves.toBe(true);
+		await expect(internals._checkCompaction(msg, true, true)).resolves.toBe("continue");
 		const shakes = harness.sessionManager.getEntries().filter((e) => e.type === "shake");
 		expect(shakes).toHaveLength(1);
 	});
@@ -344,9 +348,9 @@ describe("mid-prompt context guard", () => {
 				message: AssistantMessage,
 				skipAbortedCheck?: boolean,
 				continueAfterReduction?: boolean,
-			) => Promise<boolean>;
+			) => Promise<ContextMaintenanceAction>;
 		};
 
-		await expect(internals._checkCompaction(msg, true, false)).resolves.toBe(false);
+		await expect(internals._checkCompaction(msg, true, false)).resolves.toBe("wait");
 	});
 });

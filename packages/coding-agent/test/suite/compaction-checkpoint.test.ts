@@ -2,12 +2,52 @@ import { createAssistantMessageEventStream, fauxAssistantMessage, streamSimple }
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createPrefixCheckpoint,
+	type PrefixSummaryCheckpoint,
 	reusePrefixCheckpoint,
 	validatePrefixCheckpoint,
 } from "../../src/core/compaction/checkpoint.ts";
 import { compact, prepareCompaction } from "../../src/core/compaction/compaction.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { createTaskNoteBatchId } from "../../src/core/task-note-projection.ts";
 import { createHarness, type Harness } from "./harness.ts";
+
+function appendCheckpointEnvelope(harness: Harness, compactionPrefix: PrefixSummaryCheckpoint): void {
+	const checkpointId = "test-prefix-checkpoint";
+	const objective = harness.sessionManager
+		.getBranch()
+		.find((entry) => entry.type === "message" && entry.message.role === "user");
+	if (!objective) throw new Error("missing objective");
+	harness.sessionManager.appendCustomEntry("context-rollover-checkpoint", {
+		version: 1,
+		checkpoint: {
+			version: 1,
+			checkpointId,
+			promptGeneration: 0,
+			contextEpoch: 0,
+			coveredStartEntryId: compactionPrefix.coveredStartEntryId,
+			coveredEndEntryId: compactionPrefix.coveredEndEntryId,
+			coveredEntryIds: [compactionPrefix.coveredStartEntryId, compactionPrefix.coveredEndEntryId],
+			sourcePrefixFingerprint: "test-source",
+			todoStateEntryId: null,
+			todoStateFingerprint: "test-todo",
+			requestConfigFingerprint: "test-config",
+			compactionPrefix,
+			note: {
+				version: 1,
+				objective: { text: "Keep deployment private", sourceEntryIds: [objective.id] },
+				userConstraints: [],
+				acceptanceCriteria: { status: "not_specified", items: [] },
+				decisions: [],
+				completedWork: [],
+				currentState: { text: "Compaction pending", evidenceEntryIds: [objective.id] },
+				failedAttempts: [],
+				nextAction: { text: "Continue compaction", evidenceEntryIds: [] },
+				historyRefs: [],
+			},
+		},
+		taskNoteBatch: { version: 1, batchId: createTaskNoteBatchId(checkpointId, []), events: [] },
+	});
+}
 
 describe("memory-context-integrity: prefix checkpoint", () => {
 	const harnesses: Harness[] = [];
@@ -40,9 +80,8 @@ describe("memory-context-integrity: prefix checkpoint", () => {
 		const checkpoint = createPrefixCheckpoint(entries, preparation, "Deployment must remain private", usage);
 		return { h, first, preparation, checkpoint };
 	}
-	it("T02/T05 reuses persisted checkpoints after tail append and export", async () => {
+	it("T02/T05 reuses checkpoints after tail append and source export", async () => {
 		const { h, checkpoint } = await seed();
-		h.sessionManager.appendCustomEntry("two-pass-prefire", checkpoint);
 		h.sessionManager.appendMessage(fauxAssistantMessage("new progress"));
 		h.sessionManager.appendMessage({ role: "user", content: "new question", timestamp: 3 });
 		const restored = SessionManager.open(h.session.exportToJsonl(`${h.tempDir}/checkpoint.jsonl`));
@@ -91,7 +130,7 @@ describe("memory-context-integrity: prefix checkpoint", () => {
 	it("T07 accounts for a completed prefix before reuse and counts it only once after commit", async () => {
 		const { h, preparation, checkpoint } = await seed();
 		const before = h.session.getSessionStats();
-		h.sessionManager.appendCustomEntry("two-pass-prefire", checkpoint);
+		appendCheckpointEnvelope(h, checkpoint);
 		expect(h.session.getSessionStats().cost - before.cost).toBe(checkpoint.usage!.cost.total);
 		const incremental = reusePrefixCheckpoint(h.sessionManager.getBranch(), preparation, checkpoint)!;
 		const result = await compact(
@@ -164,14 +203,14 @@ describe("memory-context-integrity: prefix checkpoint", () => {
 			expect(
 				h.sessionManager
 					.getEntries()
-					.some((entry) => entry.type === "custom" && entry.customType === "two-pass-prefire"),
+					.some((entry) => entry.type === "custom" && entry.customType === "context-rollover-checkpoint"),
 			).toBe(false);
 			expect(calls).toBe(1);
 		},
 	);
 	it("T07 records nonzero usage for both stages without charging the prefix twice", async () => {
 		const { h, checkpoint } = await seed();
-		h.sessionManager.appendCustomEntry("two-pass-prefire", checkpoint);
+		appendCheckpointEnvelope(h, checkpoint);
 		h.sessionManager.appendMessage(fauxAssistantMessage("tail work"));
 		h.sessionManager.appendMessage({ role: "user", content: "new tail", timestamp: 4 });
 		const entries = h.sessionManager.getBranch();

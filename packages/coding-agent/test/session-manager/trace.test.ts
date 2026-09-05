@@ -17,8 +17,7 @@ function requestHeader(turn: number, step: number): SessionTraceEvent {
 			header: {
 				provider: "test",
 				model: "trace-model",
-				systemPrompt: "system",
-				messages: [{ role: "user", content: "prompt", timestamp: 1 }],
+				messages: [{ role: "user" }],
 			},
 		},
 	};

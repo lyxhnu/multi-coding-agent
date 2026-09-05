@@ -24,6 +24,7 @@ describe("Plan Mode", () => {
 		await harness.session.prompt("plan this out");
 		expect(harness.session.getActiveToolNames().sort()).toEqual(
 			[
+				"context_note",
 				"enter_plan_mode",
 				"exit_plan_mode",
 				"find",

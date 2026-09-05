@@ -2,6 +2,10 @@ import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import type {
+	ContextMaintenanceSnapshot,
+	ReductionAttemptResult,
+} from "../../src/core/compaction/context-maintenance.ts";
 import {
 	MemoryStore,
 	projectMemoryDir,
@@ -10,6 +14,16 @@ import {
 } from "../../src/core/memory/memory-store.ts";
 import { checkMemoryCandidate } from "../../src/core/memory/secret-filter.ts";
 import { createHarness, type Harness } from "./harness.ts";
+
+type CompactionInternals = {
+	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
+	_runSoftCompaction: (
+		cause: "threshold",
+		willRetry: boolean,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	) => Promise<ReductionAttemptResult>;
+};
 
 describe("memory-context-integrity: effective memory", () => {
 	const harnesses: Harness[] = [];
@@ -150,9 +164,8 @@ describe("memory-context-integrity: effective memory", () => {
 		expect(result).toMatchObject({ attempted: true, written: 0, skipped: 1, reasons: ["secret_pattern"] });
 		expect(JSON.stringify(result)).not.toContain("simulated-secret");
 		h.setResponses([fauxAssistantMessage(simulatedSecret), fauxAssistantMessage("turn summary")]);
-		await (
-			h.session as unknown as { _runAutoCompaction(reason: "threshold", retry: boolean): Promise<boolean> }
-		)._runAutoCompaction("threshold", false);
+		const internals = h.session as unknown as CompactionInternals;
+		await internals._runSoftCompaction("threshold", false, await internals._contextMaintenanceSnapshot(), 1);
 		const archive = h.sessionManager
 			.getEntries()
 			.filter((entry) => entry.type === "trace" && entry.event.type === "memory/archive");

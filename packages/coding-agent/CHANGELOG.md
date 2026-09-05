@@ -4,13 +4,15 @@
 
 ### Breaking Changes
 
-- Set the default active model tool set to `read`, `bash`, `edit`, `write`, and session-scoped `history_get`. Other built-ins must be selected explicitly; memory and LSP tools are registered only when configured.
+- Set the default active model tool set to `read`, `bash`, `edit`, `write`, and session-scoped `history_get` and `context_note`. Other built-ins must be selected explicitly; memory and LSP tools are registered only when configured.
 - Replaced unreachable background task states with an explicit `running`/`cancelling`/terminal state machine; `TaskManager.wait()` now reports its own deadline separately from task status.
 - Changed memory notes to require a committed compaction ID and return write/rejection results. Automatic consolidation uses source-identified snapshots and a processed-ID/hash state instead of filename watermarks; old state files are not silently migrated. `memory_get` now returns the effective, non-revoked safe view, not raw Markdown.
 - Added `runState` to RPC `get_state` and `reasons` to memory-flush results. Consumers must handle `context_limit` as non-completion. Automatic memory-flush outcomes now live in trace, separately from compaction entry details.
 
 ### Added
 
+- Added Context Rollover for continuing capacity-blocked work in a new context epoch using validated checkpoints, dynamic Todo projection, prepared dispatch, durable queue receipts, crash journals, trace, and RPC state.
+- Added branch-scoped Task Note events and deterministic projections, atomic Checkpoint Note batches, evidence freshness, authoritative final-Handoff validation, and Task Note trace/RPC diagnostics.
 - Added `history_get` for bounded Unicode text pages from shaken ancestors, without tool re-execution or replay of historical memory results.
 - Added source-validated incremental compaction checkpoints, source-linked body fact extraction, stable note identities and journaled idempotent archive commits.
 - Added budget, prefix/commit summary and memory-archive trace diagnostics, including persistence/export for requests stopped before the first assistant response.
@@ -28,6 +30,7 @@
 ### Changed
 
 - Changed `memory_search` ranking: term scores now decay with age (floored at 70%, half-life 90 days for curated MEMORY.md blocks and 14 days for session notes) and the top candidates are MMR-reranked so near-duplicate entries don't crowd out complementary ones.
+- Unified automatic context reduction behind a bounded, verified maintenance state machine with structured attempt outcomes and trace diagnostics.
 
 ### Fixed
 

@@ -13,20 +13,22 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import type {
 	Agent,
 	AgentEvent,
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	PreparedContinuation,
 	PrepareNextTurnContext,
 	ShakeConfig,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
+	applyRedactions,
 	buildRedactions,
 	collectShakeRegions,
 	DEFAULT_SHAKE_CONFIG,
@@ -66,7 +68,6 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
 	createPrefixCheckpoint,
 	isCheckpointUsage,
-	isPrefixCheckpoint,
 	type PrefixSummaryCheckpoint,
 	reusePrefixCheckpoint,
 	validatePrefixCheckpoint,
@@ -74,16 +75,48 @@ import {
 import {
 	type CompactionEntryDetails,
 	type CompactionResult,
+	type ContextMaintenanceAction,
+	type ContextMaintenanceBudget,
+	type ContextMaintenanceOutcome,
+	type ContextMaintenanceSnapshot,
+	type ContextMaintenanceTransition,
+	type ContextMaintenanceTrigger,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	createContextMaintenanceBudget,
+	createContextMaintenanceRequestFingerprint,
+	createContextMaintenanceSourceFingerprint,
 	createWallClockBudgetSignal,
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	generateSummaryWithUsage,
 	prepareCompaction,
+	type ReductionAttemptResult,
+	type ReductionFailureReason,
+	type ReductionMethod,
+	type ReductionWarning,
+	resolveContextMaintenanceAction,
+	runContextMaintenance,
 	shouldPrefireTwoPass,
 } from "./compaction/index.ts";
+import {
+	assembleContextRolloverBundle,
+	type ContextRolloverBundle,
+	type ContextRolloverCommitResult,
+	collectStrongProgressCreditIds,
+	createContextRolloverCheckpointEnvelope,
+	createContextRolloverDispatchId,
+	fingerprintContextRolloverValue,
+	formatContextRolloverCheckpointPrompt,
+	isContextRolloverCheckpointEnvelope,
+	parseContextRolloverCheckpointOutput,
+	selectLatestContextRolloverCheckpoint,
+	shouldStartContextRollover,
+	validateFinalHandoff,
+	validatePreparedRolloverBudget,
+} from "./context-rollover.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -120,9 +153,10 @@ import { McpManager, type McpServerConfig } from "./mcp/mcp-manager.ts";
 import { extractMemory, memoryExtractionContext } from "./memory/consolidation.ts";
 import { createOpenAiCompatibleEmbedder, resolveEmbeddingConfig } from "./memory/embeddings.ts";
 import { MemoryStore } from "./memory/memory-store.ts";
-import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import { type BashExecutionMessage, type CustomMessage, createCustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
+import { PendingDeliveryStore } from "./pending-delivery.ts";
 import { JsonlPermissionAuditLog, NULL_AUDIT_LOG } from "./permissions/audit-log.ts";
 import { PermissionService } from "./permissions/permission-service.ts";
 import { decideToolPermission } from "./permissions/policy.ts";
@@ -136,13 +170,24 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { SandboxManager } from "./sandbox/sandbox-manager.ts";
 import { resolveSandboxSettings, type SandboxProfileName } from "./sandbox/types.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	ContextProgressEntry,
+	ContextRolloverDispatchEntry,
+	ContextRolloverEntry,
+	SessionEntry,
+	SessionManager,
+} from "./session-manager.ts";
 import {
+	buildSessionContext,
 	CURRENT_SESSION_VERSION,
 	collectShakenIndex,
+	collectShakeRedactions,
 	getLatestCompactionEntry,
 	getLatestCustomEntryData,
 	type SessionHeader,
+	sessionEntryToContextMessages,
 } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -154,6 +199,12 @@ import {
 	SubagentCoordinator,
 } from "./subagents/subagent-coordinator.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
+import {
+	buildTaskNoteProjectionFromBranch,
+	createTaskNoteFreshnessResolver,
+	fingerprintTaskNoteWorkspaceContent,
+	resolveTaskNoteScope,
+} from "./task-note-projection.ts";
 import { TaskManager } from "./tasks/task-manager.ts";
 import {
 	shouldFireTodoGate,
@@ -163,6 +214,7 @@ import {
 } from "./todo/reminder-policy.ts";
 import { TodoStateStore } from "./todo/todo-state.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import { createContextNoteToolDefinition } from "./tools/context-note.ts";
 import { createHistoryGetToolDefinition } from "./tools/history-get.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createLspToolDefinition } from "./tools/lsp.ts";
@@ -223,7 +275,7 @@ export type ShakeReason = "manual" | "threshold" | "compaction-budget-exhausted"
 
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
-	| Exclude<AgentEvent, { type: "agent_end" | "request_start" }>
+	| Exclude<AgentEvent, { type: "agent_end" | "request_start" | "queue_delivery" }>
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
@@ -398,16 +450,89 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+function messageText(message: AgentMessage): string {
+	if (message.role !== "user" && message.role !== "custom") return "";
+	return contentText(message.content, "");
+}
+
+const TASK_NOTE_REFERENCE_CATALOG_TYPE = "task-note-reference-catalog";
+const TASK_NOTE_REFERENCE_CATALOG_PREFIX = "Task Note reference catalog (system metadata; not evidence by itself).";
+const MAX_TASK_NOTE_REFERENCE_CATALOG_ENTRIES = 64;
+
+function createTaskNoteReferenceCatalog(branch: readonly SessionEntry[]): CustomMessage | undefined {
+	const references = branch.flatMap((entry): Record<string, unknown>[] => {
+		if (entry.type === "message") {
+			const reference: Record<string, unknown> = {
+				entryId: entry.id,
+				entryType: entry.type,
+				role: entry.message.role,
+			};
+			if (entry.message.role === "assistant") {
+				const toolCalls = entry.message.content.flatMap((block) =>
+					block.type === "toolCall" ? [{ toolCallId: block.id, toolName: block.name }] : [],
+				);
+				if (toolCalls.length > 0) reference.toolCalls = toolCalls;
+			} else if (entry.message.role === "toolResult") {
+				reference.toolCallId = entry.message.toolCallId;
+				reference.toolName = entry.message.toolName;
+				reference.isError = entry.message.isError;
+			}
+			return [reference];
+		}
+		if (entry.type === "context_progress") {
+			return [
+				{
+					entryId: entry.id,
+					entryType: entry.type,
+					evidenceKind: entry.evidenceKind,
+					outcome: entry.outcome,
+					...(entry.toolCallId === undefined ? {} : { toolCallId: entry.toolCallId }),
+					...(entry.taskId === undefined ? {} : { taskId: entry.taskId }),
+					...(entry.subjectId === undefined ? {} : { subjectId: entry.subjectId }),
+				},
+			];
+		}
+		if (entry.type === "custom_message" && entry.customType === "user-provenance") {
+			return [{ entryId: entry.id, entryType: entry.type, customType: entry.customType }];
+		}
+		return [];
+	});
+	const visibleReferences = references.slice(-MAX_TASK_NOTE_REFERENCE_CATALOG_ENTRIES);
+	if (visibleReferences.length === 0) return undefined;
+	return {
+		role: "custom",
+		customType: TASK_NOTE_REFERENCE_CATALOG_TYPE,
+		content:
+			`${TASK_NOTE_REFERENCE_CATALOG_PREFIX} ` +
+			"Use these persisted entry IDs for context_note sourceRefs/evidenceRefs. " +
+			`Authority and evidence come only from the referenced Session entry.\n${JSON.stringify(visibleReferences)}`,
+		display: false,
+		timestamp: 0,
+	};
+}
+
+function contextRolloverDispatchOutcome(
+	runState: AgentState["runState"],
+	promptAborted: boolean,
+): ContextRolloverDispatchEntry["outcome"] {
+	if (runState.status === "idle") {
+		switch (runState.lastOutcome?.type) {
+			case "context_limit":
+				return "context_limit";
+			case "aborted":
+				return "aborted";
+			case "failed":
+				return "failed";
+			case "completed":
+				return "completed";
+		}
+	}
+	return promptAborted ? "aborted" : "failed";
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
-
-/**
- * Most mid-prompt compactions allowed for a single prompt (see AgentSession._installContextGuard).
- * Each one is a model call on a 300s budget, so an unbounded loop here would burn the whole run;
- * once spent, the length/overflow paths take over.
- */
-const MAX_MID_PROMPT_COMPACTIONS = 3;
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
@@ -430,32 +555,28 @@ export class AgentSession {
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
-	/** Tracks pending steering messages for UI display. Removed when delivered. */
-	private _steeringMessages: string[] = [];
-	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
-	private _followUpMessages: string[] = [];
-	/** Messages queued to be included with the next user prompt as context ("asides"). */
-	private _pendingNextTurnMessages: CustomMessage[] = [];
+	private _pendingDeliveryStore: PendingDeliveryStore;
+	private _deliveredPendingMessages = new WeakSet<object>();
+	private _rolloverDispatchPreparationId: string | undefined;
+	private _rolloverResumeInFlight: Promise<void> | undefined;
+	private _contextRolloverInFlight: { sourceRequestFingerprint: string; promise: Promise<boolean> } | undefined;
+	private _toolEvidenceInputs = new Map<string, { toolName: string; args: unknown }>();
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
-	private _overflowRecoveryAttempted = false;
+	private _contextMaintenanceAbortController: AbortController | undefined = undefined;
+	private _contextMaintenancePromptGeneration = 0;
+	private _contextMaintenanceTriggerSequence = 0;
+	private _contextMaintenanceBudget: ContextMaintenanceBudget = createContextMaintenanceBudget(0);
+	private _contextMaintenanceInFlight:
+		| { fingerprint: string; maintenanceId: string; promise: Promise<ContextMaintenanceOutcome> }
+		| undefined;
 	/** At most one prefix checkpoint generation is in flight. */
 	private _twoPassPrefireInFlight = false;
 	private _twoPassPrefireAbortController: AbortController | undefined = undefined;
-	/**
-	 * Mid-run compactions already performed for the current prompt (see _installContextGuard). Bounded:
-	 * each one costs a model call, so a context that stays over the line after compacting (a single 100k
-	 * tool result, say) must not be allowed to spend the whole time budget compacting in a circle.
-	 */
-	private _midPromptCompactions = 0;
-	/**
-	 * Set by the context guard when it stops the loop to rescue-shake instead of compacting (the
-	 * mid-prompt compaction budget is spent). Consumed by _handlePostAgentRun.
-	 */
+	private _contextCheckpointPromise: Promise<void> | undefined;
 	private _promptAborted = false;
-	private _lastLimitedInput: number | undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -526,6 +647,18 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		this._pendingDeliveryStore = new PendingDeliveryStore(this.sessionManager);
+		const contextCoordinates = this.sessionManager.getLatestContextCoordinates();
+		const contextUsage = this.sessionManager.getContextOperationUsage(
+			contextCoordinates.promptGeneration,
+			contextCoordinates.contextEpoch,
+		);
+		this._contextMaintenancePromptGeneration = contextCoordinates.promptGeneration;
+		this._contextMaintenanceBudget = createContextMaintenanceBudget(
+			contextCoordinates.promptGeneration,
+			contextCoordinates.contextEpoch,
+			contextUsage,
+		);
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -538,6 +671,13 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
+		for (const item of this._pendingDeliveryStore.snapshot().items) {
+			if (item.channel === "steering") {
+				this.agent.steer({ queueItemId: item.queueItemId, message: item.message });
+			} else if (item.channel === "follow_up") {
+				this.agent.followUp({ queueItemId: item.queueItemId, message: item.message });
+			}
+		}
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._permissionService = new PermissionService({
 			getMode: () => (this._planModeState.status !== "off" ? "plan" : this.settingsManager.getPermissionMode()),
@@ -569,6 +709,28 @@ export class AgentSession {
 				transition.to === "failed" ||
 				transition.to === "cancelled"
 			) {
+				const completedTask =
+					transition.to === "completed"
+						? this._taskManager
+								.list()
+								.find((task) => task.taskId === transition.taskId && task.status === "completed")
+						: undefined;
+				if (
+					completedTask?.status === "completed" &&
+					(completedTask.result !== undefined || completedTask.exitCode === 0)
+				) {
+					this.sessionManager.appendContextProgress({
+						evidenceId: fingerprintContextRolloverValue({ kind: "task_completed", taskId: transition.taskId }),
+						evidenceKind: "task_completed",
+						targetFingerprint: fingerprintContextRolloverValue({ taskId: transition.taskId }),
+						resultFingerprint: fingerprintContextRolloverValue({
+							result: completedTask.result,
+							exitCode: completedTask.exitCode,
+						}),
+						outcome: "succeeded",
+						taskId: transition.taskId,
+					});
+				}
 				this._taskTraceTurns.delete(transition.taskId);
 			}
 		});
@@ -900,29 +1062,45 @@ export class AgentSession {
 	}
 
 	private async _requestBudget(): Promise<ContextBudget> {
-		return calculateContextBudget(
-			this.agent.state.model,
-			{
-				systemPrompt: this.agent.state.systemPrompt,
-				tools: this.agent.state.tools,
-				messages: await this.agent.convertToLlm(this.agent.state.messages),
-			},
-			this.agent.getContextBudgetOptions?.(this.agent.state.model),
-		);
+		return (await this._contextMaintenanceSnapshot()).budget;
 	}
 
-	private _validateCompactionCommit(summary: string, firstKeptEntryId: string, sourceFingerprint: string): void {
+	private async _contextMaintenanceSnapshot(): Promise<ContextMaintenanceSnapshot> {
+		const model = this.agent.state.model;
+		const context = {
+			systemPrompt: this.agent.state.systemPrompt,
+			tools: this.agent.state.tools,
+			messages: await this.agent.convertToLlm(this.agent.state.messages),
+		};
+		const options = this.agent.getContextBudgetOptions?.(model) ?? {};
+		return {
+			fingerprint: createContextMaintenanceRequestFingerprint(
+				context,
+				model,
+				options,
+				this.agent.state.thinkingLevel === "off" ? undefined : this.agent.state.thinkingLevel,
+			),
+			sourceFingerprint: createContextMaintenanceSourceFingerprint(this.sessionManager.getBranch()),
+			budget: calculateContextBudget(model, context, options),
+		};
+	}
+
+	private _validateCompactionCommit(
+		summary: string,
+		firstKeptEntryId: string,
+		sourceFingerprint: string,
+	): "valid" | "invalid" | "superseded" {
 		const branch = this.sessionManager.getBranch();
 		const keptIndex = branch.findIndex((entry) => entry.id === firstKeptEntryId);
 		const firstMessage = branch.slice(keptIndex).find((entry) => entry.type === "message");
+		if (createContextMaintenanceSourceFingerprint(branch) !== sourceFingerprint) return "superseded";
 		if (
 			!summary.trim() ||
 			keptIndex < 0 ||
-			(firstMessage?.type === "message" && firstMessage.message.role === "toolResult") ||
-			createHash("sha256").update(JSON.stringify(branch)).digest("hex") !== sourceFingerprint
-		) {
-			throw new Error("Invalid or stale compaction result");
-		}
+			(firstMessage?.type === "message" && firstMessage.message.role === "toolResult")
+		)
+			return "invalid";
+		return "valid";
 	}
 	/**
 	 * Mechanical context reduction: replace the heaviest regions still in context with placeholders.
@@ -935,7 +1113,10 @@ export class AgentSession {
 	 * Redactions are persisted as a {@link ShakeEntry} and replayed on every context build, so the
 	 * reduction survives a reload — unlike an in-place edit of an append-only log.
 	 */
-	async shake(config: ShakeConfig, reason: ShakeReason): Promise<number> {
+	private _commitShake(
+		config: ShakeConfig,
+		reason: ShakeReason,
+	): { tokensSaved: number; warnings: ReductionWarning[] } {
 		const resolved = resolveShakeConfig(config, (warning) => console.warn(warning));
 		const entries = this.sessionManager.buildContextEntries();
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
@@ -945,7 +1126,7 @@ export class AgentSession {
 			collectShakenIndex(this.sessionManager.getBranch()),
 			estimateTokens,
 		);
-		if (regions.length === 0) return 0;
+		if (regions.length === 0) return { tokensSaved: 0, warnings: [] };
 
 		const historyAvailable =
 			this.getActiveToolNames().includes("history_get") &&
@@ -958,16 +1139,48 @@ export class AgentSession {
 				args: {},
 			}).decision === "allow";
 		const redactions = buildRedactions(entries, regions, historyAvailable);
-		if (redactions.length === 0) return 0;
+		if (redactions.length === 0) return { tokensSaved: 0, warnings: [] };
 
 		const tokensSaved = estimateShakeSavings(regions);
 		this.sessionManager.appendShake(redactions, tokensSaved, reason);
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
-		this._emit({ type: "shake", reason, tokensSaved, regionCount: regions.length });
-		return tokensSaved;
+		const warnings: ReductionWarning[] = [];
+		try {
+			this._emit({ type: "shake", reason, tokensSaved, regionCount: regions.length });
+		} catch {
+			warnings.push("ui_notification_failed");
+		}
+		return { tokensSaved, warnings };
+	}
+
+	async shake(config: ShakeConfig, reason: ShakeReason): Promise<number> {
+		return this._commitShake(config, reason).tokensSaved;
 	}
 
 	private _installAgentNextTurnRefresh(): void {
+		const previousProjectUsageContext = this.agent.projectUsageContext;
+		this.agent.projectUsageContext = (messages) => {
+			const projected = previousProjectUsageContext?.(messages) ?? messages;
+			return projected.filter(
+				(message) =>
+					message.role !== "user" ||
+					message.timestamp !== 0 ||
+					!contentText(message.content, "").startsWith(TASK_NOTE_REFERENCE_CATALOG_PREFIX),
+			);
+		};
+		const previousTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformedMessages = previousTransformContext
+				? await previousTransformContext(messages, signal)
+				: messages;
+			const messagesWithoutCatalog = transformedMessages.filter(
+				(message) => message.role !== "custom" || message.customType !== TASK_NOTE_REFERENCE_CATALOG_TYPE,
+			);
+			if (!this.getActiveToolNames().includes("context_note")) return messagesWithoutCatalog;
+			const catalog = createTaskNoteReferenceCatalog(this.sessionManager.getBranch());
+			return catalog === undefined ? messagesWithoutCatalog : [...messagesWithoutCatalog, catalog];
+		};
+
 		const previousPrepareNextTurnWithContext =
 			this.agent.prepareNextTurnWithContext ??
 			(this.agent.prepareNextTurn
@@ -976,11 +1189,24 @@ export class AgentSession {
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
 			const previousContext = previousSnapshot?.context ?? turn.context;
+			const refreshedMessages =
+				this.sessionManager.getContextRolloverState().contextEpoch > 0
+					? this.sessionManager.buildSessionContext().messages
+					: previousContext.messages;
+			const model = previousSnapshot?.model ?? this.agent.state.model;
+			const policy = this.settingsManager.getCompactionPolicy();
+			const budget = calculateContextBudget(model, {
+				systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+				tools: this.agent.state.tools,
+				messages: await this.agent.convertToLlm(refreshedMessages),
+			});
+			if (shouldPrefireTwoPass(budget.tokens, model.contextWindow, policy)) this._maybeStartTwoPassPrefire();
 
 			return {
 				...previousSnapshot,
 				context: {
 					...previousContext,
+					messages: refreshedMessages,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
 					tools: this.agent.state.tools.slice(),
 				},
@@ -1002,10 +1228,15 @@ export class AgentSession {
 	}
 
 	private _emitQueueUpdate(): void {
+		const snapshot = this._pendingDeliveryStore.snapshot();
 		this._emit({
 			type: "queue_update",
-			steering: [...this._steeringMessages],
-			followUp: [...this._followUpMessages],
+			steering: snapshot.items
+				.filter((item) => item.channel === "steering")
+				.map((item) => messageText(item.message)),
+			followUp: snapshot.items
+				.filter((item) => item.channel === "follow_up")
+				.map((item) => messageText(item.message)),
 		});
 	}
 
@@ -1034,7 +1265,13 @@ export class AgentSession {
 			const state = this.agent.state.runState;
 			if (state.status === "idle" && state.lastOutcome?.type === "context_limit") {
 				this._extensionUIContext?.notify(
-					"context_limit: insufficient context after bounded reduction; task is not complete.",
+					"context_limit: context maintenance is exhausted and the task is not complete; reduce context or switch to a model with a larger context window.",
+					"error",
+				);
+			}
+			if (this.contextRolloverState.dispatchState === "outcome_unknown") {
+				this._extensionUIContext?.notify(
+					"Context rollover stopped: Provider or tool outcome is unknown. Nothing was replayed automatically; inspect external state before sending a new prompt.",
 					"error",
 				);
 			}
@@ -1126,7 +1363,7 @@ export class AgentSession {
 
 	/** Maps a subagent capability_mode to concrete base tool names, filtered against this session's own registry so a subagent never gains a tool the parent itself does not have. */
 	private _capabilityModeToolNames(mode: "read-only" | "read-write" | "execute" | "all"): string[] {
-		const readOnly = ["read", "grep", "find", "ls", "todo_write", "history_get"];
+		const readOnly = ["read", "grep", "find", "ls", "todo_write", "history_get", "context_note"];
 		const wanted =
 			mode === "read-only"
 				? readOnly
@@ -1148,7 +1385,7 @@ export class AgentSession {
 			}
 			this._traceTurn = this._nextTraceTurn++;
 			this._traceStep = -1;
-			this.sessionManager.appendTrace({ type: "turn/start", data: { turn: this._traceTurn } });
+			this._appendTraceSafely({ type: "turn/start", data: { turn: this._traceTurn } });
 			return;
 		}
 
@@ -1208,7 +1445,6 @@ export class AgentSession {
 					step: this._traceStep,
 					callId: event.toolCallId,
 					name: event.toolName,
-					arguments: structuredClone(event.args as unknown),
 				},
 			};
 		} else if (event.type === "tool_execution_end") {
@@ -1235,7 +1471,7 @@ export class AgentSession {
 		}
 
 		if (traceEvent) {
-			this.sessionManager.appendTrace(traceEvent);
+			this._appendTraceSafely(traceEvent);
 		}
 		if (event.type === "agent_end") {
 			this._traceTurn = undefined;
@@ -1243,44 +1479,119 @@ export class AgentSession {
 		}
 	}
 
+	private _recordToolProgress(
+		toolCallId: string,
+		toolName: string,
+		args: unknown,
+		result: unknown,
+		failed: boolean,
+	): void {
+		if (toolName === "context_note") return;
+		const record = typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+		const target = record.path ?? record.filePath ?? record.url ?? record.command;
+		const workspacePath =
+			(toolName === "read" || toolName === "write" || toolName === "edit") && typeof target === "string"
+				? resolve(this._cwd, target)
+				: undefined;
+		const subjectId = workspacePath === undefined ? undefined : `workspace-file:${workspacePath}`;
+		let workspaceFingerprint: string | undefined;
+		if (workspacePath !== undefined) {
+			try {
+				workspaceFingerprint = fingerprintTaskNoteWorkspaceContent(readFileSync(workspacePath, "utf8"));
+			} catch {
+				workspaceFingerprint = fingerprintTaskNoteWorkspaceContent(undefined);
+			}
+		}
+		const targetFingerprint = fingerprintContextRolloverValue({
+			toolName: toolName === "read" || toolName === "write" || toolName === "edit" ? "workspace-file" : toolName,
+			target: target ?? null,
+		});
+		const resultFingerprint = fingerprintContextRolloverValue(result);
+		const latestEffect = [...this.sessionManager.getBranch()]
+			.reverse()
+			.find(
+				(entry): entry is ContextProgressEntry =>
+					entry.type === "context_progress" &&
+					entry.evidenceKind === "non_read_effect" &&
+					entry.outcome === "succeeded" &&
+					(toolName === "bash" ||
+						(subjectId !== undefined
+							? entry.subjectId === subjectId
+							: entry.targetFingerprint === targetFingerprint)),
+			);
+		if ((toolName === "read" || toolName === "bash" || failed) && latestEffect) {
+			this.sessionManager.appendContextProgress({
+				evidenceId: fingerprintContextRolloverValue({
+					kind: "verification",
+					toolCallId,
+					effect: latestEffect.evidenceId,
+				}),
+				evidenceKind: "verification",
+				targetFingerprint: latestEffect.targetFingerprint,
+				subjectId: latestEffect.subjectId ?? latestEffect.targetFingerprint,
+				inputFingerprint: workspaceFingerprint ?? latestEffect.resultFingerprint,
+				resultFingerprint,
+				outcome: failed ? "failed" : "succeeded",
+				toolCallId,
+			});
+		}
+		if (!failed && ["write", "edit", "bash"].includes(toolName)) {
+			this.sessionManager.appendContextProgress({
+				evidenceId: fingerprintContextRolloverValue({ kind: "effect", toolCallId }),
+				evidenceKind: "non_read_effect",
+				targetFingerprint,
+				subjectId: subjectId ?? targetFingerprint,
+				inputFingerprint: workspaceFingerprint ?? targetFingerprint,
+				resultFingerprint: workspaceFingerprint ?? resultFingerprint,
+				outcome: "succeeded",
+				toolCallId,
+			});
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		this._recordTraceEvent(event);
+		if (event.type === "tool_execution_start") {
+			this._toolEvidenceInputs.set(event.toolCallId, {
+				toolName: event.toolName,
+				args: structuredClone(event.args),
+			});
+		} else if (event.type === "tool_execution_end") {
+			const input = this._toolEvidenceInputs.get(event.toolCallId);
+			this._toolEvidenceInputs.delete(event.toolCallId);
+			if (input) this._recordToolProgress(event.toolCallId, input.toolName, input.args, event.result, event.isError);
+		}
 
-		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
-		// This ensures the UI sees the updated queue state
-		if (event.type === "message_start" && event.message.role === "user") {
-			this._overflowRecoveryAttempted = false;
-			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
-					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
+		if (event.type === "queue_delivery") {
+			for (const item of event.items) {
+				if (
+					this._rolloverDispatchPreparationId === undefined ||
+					event.preparationId !== this._rolloverDispatchPreparationId
+				) {
+					this._pendingDeliveryStore.markDelivered(item.queueItemId, event.preparationId);
 				}
+				this._deliveredPendingMessages.add(item.message as object);
 			}
+			this._emitQueueUpdate();
 		}
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
 
 		// Notify all listeners
-		if (event.type !== "request_start") {
+		if (event.type !== "request_start" && event.type !== "queue_delivery") {
 			this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
+			const deliveredFromQueue = this._deliveredPendingMessages.has(event.message as object);
+			if (deliveredFromQueue) this._deliveredPendingMessages.delete(event.message as object);
 			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
+			if (deliveredFromQueue) {
+				// The receipt projects the authoritative pending message into context.
+			} else if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
 				this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
@@ -1303,9 +1614,6 @@ export class AgentSession {
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error") {
-					this._overflowRecoveryAttempted = false;
-				}
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
@@ -1729,12 +2037,10 @@ export class AgentSession {
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		this._isAgentRunActive = true;
-		this._midPromptCompactions = 0;
 		this._promptAborted = false;
-		this._lastLimitedInput = undefined;
 		try {
 			await this.agent.prompt(messages);
-			while (await this._handlePostAgentRun()) {
+			while ((await this._handlePostAgentRun()) === "continue") {
 				await this.agent.continue();
 			}
 		} finally {
@@ -1744,36 +2050,28 @@ export class AgentSession {
 		}
 	}
 
-	private async _handlePostAgentRun(): Promise<boolean> {
+	private async _handlePostAgentRun(): Promise<ContextMaintenanceAction> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
-		if (this._promptAborted) return false;
+		if (this._promptAborted) return "stop";
 		const runState = this.agent.state.runState;
 		if (runState.status === "idle" && runState.lastOutcome?.type === "context_limit") {
-			const budget = runState.lastOutcome.budget;
-			if (
-				!this.autoCompactionEnabled ||
-				(this._lastLimitedInput !== undefined && budget.tokens >= this._lastLimitedInput)
-			)
-				return false;
-			this._lastLimitedInput = budget.tokens;
-			const rescue = this._midPromptCompactions >= MAX_MID_PROMPT_COMPACTIONS;
-			const saved = await this.shake(
-				rescue ? RESCUE_SHAKE_CONFIG : DEFAULT_SHAKE_CONFIG,
-				rescue ? "compaction-budget-exhausted" : "threshold",
-			);
-			if (this._promptAborted) return false;
-			if (saved > 0 && (await this._requestBudget()).decision !== "context_limit") return true;
-			if (rescue) return saved > 0;
-			this._midPromptCompactions++;
-			return await this._runAutoCompaction("threshold", true);
+			if (!this.autoCompactionEnabled) return "stop";
+			const snapshot = await this._contextMaintenanceSnapshot();
+			this._contextMaintenanceBudget.rejectedRequestFingerprints.add(snapshot.fingerprint);
+			return await this._runContextMaintenance({
+				triggerId: this._nextContextMaintenanceTriggerId(),
+				cause: "budget_limit",
+				phase: "mid_run",
+				continuation: "required",
+			});
 		}
 		if (!msg) {
-			return false;
+			return "wait";
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return true;
+			return "continue";
 		}
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
@@ -1788,19 +2086,18 @@ export class AgentSession {
 
 		// If the guard stopped a turn that was still issuing tool calls, a successful reduction must
 		// continue the agent. Otherwise a threshold shake/compaction turns into a silent mid-action stop.
-		if (await this._checkCompaction(msg, true, msg.stopReason === "toolUse")) {
-			return true;
-		}
+		const maintenanceAction = await this._checkCompaction(msg, true, msg.stopReason === "toolUse");
+		if (maintenanceAction !== "wait") return maintenanceAction;
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
 		if (this.agent.hasQueuedMessages()) {
-			return true;
+			return "continue";
 		}
 
 		// TodoGate (see reminder-policy.ts): queue a forced continuation while pending todos remain.
 		// Must run before _emitAgentSettled, otherwise the queued follow-up would never be drained.
-		return this._maybeTriggerTodoGate();
+		return this._maybeTriggerTodoGate() ? "continue" : "wait";
 	}
 
 	/**
@@ -1895,6 +2192,30 @@ export class AgentSession {
 				}
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 			}
+			const rolloverState = this.sessionManager.getContextRolloverState();
+			if (
+				rolloverState.dispatchState === "outcome_unknown" &&
+				rolloverState.dispatchId !== undefined &&
+				rolloverState.rolloverId !== undefined
+			) {
+				const startedDispatch = [...this.sessionManager.getBranch()]
+					.reverse()
+					.find(
+						(entry) =>
+							entry.type === "context_rollover_dispatch" && entry.dispatchId === rolloverState.dispatchId,
+					);
+				this.sessionManager.appendContextRolloverDispatch({
+					dispatchId: rolloverState.dispatchId,
+					rolloverId: rolloverState.rolloverId,
+					state: "blocked",
+					requestFingerprint:
+						startedDispatch?.type === "context_rollover_dispatch"
+							? startedDispatch.requestFingerprint
+							: "unknown",
+					reason: "dispatch_outcome_unknown",
+				});
+			}
+			this._beginContextMaintenancePrompt();
 
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
@@ -1917,11 +2238,15 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 
-			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this._pendingNextTurnMessages) {
-				messages.push(msg);
+			// next_prompt retains its original meaning: deliver only with a new user prompt.
+			const nextPromptItems = this._pendingDeliveryStore
+				.snapshot()
+				.items.filter((item) => item.channel === "next_prompt");
+			for (const item of nextPromptItems) {
+				this._pendingDeliveryStore.markDelivered(item.queueItemId);
+				this._deliveredPendingMessages.add(item.message as object);
+				messages.push(item.message);
 			}
-			this._pendingNextTurnMessages = [];
 
 			// Emit before_agent_start extension event
 			const result = await this._extensionRunner.emitBeforeAgentStart(
@@ -2084,34 +2409,34 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
-		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
+		const queued = this._pendingDeliveryStore.enqueue("steering", {
 			role: "user",
 			content,
 			timestamp: Date.now(),
 		});
+		this.agent.steer(queued);
+		this._emitQueueUpdate();
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
+		const queued = this._pendingDeliveryStore.enqueue("follow_up", {
 			role: "user",
 			content,
 			timestamp: Date.now(),
 		});
+		this.agent.followUp(queued);
+		this._emitQueueUpdate();
 	}
 
 	/**
@@ -2155,14 +2480,18 @@ export class AgentSession {
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
-			this._pendingNextTurnMessages.push(appMessage);
+			this._pendingDeliveryStore.enqueue("next_prompt", appMessage);
 		} else if (this.isStreaming) {
+			const channel = options?.deliverAs === "followUp" ? "follow_up" : "steering";
+			const queued = this._pendingDeliveryStore.enqueue(channel, appMessage);
 			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(appMessage);
+				this.agent.followUp(queued);
 			} else {
-				this.agent.steer(appMessage);
+				this.agent.steer(queued);
 			}
+			this._emitQueueUpdate();
 		} else if (options?.triggerTurn) {
+			this._beginContextMaintenancePrompt();
 			await this._runAgentPrompt(appMessage);
 		} else {
 			this.agent.state.messages.push(appMessage);
@@ -2223,10 +2552,16 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
-		this._steeringMessages = [];
-		this._followUpMessages = [];
+		const queueItems = this._pendingDeliveryStore
+			.snapshot()
+			.items.filter((item) => item.channel === "steering" || item.channel === "follow_up");
+		const steering = queueItems
+			.filter((item) => item.channel === "steering")
+			.map((item) => messageText(item.message));
+		const followUp = queueItems
+			.filter((item) => item.channel === "follow_up")
+			.map((item) => messageText(item.message));
+		for (const item of queueItems) this._pendingDeliveryStore.cancel(item.queueItemId);
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -2234,17 +2569,25 @@ export class AgentSession {
 
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
-		return this._steeringMessages.length + this._followUpMessages.length;
+		return this._pendingDeliveryStore
+			.snapshot()
+			.items.filter((item) => item.channel === "steering" || item.channel === "follow_up").length;
 	}
 
 	/** Get pending steering messages (read-only) */
 	getSteeringMessages(): readonly string[] {
-		return this._steeringMessages;
+		return this._pendingDeliveryStore
+			.snapshot()
+			.items.filter((item) => item.channel === "steering")
+			.map((item) => messageText(item.message));
 	}
 
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
-		return this._followUpMessages;
+		return this._pendingDeliveryStore
+			.snapshot()
+			.items.filter((item) => item.channel === "follow_up")
+			.map((item) => messageText(item.message));
 	}
 
 	get resourceLoader(): ResourceLoader {
@@ -2513,7 +2856,7 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
-			const sourceFingerprint = createHash("sha256").update(JSON.stringify(pathEntries)).digest("hex");
+			const sourceFingerprint = createContextMaintenanceSourceFingerprint(pathEntries);
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -2588,7 +2931,9 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this._validateCompactionCommit(summary, firstKeptEntryId, sourceFingerprint);
+			if (this._validateCompactionCommit(summary, firstKeptEntryId, sourceFingerprint) !== "valid") {
+				throw new Error("Invalid or stale compaction result");
+			}
 			const compactionId = this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -2670,6 +3015,7 @@ export class AgentSession {
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+		this._contextMaintenanceAbortController?.abort();
 	}
 
 	/**
@@ -2677,6 +3023,602 @@ export class AgentSession {
 	 */
 	abortBranchSummary(): void {
 		this._branchSummaryAbortController?.abort();
+	}
+
+	private _beginContextMaintenancePrompt(): void {
+		this._contextMaintenancePromptGeneration++;
+		this._contextMaintenanceBudget = createContextMaintenanceBudget(this._contextMaintenancePromptGeneration, 0);
+		this.sessionManager.appendCustomEntry("context-prompt-generation", {
+			promptGeneration: this._contextMaintenancePromptGeneration,
+			contextEpoch: 0,
+		});
+	}
+
+	private _nextContextMaintenanceTriggerId(): string {
+		this._contextMaintenanceTriggerSequence++;
+		return `context-trigger-${this._contextMaintenancePromptGeneration}-${this._contextMaintenanceTriggerSequence}`;
+	}
+
+	private _recordContextMaintenanceTransition(
+		trigger: ContextMaintenanceTrigger,
+		transition: ContextMaintenanceTransition,
+	): void {
+		const attempt = transition.attempt;
+		if (transition.method === "soft_compaction" && transition.attemptIndex !== undefined) {
+			const operationId = `${transition.maintenanceId}:soft_compaction:${transition.attemptIndex}`;
+			this.sessionManager.appendContextOperation({
+				operationId,
+				operationKind: "soft_compaction",
+				state: attempt === undefined ? "started" : "finished",
+				promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+				contextEpoch: this._contextMaintenanceBudget.contextEpoch,
+				sourceFingerprint: transition.snapshot.sourceFingerprint,
+				...(attempt === undefined ? {} : { outcome: attempt.outcome }),
+			});
+		}
+		const outcome =
+			transition.state === "ready" || transition.state === "blocked" || transition.state === "cancelled"
+				? transition.state
+				: (attempt?.outcome ?? "entered");
+		this._appendTraceSafely({
+			type: "context/maintenance",
+			data: {
+				maintenanceId: transition.maintenanceId,
+				triggerId: trigger.triggerId,
+				turn: Math.max(0, this._nextTraceTurn - 1),
+				promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+				cause: trigger.cause,
+				phase: trigger.phase,
+				state: transition.state,
+				...(transition.method === undefined ? {} : { method: transition.method }),
+				...(attempt === undefined ? {} : { attemptIndex: attempt.attemptIndex }),
+				requestFingerprint: transition.snapshot.fingerprint,
+				outcome,
+				...(attempt === undefined ? {} : { tokensBefore: attempt.tokensBefore }),
+				...(attempt?.outcome === "committed" ? { tokensAfter: attempt.tokensAfter } : {}),
+				budgetDecision: transition.snapshot.budget.decision,
+				...(transition.verification === undefined ? {} : { verification: transition.verification }),
+				...(attempt?.outcome === "committed" ? { verification: attempt.verification } : {}),
+				...(transition.reasonCode === undefined ? {} : { reasonCode: transition.reasonCode }),
+			},
+		});
+	}
+
+	private async _runAutomaticShake(
+		method: Extract<ReductionMethod, "default_shake" | "rescue_shake">,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	): Promise<ReductionAttemptResult> {
+		if (this._contextMaintenanceAbortController?.signal.aborted || this._promptAborted) {
+			return {
+				outcome: "cancelled",
+				method,
+				attemptIndex,
+				requestFingerprint: snapshot.fingerprint,
+				tokensBefore: snapshot.budget.tokens,
+			};
+		}
+		const currentSourceFingerprint = createContextMaintenanceSourceFingerprint(this.sessionManager.getBranch());
+		if (currentSourceFingerprint !== snapshot.sourceFingerprint) {
+			return {
+				outcome: "superseded",
+				method,
+				attemptIndex,
+				requestFingerprint: snapshot.fingerprint,
+				currentFingerprint: currentSourceFingerprint,
+				tokensBefore: snapshot.budget.tokens,
+			};
+		}
+		const shakeResult = this._commitShake(
+			method === "default_shake" ? DEFAULT_SHAKE_CONFIG : RESCUE_SHAKE_CONFIG,
+			method === "default_shake" ? "threshold" : "compaction-budget-exhausted",
+		);
+		if (shakeResult.tokensSaved === 0) {
+			return {
+				outcome: "unavailable",
+				method,
+				attemptIndex,
+				requestFingerprint: snapshot.fingerprint,
+				tokensBefore: snapshot.budget.tokens,
+				reason: "no_candidate",
+			};
+		}
+		const after = await this._contextMaintenanceSnapshot();
+		return {
+			outcome: "committed",
+			method,
+			attemptIndex,
+			requestFingerprint: snapshot.fingerprint,
+			tokensBefore: snapshot.budget.tokens,
+			tokensAfter: after.budget.tokens,
+			budgetAfter: after.budget,
+			verification:
+				after.budget.decision === "fits"
+					? "fits"
+					: after.budget.decision === "context_limit"
+						? "still_limited"
+						: "unknown",
+			warnings: shakeResult.warnings,
+		};
+	}
+
+	private _contextRolloverRevisions() {
+		const todo = this._todoRevision();
+		const queue = this._pendingDeliveryStore.snapshot();
+		const branch = this.sessionManager.getBranch();
+		return {
+			sessionLeafId: this.sessionManager.getLeafId(),
+			sourceFingerprint: createContextMaintenanceSourceFingerprint(branch),
+			todoStateEntryId: todo.entryId,
+			todoStateFingerprint: todo.fingerprint,
+			queueRevision: queue.revision,
+			progressRevision: fingerprintContextRolloverValue(branch.filter((entry) => entry.type === "context_progress")),
+			requestConfigFingerprint: this._requestConfigFingerprint(),
+		};
+	}
+
+	/**
+	 * Atomically compare all rollover revisions and append the authority entry.
+	 * This method is intentionally synchronous: the comparison and append are one
+	 * JavaScript turn, so no caller or hook can mutate the proposal between them.
+	 */
+	commitContextRollover(
+		expectedRevisions: ReturnType<AgentSession["_contextRolloverRevisions"]>,
+		input: Parameters<SessionManager["appendContextRollover"]>[0],
+	): ContextRolloverCommitResult {
+		if (JSON.stringify(this._contextRolloverRevisions()) !== JSON.stringify(expectedRevisions)) {
+			return { status: "superseded" };
+		}
+		try {
+			return { status: "committed", entryId: this.sessionManager.appendContextRollover(input) };
+		} catch {
+			return { status: "failed" };
+		}
+	}
+
+	private _traceContextRollover(
+		data: Omit<Extract<SessionTraceEvent, { type: "context/rollover" }>["data"], "turn">,
+	): void {
+		this._appendTraceSafely({
+			type: "context/rollover",
+			data: { turn: Math.max(0, this._nextTraceTurn - 1), ...data },
+		});
+	}
+
+	private _appendTraceSafely(event: SessionTraceEvent): void {
+		try {
+			this.sessionManager.appendTrace(event);
+		} catch {
+			console.warn("Failed to append context trace event");
+		}
+	}
+
+	private async _runContextRollover(
+		maintenanceId: string,
+		trigger: ContextMaintenanceTrigger,
+		outcome: Extract<ContextMaintenanceOutcome, { outcome: "blocked" }>,
+	): Promise<boolean> {
+		const inFlight = this._contextRolloverInFlight;
+		if (inFlight) {
+			if (inFlight.sourceRequestFingerprint === outcome.requestFingerprint) return await inFlight.promise;
+			await inFlight.promise;
+			return await this._runContextRollover(maintenanceId, trigger, outcome);
+		}
+		const promise = this._executeContextRollover(maintenanceId, trigger, outcome);
+		this._contextRolloverInFlight = { sourceRequestFingerprint: outcome.requestFingerprint, promise };
+		try {
+			return await promise;
+		} finally {
+			if (this._contextRolloverInFlight?.promise === promise) this._contextRolloverInFlight = undefined;
+		}
+	}
+
+	private async _executeContextRollover(
+		_maintenanceId: string,
+		trigger: ContextMaintenanceTrigger,
+		outcome: Extract<ContextMaintenanceOutcome, { outcome: "blocked" }>,
+		supersedeCount = 0,
+	): Promise<boolean> {
+		const coordinates = this.sessionManager.getLatestContextCoordinates();
+		const rolloverId = randomUUID();
+		const traceBase = {
+			rolloverId,
+			promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+			sourceContextEpoch: this._contextMaintenanceBudget.contextEpoch,
+		} as const;
+		this._traceContextRollover({ ...traceBase, phase: "rollover", outcome: "entered" });
+
+		const rollovers = this.sessionManager
+			.getBranch()
+			.filter((entry): entry is ContextRolloverEntry => entry.type === "context_rollover");
+		const promptRollovers = rollovers.filter(
+			(entry) => entry.promptGeneration === this._contextMaintenanceBudget.promptGeneration,
+		);
+		const block = (reason: Parameters<typeof this._traceContextRollover>[0]["reasonCode"]): false => {
+			this._traceContextRollover({ ...traceBase, phase: "rollover", outcome: "blocked", reasonCode: reason });
+			return false;
+		};
+		if (coordinates.contextEpoch !== this._contextMaintenanceBudget.contextEpoch) return block("source_changed");
+		if (
+			rollovers.some(
+				(entry) =>
+					entry.promptGeneration === this._contextMaintenanceBudget.promptGeneration &&
+					entry.sourceContextEpoch === coordinates.contextEpoch,
+			)
+		) {
+			return block("rollover_already_used");
+		}
+		if (promptRollovers.length >= 8) return block("rollover_limit");
+		if (
+			this._pendingInteractions.list().length > 0 ||
+			this._taskManager.list().some((task) => task.status === "running" || task.status === "cancelling")
+		) {
+			return block("operation_in_flight");
+		}
+		let checkpointResult = this._validContextRolloverCheckpoint();
+		if (!checkpointResult && this._contextCheckpointPromise) {
+			this._traceContextRollover({ ...traceBase, phase: "checkpoint", outcome: "waiting" });
+			await this._contextCheckpointPromise;
+			checkpointResult = this._validContextRolloverCheckpoint();
+		}
+		if (!checkpointResult) return block("checkpoint_missing");
+
+		const branch = this.sessionManager.getBranch();
+		const taskNoteScope = resolveTaskNoteScope(branch, this._contextMaintenanceBudget.promptGeneration);
+		if (taskNoteScope === undefined) return block("handoff_invalid");
+		const taskNoteProjection = buildTaskNoteProjectionFromBranch(
+			branch,
+			taskNoteScope,
+			createTaskNoteFreshnessResolver(branch),
+		);
+		if (taskNoteProjection.status !== "valid") return block("handoff_invalid");
+		const consumedCredits = new Set(rollovers.flatMap((entry) => entry.strongProgressCreditIds));
+		const latestRolloverIndex =
+			rollovers.length === 0 ? -1 : branch.findIndex((entry) => entry.id === rollovers.at(-1)?.id);
+		const progressCredits = collectStrongProgressCreditIds(branch.slice(latestRolloverIndex + 1), consumedCredits);
+		if (promptRollovers.length > 0 && progressCredits.length === 0) return block("no_strong_progress");
+
+		const revisions = this._contextRolloverRevisions();
+		const activeTodos = this._todoStateStore
+			.entries()
+			.flatMap(([id, todo]) =>
+				todo.status === "pending" || todo.status === "in_progress"
+					? [{ id, content: todo.content, priority: todo.priority, status: todo.status }]
+					: [],
+			);
+		let bundle: ContextRolloverBundle;
+		try {
+			bundle = assembleContextRolloverBundle({
+				checkpoint: checkpointResult.checkpoint,
+				checkpointEntryId: checkpointResult.entryId,
+				contextEntries: branch,
+				taskNoteProjection: taskNoteProjection.snapshot,
+				targetContextEpoch: coordinates.contextEpoch + 1,
+				activeTodos,
+				todoStateEntryId: revisions.todoStateEntryId,
+				todoStateFingerprint: revisions.todoStateFingerprint,
+				progressBaselineFingerprint: revisions.progressRevision,
+			});
+			bundle.sourceFingerprint = revisions.sourceFingerprint;
+			validateFinalHandoff({
+				bundle,
+				branch,
+				projection: taskNoteProjection.snapshot,
+				activeTodos,
+				contextWindow: this.model?.contextWindow ?? 0,
+			});
+		} catch (error) {
+			return block(
+				error instanceof Error && error.message === "tool_transaction_incomplete"
+					? "tool_transaction_incomplete"
+					: "handoff_invalid",
+			);
+		}
+
+		const activeIds = new Set(bundle.activeEntryIds);
+		const activeTokens = branch
+			.filter((entry) => activeIds.has(entry.id))
+			.flatMap((entry) =>
+				entry.type === "message"
+					? [entry.message]
+					: entry.type === "custom_message"
+						? [
+								createCustomMessage(
+									entry.customType,
+									entry.content,
+									entry.display,
+									entry.details,
+									entry.timestamp,
+								),
+							]
+						: [],
+			)
+			.reduce((total, message) => total + estimateTokens(message), 0);
+		if (activeTokens > Math.floor(outcome.budget.contextWindow * 0.2)) return block("active_suffix_too_large");
+
+		const provisional: ContextRolloverEntry = {
+			type: "context_rollover",
+			id: `provisional-${rolloverId}`,
+			parentId: revisions.sessionLeafId,
+			timestamp: "1970-01-01T00:00:00.000Z",
+			rolloverId,
+			dispatchId: "pending",
+			promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+			sourceContextEpoch: coordinates.contextEpoch,
+			targetContextEpoch: coordinates.contextEpoch + 1,
+			checkpointEntryId: checkpointResult.entryId,
+			bundle,
+			expectedRevisions: revisions,
+			sourceTokens: outcome.budget.tokens,
+			preparedTokens: 0,
+			sourceRequestFingerprint: outcome.requestFingerprint,
+			preparedRequestFingerprint: "pending",
+			preparationBaseFingerprint: "pending",
+			reservedDeliveryIds: [],
+			strongProgressCreditIds: progressCredits.slice(0, 1),
+		};
+		const candidateMessages = buildSessionContext(
+			[...this.sessionManager.getEntries(), provisional],
+			provisional.id,
+		).messages;
+		let preparation: PreparedContinuation;
+		try {
+			preparation = await this.agent.prepareContinuation(candidateMessages, { signal: trigger.signal });
+		} catch {
+			return block("invalid_continuation_context");
+		}
+		const budgetReason = validatePreparedRolloverBudget(preparation, outcome.budget, outcome.requestFingerprint);
+		if (budgetReason) {
+			this.agent.releasePreparedContinuation(preparation);
+			return block(budgetReason);
+		}
+		this._traceContextRollover({
+			...traceBase,
+			checkpointId: checkpointResult.checkpoint.checkpointId,
+			phase: "preparation",
+			outcome: "prepared",
+			targetContextEpoch: coordinates.contextEpoch + 1,
+			sourceRequestFingerprint: outcome.requestFingerprint,
+			preparedRequestFingerprint: preparation.requestFingerprint,
+			sourceTokens: outcome.budget.tokens,
+			preparedTokens: preparation.budget.tokens,
+			reservedDeliveryCount: preparation.reservedQueueItemIds.length,
+			strongProgressCreditCount: progressCredits.length,
+		});
+
+		const dispatchId = createContextRolloverDispatchId(rolloverId, preparation.requestFingerprint);
+		const commitResult = this.commitContextRollover(revisions, {
+			rolloverId,
+			dispatchId,
+			promptGeneration: provisional.promptGeneration,
+			sourceContextEpoch: provisional.sourceContextEpoch,
+			targetContextEpoch: provisional.targetContextEpoch,
+			checkpointEntryId: provisional.checkpointEntryId,
+			bundle,
+			expectedRevisions: revisions,
+			sourceTokens: outcome.budget.tokens,
+			preparedTokens: preparation.budget.tokens,
+			sourceRequestFingerprint: outcome.requestFingerprint,
+			preparedRequestFingerprint: preparation.requestFingerprint,
+			preparationBaseFingerprint: preparation.baseContextFingerprint,
+			reservedDeliveryIds: [...preparation.reservedQueueItemIds],
+			strongProgressCreditIds: progressCredits.slice(0, 1),
+		});
+		if (commitResult.status === "superseded") {
+			this.agent.releasePreparedContinuation(preparation);
+			if (supersedeCount === 0) {
+				return await this._executeContextRollover(_maintenanceId, trigger, outcome, 1);
+			}
+			return block("source_changed");
+		}
+		if (commitResult.status !== "committed") {
+			this.agent.releasePreparedContinuation(preparation);
+			return block("source_changed");
+		}
+		const pendingDeliveryIds = new Set(this._pendingDeliveryStore.snapshot().items.map((item) => item.queueItemId));
+		const cancelledDeliveryIds = preparation.reservedQueueItemIds.filter((id) => !pendingDeliveryIds.has(id));
+		if (cancelledDeliveryIds.length > 0) {
+			this.agent.releasePreparedContinuation(preparation);
+			this.agent.discardQueuedItems(cancelledDeliveryIds);
+			try {
+				this.sessionManager.appendContextRolloverDispatch({
+					dispatchId,
+					rolloverId,
+					state: "cancelled",
+					requestFingerprint: preparation.requestFingerprint,
+				});
+			} catch {
+				return block("source_changed");
+			}
+			this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "cancelled" });
+			return false;
+		}
+		const committedMessages = this.sessionManager.buildSessionContext().messages;
+		if (fingerprintContextRolloverValue(committedMessages) !== fingerprintContextRolloverValue(candidateMessages)) {
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId,
+				rolloverId,
+				state: "blocked",
+				requestFingerprint: preparation.requestFingerprint,
+				reason: "post_commit_mismatch",
+			});
+			this.agent.releasePreparedContinuation(preparation);
+			return block("post_commit_mismatch");
+		}
+		this._traceContextRollover({
+			...traceBase,
+			checkpointId: checkpointResult.checkpoint.checkpointId,
+			dispatchId,
+			phase: "rollover",
+			outcome: "committed",
+			targetContextEpoch: coordinates.contextEpoch + 1,
+		});
+		if (trigger.signal?.aborted || this._promptAborted) {
+			try {
+				this.sessionManager.appendContextRolloverDispatch({
+					dispatchId,
+					rolloverId,
+					state: "cancelled",
+					requestFingerprint: preparation.requestFingerprint,
+				});
+			} catch {
+				this.agent.releasePreparedContinuation(preparation);
+				return block("source_changed");
+			}
+			this.agent.releasePreparedContinuation(preparation);
+			this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "cancelled" });
+			return false;
+		}
+
+		try {
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId,
+				rolloverId,
+				state: "started",
+				requestFingerprint: preparation.requestFingerprint,
+				reservedDeliveryIds: [...preparation.reservedQueueItemIds],
+			});
+		} catch {
+			this.agent.releasePreparedContinuation(preparation);
+			return block("source_changed");
+		}
+		this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "started" });
+		this._rolloverDispatchPreparationId = preparation.preparationId;
+		try {
+			await this.agent.dispatchPreparedContinuation(preparation);
+		} catch {
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId,
+				rolloverId,
+				state: "blocked",
+				requestFingerprint: preparation.requestFingerprint,
+				reason: "dispatch_outcome_unknown",
+			});
+			this._traceContextRollover({
+				...traceBase,
+				dispatchId,
+				phase: "dispatch",
+				outcome: "outcome_unknown",
+				reasonCode: "dispatch_outcome_unknown",
+			});
+			return false;
+		} finally {
+			this._rolloverDispatchPreparationId = undefined;
+		}
+		const runState = this.agent.state.runState;
+		const dispatchOutcome = contextRolloverDispatchOutcome(runState, this._promptAborted);
+		this.sessionManager.appendContextRolloverDispatch({
+			dispatchId,
+			rolloverId,
+			state: "finished",
+			requestFingerprint: preparation.requestFingerprint,
+			outcome: dispatchOutcome,
+		});
+		this._contextMaintenanceBudget = createContextMaintenanceBudget(
+			this._contextMaintenanceBudget.promptGeneration,
+			coordinates.contextEpoch + 1,
+		);
+		this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "finished" });
+		return true;
+	}
+
+	private async _runContextMaintenance(trigger: ContextMaintenanceTrigger): Promise<ContextMaintenanceAction> {
+		const initial = await this._contextMaintenanceSnapshot();
+		let maintenanceId: string;
+		let outcome: ContextMaintenanceOutcome;
+		const inFlight = this._contextMaintenanceInFlight;
+		if (inFlight) {
+			if (inFlight.fingerprint === initial.fingerprint) {
+				maintenanceId = inFlight.maintenanceId;
+				outcome = await inFlight.promise;
+			} else {
+				await inFlight.promise;
+				return await this._runContextMaintenance(trigger);
+			}
+		} else {
+			maintenanceId = `context-maintenance-${this._contextMaintenancePromptGeneration}-${this._contextMaintenanceTriggerSequence}`;
+			const controller = new AbortController();
+			this._contextMaintenanceAbortController = controller;
+			const machineTrigger = { ...trigger, signal: controller.signal };
+			const promise = runContextMaintenance(machineTrigger, this._contextMaintenanceBudget, {
+				measure: () => this._contextMaintenanceSnapshot(),
+				defaultShake: (snapshot, attemptIndex) => this._runAutomaticShake("default_shake", snapshot, attemptIndex),
+				softCompaction: (snapshot, attemptIndex) =>
+					this._runSoftCompaction(trigger.cause, trigger.continuation === "required", snapshot, attemptIndex),
+				rescueShake: (snapshot, attemptIndex) => this._runAutomaticShake("rescue_shake", snapshot, attemptIndex),
+				onTransition: (transition) => this._recordContextMaintenanceTransition(trigger, transition),
+				createMaintenanceId: () => maintenanceId,
+			});
+			this._contextMaintenanceInFlight = { fingerprint: initial.fingerprint, maintenanceId, promise };
+			try {
+				outcome = await promise;
+			} finally {
+				if (this._contextMaintenanceInFlight?.promise === promise) this._contextMaintenanceInFlight = undefined;
+				if (this._contextMaintenanceAbortController === controller) {
+					this._contextMaintenanceAbortController = undefined;
+				}
+			}
+		}
+
+		const requestedAction = resolveContextMaintenanceAction(outcome, trigger.continuation);
+		let action = requestedAction;
+		let dispatchStatus: "executed" | "coalesced" = "executed";
+		if (requestedAction === "continue") {
+			if (this._contextMaintenanceBudget.continuedRequestFingerprints.has(outcome.requestFingerprint)) {
+				action = "wait";
+				dispatchStatus = "coalesced";
+			} else {
+				this._contextMaintenanceBudget.continuedRequestFingerprints.add(outcome.requestFingerprint);
+				if (trigger.cause === "provider_overflow") {
+					this.sessionManager.appendContextOperation({
+						operationId: `${maintenanceId}:overflow_retry`,
+						operationKind: "overflow_retry",
+						state: "started",
+						promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+						contextEpoch: this._contextMaintenanceBudget.contextEpoch,
+						sourceFingerprint: initial.sourceFingerprint,
+					});
+					this._contextMaintenanceBudget.overflowRetriesUsed = 1;
+				}
+			}
+		}
+		this._appendTraceSafely({
+			type: "context/maintenance",
+			data: {
+				maintenanceId,
+				triggerId: trigger.triggerId,
+				turn: Math.max(0, this._nextTraceTurn - 1),
+				promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+				cause: trigger.cause,
+				phase: trigger.phase,
+				state: outcome.outcome === "ready" ? "ready" : outcome.outcome === "blocked" ? "blocked" : "cancelled",
+				requestFingerprint: outcome.requestFingerprint,
+				outcome: "dispatched",
+				budgetDecision: outcome.budget.decision,
+				continuation: trigger.continuation,
+				nextAction: requestedAction,
+				dispatchStatus,
+			},
+		});
+		if (
+			outcome.outcome === "blocked" &&
+			shouldStartContextRollover({
+				maintenance: outcome,
+				cause: trigger.cause,
+				continuation: trigger.continuation,
+				taskIsIncomplete:
+					trigger.cause === "budget_limit" ||
+					trigger.cause === "provider_overflow" ||
+					this._todoStateStore.hasPendingWork() ||
+					this._pendingDeliveryStore.snapshot().items.some((item) => item.channel !== "next_prompt") ||
+					(this.agent.state.runState.status === "idle" &&
+						this.agent.state.runState.lastOutcome?.type === "context_limit"),
+			}) &&
+			(await this._runContextRollover(maintenanceId, trigger, outcome))
+		) {
+			return await this._handlePostAgentRun();
+		}
+		return action;
 	}
 
 	/**
@@ -2698,12 +3640,12 @@ export class AgentSession {
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck = true,
 		continueAfterReduction = false,
-	): Promise<boolean> {
+	): Promise<ContextMaintenanceAction> {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled) return false;
+		if (!settings.enabled) return "wait";
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
-		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
+		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return "wait";
 
 		const contextWindow = this.model?.contextWindow ?? 0;
 
@@ -2721,7 +3663,7 @@ export class AgentSession {
 		const assistantIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
 		if (assistantIsFromBeforeCompaction) {
-			return false;
+			return "wait";
 		}
 
 		// Case 1: Overflow - LLM returned context overflow error, or reported usage exceeded
@@ -2730,54 +3672,104 @@ export class AgentSession {
 		// continue from an assistant message.
 		if (sameModel && isContextOverflow(assistantMessage, contextWindow)) {
 			const willRetry = assistantMessage.stopReason !== "stop";
-
-			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
-			}
-
-			if (this._overflowRecoveryAttempted) {
-				this._emit({
-					type: "compaction_end",
-					reason: "overflow",
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage:
-						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
-				});
-				return false;
-			}
-
-			this._overflowRecoveryAttempted = true;
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
-			const messages = this.agent.state.messages;
-			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-				this.agent.state.messages = messages.slice(0, -1);
+			if (willRetry) {
+				const messages = this.agent.state.messages;
+				if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+					this.agent.state.messages = messages.slice(0, -1);
+				}
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			const snapshot = await this._contextMaintenanceSnapshot();
+			this._contextMaintenanceBudget.rejectedRequestFingerprints.add(snapshot.fingerprint);
+			return await this._runContextMaintenance({
+				triggerId: this._nextContextMaintenanceTriggerId(),
+				cause: "provider_overflow",
+				phase: "post_run",
+				continuation: willRetry ? "required" : "forbidden",
+			});
 		}
 
 		const budget = await this._requestBudget();
 		const policy = this.settingsManager.getCompactionPolicy();
 		if (budget.decision === "context_limit") {
-			const saved = await this.shake(DEFAULT_SHAKE_CONFIG, "threshold");
-			if (this._promptAborted) return false;
-			if (saved > 0 && (await this._requestBudget()).decision !== "context_limit") return continueAfterReduction;
-			return await this._runAutoCompaction("threshold", continueAfterReduction);
+			return await this._runContextMaintenance({
+				triggerId: this._nextContextMaintenanceTriggerId(),
+				cause: "threshold",
+				phase: skipAbortedCheck ? "post_run" : "pre_prompt",
+				continuation: continueAfterReduction ? "required" : "forbidden",
+			});
 		}
-		if (policy.twoPassEnabled && shouldPrefireTwoPass(budget.tokens, contextWindow, policy))
-			this._maybeStartTwoPassPrefire();
-		return false;
+		if (shouldPrefireTwoPass(budget.tokens, contextWindow, policy)) this._maybeStartTwoPassPrefire();
+		return "wait";
 	}
 
 	private _validPrefixCheckpoint(): PrefixSummaryCheckpoint | undefined {
 		const branch = this.sessionManager.getBranch();
-		const saved = [...branch]
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (
+				entry.type !== "custom" ||
+				entry.customType !== "context-rollover-checkpoint" ||
+				!isContextRolloverCheckpointEnvelope(entry.data) ||
+				entry.data.checkpoint.contextEpoch !== this._contextMaintenanceBudget.contextEpoch
+			) {
+				continue;
+			}
+			const checkpoint = entry.data.checkpoint.compactionPrefix;
+			if (validatePrefixCheckpoint(branch, checkpoint)) return checkpoint;
+		}
+		return undefined;
+	}
+
+	private _validContextRolloverCheckpoint() {
+		const selected = selectLatestContextRolloverCheckpoint(
+			this.sessionManager.getBranch(),
+			this._contextMaintenanceBudget.promptGeneration,
+			this._contextMaintenanceBudget.contextEpoch,
+		);
+		if (!selected) return undefined;
+		const todo = this._todoRevision();
+		if (
+			selected.checkpoint.todoStateEntryId !== todo.entryId ||
+			selected.checkpoint.todoStateFingerprint !== todo.fingerprint ||
+			selected.checkpoint.requestConfigFingerprint !== this._requestConfigFingerprint()
+		) {
+			return undefined;
+		}
+		return selected;
+	}
+
+	private _requestConfigFingerprint(): string {
+		return fingerprintContextRolloverValue({
+			systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+			tools: this.agent.state.tools.map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+			})),
+			model: {
+				provider: this.agent.state.model.provider,
+				id: this.agent.state.model.id,
+				api: this.agent.state.model.api,
+				baseUrl: this.agent.state.model.baseUrl,
+				contextWindow: this.agent.state.model.contextWindow,
+				maxTokens: this.agent.state.model.maxTokens,
+				reasoning: this.agent.state.model.reasoning,
+			},
+			thinkingLevel: this.agent.state.thinkingLevel,
+			budget: this.agent.getContextBudgetOptions?.(this.agent.state.model) ?? {},
+		});
+	}
+
+	private _todoRevision(): { entryId: string | null; fingerprint: string } {
+		const latest = [...this.sessionManager.getBranch()]
 			.reverse()
-			.find((entry) => entry.type === "custom" && entry.customType === "two-pass-prefire");
-		const checkpoint = saved?.type === "custom" && isPrefixCheckpoint(saved.data) ? saved.data : undefined;
-		return checkpoint && validatePrefixCheckpoint(branch, checkpoint) ? checkpoint : undefined;
+			.find((entry) => entry.type === "custom" && entry.customType === "todo-state");
+		return {
+			entryId: latest?.id ?? null,
+			fingerprint: fingerprintContextRolloverValue(latest?.type === "custom" ? latest.data : []),
+		};
 	}
 
 	/** A note is created only after its compaction boundary has been committed. */
@@ -2790,7 +3782,7 @@ export class AgentSession {
 				summary,
 				compactionId,
 			);
-			this.sessionManager.appendTrace({
+			this._appendTraceSafely({
 				type: "memory/archive",
 				data: {
 					turn: Math.max(0, this._nextTraceTurn - 1),
@@ -2804,7 +3796,7 @@ export class AgentSession {
 			});
 			return note.written > 0;
 		} catch {
-			this.sessionManager.appendTrace({
+			this._appendTraceSafely({
 				type: "memory/archive",
 				data: { turn: Math.max(0, this._nextTraceTurn - 1), compactionId, ran: false, reason: "note_write_failed" },
 			});
@@ -2814,8 +3806,26 @@ export class AgentSession {
 
 	/** Summarize a stable prefix once; append-only tail growth does not invalidate it. */
 	private _maybeStartTwoPassPrefire(): void {
-		if (this._twoPassPrefireInFlight || this._validPrefixCheckpoint() || !this.model) return;
-		const pathEntries = structuredClone(this.sessionManager.getBranch());
+		if (this._twoPassPrefireInFlight || !this.model) return;
+		const operationUsage = this.sessionManager.getContextOperationUsage(
+			this._contextMaintenanceBudget.promptGeneration,
+			this._contextMaintenanceBudget.contextEpoch,
+		);
+		if (operationUsage.checkpoint >= 2) return;
+		const branch = structuredClone(this.sessionManager.getBranch());
+		const pathEntries = applyRedactions(branch, collectShakeRedactions(branch));
+		const existingCheckpoint = this._validContextRolloverCheckpoint();
+		if (existingCheckpoint) {
+			const coveredEndIndex = pathEntries.findIndex(
+				(entry) => entry.id === existingCheckpoint.checkpoint.coveredEndEntryId,
+			);
+			if (coveredEndIndex < 0) return;
+			const uncoveredTokens = pathEntries
+				.slice(coveredEndIndex + 1)
+				.flatMap((entry) => sessionEntryToContextMessages(entry))
+				.reduce((total, message) => total + estimateTokens(message), 0);
+			if (uncoveredTokens < Math.floor(this.model.contextWindow * 0.1)) return;
+		}
 		const preparation = prepareCompaction(pathEntries, this.settingsManager.getCompactionSettings());
 		if (!preparation) return;
 		const policy = this.settingsManager.getCompactionPolicy();
@@ -2826,28 +3836,125 @@ export class AgentSession {
 		const controller = new AbortController();
 		this._twoPassPrefireAbortController = controller;
 		const budget = createWallClockBudgetSignal(controller.signal, policy.wallClockBudgetSecs);
-		void (async () => {
+		const operationId = `context-checkpoint-${this._contextMaintenanceBudget.promptGeneration}-${this._contextMaintenanceBudget.contextEpoch}-${operationUsage.checkpoint + 1}`;
+		const checkpointRolloverId = `checkpoint-${operationId}`;
+		this.sessionManager.appendContextOperation({
+			operationId,
+			operationKind: "checkpoint",
+			state: "started",
+			promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+			contextEpoch: this._contextMaintenanceBudget.contextEpoch,
+			sourceFingerprint: createContextMaintenanceSourceFingerprint(pathEntries),
+		});
+		const checkpointPromise = (async () => {
+			let operationOutcome = "failed";
 			try {
+				this._traceContextRollover({
+					rolloverId: checkpointRolloverId,
+					promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+					sourceContextEpoch: this._contextMaintenanceBudget.contextEpoch,
+					phase: "checkpoint",
+					outcome: "entered",
+				});
 				const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
-				const result = await compact(
-					preparation,
+				const boundary = createPrefixCheckpoint(pathEntries, preparation, "pending");
+				const boundaryStart = pathEntries.findIndex((entry) => entry.id === boundary.coveredStartEntryId);
+				const boundaryEnd = pathEntries.findIndex((entry) => entry.id === boundary.coveredEndEntryId);
+				if (boundaryStart < 0 || boundaryEnd < boundaryStart) throw new Error("invalid_output");
+				const taskNoteScope = resolveTaskNoteScope(pathEntries, this._contextMaintenanceBudget.promptGeneration);
+				if (taskNoteScope === undefined) throw new Error("invalid_output");
+				const taskNoteProjection = buildTaskNoteProjectionFromBranch(
+					pathEntries,
+					taskNoteScope,
+					createTaskNoteFreshnessResolver(pathEntries),
+				);
+				if (taskNoteProjection.status !== "valid") throw new Error(taskNoteProjection.reason);
+				const activeTodos = this._todoStateStore
+					.entries()
+					.flatMap(([id, todo]) =>
+						todo.status === "pending" || todo.status === "in_progress"
+							? [{ id, content: todo.content, priority: todo.priority, status: todo.status }]
+							: [],
+					);
+				const checkpointPrompt = formatContextRolloverCheckpointPrompt({
+					coveredEntries: pathEntries.slice(boundaryStart, boundaryEnd + 1),
+					projection: taskNoteProjection.snapshot,
+					activeTodos,
+				});
+				const result = await generateSummaryWithUsage(
+					[],
 					model,
+					preparation.settings.reserveTokens,
 					apiKey,
 					headers,
-					undefined,
 					budget.signal,
+					checkpointPrompt,
+					undefined,
 					this.thinkingLevel,
 					this.agent.streamFunction,
 					env,
 					this.settingsManager.getRetrySettings(),
+					undefined,
+					true,
 				);
 				budget.signal.throwIfAborted();
-				const checkpoint = createPrefixCheckpoint(pathEntries, preparation, result.summary, result.usage);
+				const output = parseContextRolloverCheckpointOutput(result.text);
+				const checkpointSummary = JSON.stringify(output.checkpoint);
+				const checkpoint = createPrefixCheckpoint(pathEntries, preparation, checkpointSummary, result.usage);
 				const valid = validatePrefixCheckpoint(this.sessionManager.getBranch(), checkpoint);
 				if (valid) {
-					this.sessionManager.appendCustomEntry("two-pass-prefire", checkpoint);
+					if (Math.ceil(checkpoint.summary.length / 4) > Math.floor(model.contextWindow * 0.1)) {
+						throw new Error("Context rollover checkpoint exceeds 10% of the context window");
+					}
+					const todoRevision = this._todoRevision();
+					const checkpointEnvelope = createContextRolloverCheckpointEnvelope({
+						checkpointId: `rollover-${operationId}`,
+						promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+						contextEpoch: this._contextMaintenanceBudget.contextEpoch,
+						branch: pathEntries,
+						coveredStartEntryId: checkpoint.coveredStartEntryId,
+						coveredEndEntryId: checkpoint.coveredEndEntryId,
+						output,
+						taskNoteScope,
+						taskNoteProjection: taskNoteProjection.snapshot,
+						taskNoteEvents: taskNoteProjection.events,
+						todoStateEntryId: todoRevision.entryId,
+						todoStateFingerprint: todoRevision.fingerprint,
+						requestConfigFingerprint: this._requestConfigFingerprint(),
+						usage: result.usage,
+					});
+					this.sessionManager.appendCustomEntry("context-rollover-checkpoint", checkpointEnvelope);
+					const committedBranch = this.sessionManager.getBranch();
+					const rebuiltProjection = buildTaskNoteProjectionFromBranch(
+						committedBranch,
+						taskNoteScope,
+						createTaskNoteFreshnessResolver(committedBranch),
+					);
+					if (rebuiltProjection.status !== "valid") throw new Error(rebuiltProjection.reason);
+					this._appendTraceSafely({
+						type: "context/task_note",
+						data: {
+							turn: Math.max(0, this._nextTraceTurn - 1),
+							batchId: checkpointEnvelope.taskNoteBatch.batchId,
+							promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+							contextEpoch: this._contextMaintenanceBudget.contextEpoch,
+							operation: "project",
+							outcome: "rebuilt",
+							activeCount: rebuiltProjection.snapshot.items.length,
+							staleCount: rebuiltProjection.snapshot.items.filter((item) => item.freshness === "stale").length,
+						},
+					});
+					operationOutcome = "completed";
+					this._traceContextRollover({
+						rolloverId: checkpointRolloverId,
+						checkpointId: checkpointEnvelope.checkpoint.checkpointId,
+						promptGeneration: checkpointEnvelope.checkpoint.promptGeneration,
+						sourceContextEpoch: checkpointEnvelope.checkpoint.contextEpoch,
+						phase: "checkpoint",
+						outcome: "committed",
+					});
 				}
-				this.sessionManager.appendTrace({
+				this._appendTraceSafely({
 					type: "compaction/summary",
 					data: {
 						turn: Math.max(0, this._nextTraceTurn - 1),
@@ -2862,7 +3969,23 @@ export class AgentSession {
 				});
 			} catch {
 				// No checkpoint is committed for incomplete or invalid sources.
+				this._traceContextRollover({
+					rolloverId: checkpointRolloverId,
+					promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+					sourceContextEpoch: this._contextMaintenanceBudget.contextEpoch,
+					phase: "checkpoint",
+					outcome: "discarded",
+				});
 			} finally {
+				this.sessionManager.appendContextOperation({
+					operationId,
+					operationKind: "checkpoint",
+					state: "finished",
+					promptGeneration: this._contextMaintenanceBudget.promptGeneration,
+					contextEpoch: this._contextMaintenanceBudget.contextEpoch,
+					sourceFingerprint: createContextMaintenanceSourceFingerprint(pathEntries),
+					outcome: operationOutcome,
+				});
 				budget.dispose();
 				if (this._twoPassPrefireAbortController === controller) {
 					this._twoPassPrefireAbortController = undefined;
@@ -2870,6 +3993,12 @@ export class AgentSession {
 				}
 			}
 		})();
+		this._contextCheckpointPromise = checkpointPromise;
+		void checkpointPromise
+			.catch(() => {})
+			.finally(() => {
+				if (this._contextCheckpointPromise === checkpointPromise) this._contextCheckpointPromise = undefined;
+			});
 	}
 
 	/** Resolves CompactionPolicy.compactModel ("provider/modelId", or a bare modelId assumed to be on the current provider) to a concrete Model. Returns undefined if it cannot be found. */
@@ -2887,17 +4016,31 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/**
-	 * Internal: Run auto-compaction with events.
-	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	/** Execute one bounded soft-compaction operation. Continuation is decided by the maintenance caller. */
+	private async _runSoftCompaction(
+		cause: ContextMaintenanceTrigger["cause"],
+		willRetry: boolean,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	): Promise<ReductionAttemptResult> {
+		const reason = cause === "provider_overflow" ? "overflow" : "threshold";
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
+		let failureReason: ReductionFailureReason = "provider_failed";
+		let committedOutcome: Extract<ReductionAttemptResult, { outcome: "committed" }> | undefined;
+		if (this._contextCheckpointPromise) await this._contextCheckpointPromise;
 		this._twoPassPrefireAbortController?.abort();
 
 		try {
 			if (!this.model) {
-				return false;
+				return {
+					outcome: "unavailable",
+					method: "soft_compaction",
+					attemptIndex,
+					requestFingerprint: snapshot.fingerprint,
+					tokensBefore: snapshot.budget.tokens,
+					reason: "no_compactable_range",
+				};
 			}
 
 			const policy = this.settingsManager.getCompactionPolicy();
@@ -2916,12 +4059,20 @@ export class AgentSession {
 						willRetry: false,
 						errorMessage: `compact_model "${policy.compactModel}" could not be resolved and strictCompactModel is enabled; compaction was skipped.`,
 					});
-					return false;
+					return {
+						outcome: "failed",
+						method: "soft_compaction",
+						attemptIndex,
+						requestFingerprint: snapshot.fingerprint,
+						tokensBefore: snapshot.budget.tokens,
+						reason: "provider_failed",
+					};
 				} else {
 					compactModelWarning = `compact_model "${policy.compactModel}" could not be resolved; fell back to the current model.`;
 				}
 			}
 
+			failureReason = "authorization_failed";
 			let apiKey: string | undefined;
 			let headers: Record<string, string> | undefined;
 			let env: Record<string, string> | undefined;
@@ -2930,13 +4081,31 @@ export class AgentSession {
 			} else {
 				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(compactionModel));
 			}
+			failureReason = "provider_failed";
 
 			const pathEntries = this.sessionManager.getBranch();
 
 			const preparation = prepareCompaction(pathEntries, settings);
-			const sourceFingerprint = createHash("sha256").update(JSON.stringify(pathEntries)).digest("hex");
+			const sourceFingerprint = createContextMaintenanceSourceFingerprint(pathEntries);
+			if (sourceFingerprint !== snapshot.sourceFingerprint) {
+				return {
+					outcome: "superseded",
+					method: "soft_compaction",
+					attemptIndex,
+					requestFingerprint: snapshot.fingerprint,
+					currentFingerprint: sourceFingerprint,
+					tokensBefore: snapshot.budget.tokens,
+				};
+			}
 			if (!preparation) {
-				return false;
+				return {
+					outcome: "unavailable",
+					method: "soft_compaction",
+					attemptIndex,
+					requestFingerprint: snapshot.fingerprint,
+					tokensBefore: snapshot.budget.tokens,
+					reason: "no_compactable_range",
+				};
 			}
 
 			this._emit({ type: "compaction_start", reason });
@@ -2947,6 +4116,7 @@ export class AgentSession {
 			let fromExtension = false;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+				failureReason = "extension_failed";
 				const extensionResult = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
@@ -2965,13 +4135,21 @@ export class AgentSession {
 						aborted: true,
 						willRetry: false,
 					});
-					return false;
+					return {
+						outcome: "vetoed",
+						method: "soft_compaction",
+						attemptIndex,
+						requestFingerprint: snapshot.fingerprint,
+						tokensBefore: snapshot.budget.tokens,
+						reason: "extension_veto",
+					};
 				}
 
 				if (extensionResult?.compaction) {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+				failureReason = "provider_failed";
 			}
 
 			let summary: string;
@@ -3033,14 +4211,20 @@ export class AgentSession {
 						willRetry: false,
 						errorMessage: `Compaction exceeded its ${policy.wallClockBudgetSecs}s wall-clock budget twice; keeping the existing context.`,
 					});
-					return false;
+					return {
+						outcome: "failed",
+						method: "soft_compaction",
+						attemptIndex,
+						requestFingerprint: snapshot.fingerprint,
+						tokensBefore: snapshot.budget.tokens,
+						reason: "wall_clock_exhausted",
+					};
 				}
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
 				usage = compactResult.usage;
 				this._autoCompactionAbortController.signal.throwIfAborted();
-				this._validateCompactionCommit(summary, firstKeptEntryId, sourceFingerprint);
 				const grokDetails: CompactionEntryDetails = { policy, mode };
 				details = {
 					...(compactResult.details as Record<string, unknown> | undefined),
@@ -3057,10 +4241,38 @@ export class AgentSession {
 					aborted: true,
 					willRetry: false,
 				});
-				return false;
+				return {
+					outcome: "cancelled",
+					method: "soft_compaction",
+					attemptIndex,
+					requestFingerprint: snapshot.fingerprint,
+					tokensBefore: snapshot.budget.tokens,
+				};
 			}
 
-			this._validateCompactionCommit(summary, firstKeptEntryId, sourceFingerprint);
+			const validation = this._validateCompactionCommit(summary, firstKeptEntryId, sourceFingerprint);
+			if (validation === "superseded") {
+				return {
+					outcome: "superseded",
+					method: "soft_compaction",
+					attemptIndex,
+					requestFingerprint: snapshot.fingerprint,
+					currentFingerprint: createContextMaintenanceSourceFingerprint(this.sessionManager.getBranch()),
+					tokensBefore: snapshot.budget.tokens,
+				};
+			}
+			if (validation === "invalid") {
+				return {
+					outcome: "failed",
+					method: "soft_compaction",
+					attemptIndex,
+					requestFingerprint: snapshot.fingerprint,
+					tokensBefore: snapshot.budget.tokens,
+					reason: "invalid_summary",
+				};
+			}
+
+			// appendCompaction is the irreversible commit point. Nothing below may turn this into failed.
 			const compactionId = this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -3069,22 +4281,60 @@ export class AgentSession {
 				fromExtension,
 				usage,
 			);
+			const warnings: ReductionWarning[] = [];
+			committedOutcome = {
+				outcome: "committed",
+				method: "soft_compaction",
+				attemptIndex,
+				requestFingerprint: snapshot.fingerprint,
+				tokensBefore: snapshot.budget.tokens,
+				tokensAfter: snapshot.budget.tokens,
+				budgetAfter: snapshot.budget,
+				verification:
+					snapshot.budget.decision === "fits"
+						? "fits"
+						: snapshot.budget.decision === "context_limit"
+							? "still_limited"
+							: "unknown",
+				warnings,
+			};
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
-			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
-			this.sessionManager.appendTrace({
-				type: "compaction/summary",
-				data: {
-					turn: Math.max(0, this._nextTraceTurn - 1),
-					phase: "commit",
-					outcome: "completed",
-					compactionId,
-					sourceFingerprint,
-					firstKeptEntryId,
-					usage,
-				},
-			});
+			let estimatedTokensAfter = snapshot.budget.tokens;
+			try {
+				const sessionContext = this.sessionManager.buildSessionContext();
+				this.agent.state.messages = sessionContext.messages;
+				estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
+				const after = await this._contextMaintenanceSnapshot();
+				committedOutcome = {
+					...committedOutcome,
+					tokensAfter: after.budget.tokens,
+					budgetAfter: after.budget,
+					verification:
+						after.budget.decision === "fits"
+							? "fits"
+							: after.budget.decision === "context_limit"
+								? "still_limited"
+								: "unknown",
+				};
+			} catch {
+				warnings.push("ui_notification_failed");
+			}
+			try {
+				this._appendTraceSafely({
+					type: "compaction/summary",
+					data: {
+						turn: Math.max(0, this._nextTraceTurn - 1),
+						phase: "commit",
+						outcome: "completed",
+						compactionId,
+						sourceFingerprint,
+						firstKeptEntryId,
+						usage,
+					},
+				});
+			} catch {
+				warnings.push("ui_notification_failed");
+			}
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.id === compactionId) as
@@ -3092,13 +4342,24 @@ export class AgentSession {
 				| undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				await this._extensionRunner.emit({
-					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
-					fromExtension,
-					reason,
-					willRetry,
+				let extensionNotificationFailed = false;
+				const removeErrorListener = this._extensionRunner.onError((error) => {
+					if (error.event === "session_compact") extensionNotificationFailed = true;
 				});
+				try {
+					await this._extensionRunner.emit({
+						type: "session_compact",
+						compactionEntry: savedCompactionEntry,
+						fromExtension,
+						reason,
+						willRetry,
+					});
+				} catch {
+					extensionNotificationFailed = true;
+				} finally {
+					removeErrorListener();
+				}
+				if (extensionNotificationFailed) warnings.push("extension_notification_failed");
 			}
 
 			const result: CompactionResult = {
@@ -3109,11 +4370,15 @@ export class AgentSession {
 				usage,
 				details,
 			};
-			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			try {
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			} catch {
+				warnings.push("ui_notification_failed");
+			}
 			if (!fromExtension && policy.memoryFlushEnabled) {
 				try {
 					const flushed = this._memoryStore.appendProject(this._cwd, [summary]);
-					this.sessionManager.appendTrace({
+					this._appendTraceSafely({
 						type: "memory/archive",
 						data: {
 							turn: Math.max(0, this._nextTraceTurn - 1),
@@ -3126,7 +4391,8 @@ export class AgentSession {
 						},
 					});
 				} catch {
-					this.sessionManager.appendTrace({
+					warnings.push("memory_archive_failed");
+					this._appendTraceSafely({
 						type: "memory/archive",
 						data: {
 							turn: Math.max(0, this._nextTraceTurn - 1),
@@ -3166,14 +4432,15 @@ export class AgentSession {
 								},
 							),
 					});
-					this.sessionManager.appendTrace({
+					this._appendTraceSafely({
 						type: "memory/archive",
 						data: { turn: Math.max(0, this._nextTraceTurn - 1), compactionId, ...archive, usage: archiveUsage },
 					});
 					archiveUsage = undefined;
 					this._memoryStore.degradeSessionNotes(this._cwd);
 				} catch {
-					this.sessionManager.appendTrace({
+					warnings.push("memory_archive_failed");
+					this._appendTraceSafely({
 						type: "memory/archive",
 						data: {
 							turn: Math.max(0, this._nextTraceTurn - 1),
@@ -3188,35 +4455,49 @@ export class AgentSession {
 				}
 			}
 
-			if (this._promptAborted) return false;
-			if (willRetry) {
-				const messages = this.agent.state.messages;
-				const lastMsg = messages[messages.length - 1];
-				if (lastMsg?.role === "assistant" && (lastMsg as AssistantMessage).stopReason === "error") {
-					this.agent.state.messages = messages.slice(0, -1);
-				}
-				return true;
-			}
-
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
-			return this.agent.hasQueuedMessages();
+			return { ...committedOutcome, warnings: [...new Set(warnings)] };
 		} catch (error) {
+			if (committedOutcome) {
+				return {
+					...committedOutcome,
+					warnings: [...new Set<ReductionWarning>([...committedOutcome.warnings, "ui_notification_failed"])],
+				};
+			}
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			const cancelled = this._autoCompactionAbortController?.signal.aborted || this._promptAborted;
 			if (started) {
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
-					aborted: false,
+					aborted: cancelled,
 					willRetry: false,
-					errorMessage:
-						reason === "overflow"
-							? `Context overflow recovery failed: ${errorMessage}`
-							: `Auto-compaction failed: ${errorMessage}`,
+					...(cancelled
+						? {}
+						: {
+								errorMessage:
+									reason === "overflow"
+										? `Context overflow recovery failed: ${errorMessage}`
+										: `Auto-compaction failed: ${errorMessage}`,
+							}),
 				});
 			}
-			return false;
+			return cancelled
+				? {
+						outcome: "cancelled",
+						method: "soft_compaction",
+						attemptIndex,
+						requestFingerprint: snapshot.fingerprint,
+						tokensBefore: snapshot.budget.tokens,
+					}
+				: {
+						outcome: "failed",
+						method: "soft_compaction",
+						attemptIndex,
+						requestFingerprint: snapshot.fingerprint,
+						tokensBefore: snapshot.budget.tokens,
+						reason: failureReason,
+					};
 		} finally {
 			this._autoCompactionAbortController = undefined;
 		}
@@ -3232,6 +4513,245 @@ export class AgentSession {
 	/** Whether auto-compaction is enabled */
 	get autoCompactionEnabled(): boolean {
 		return this.settingsManager.getCompactionEnabled();
+	}
+
+	get contextRolloverState() {
+		return this.sessionManager.getContextRolloverState();
+	}
+
+	get taskNoteState(): { activeCount: number; staleCount: number; lastFailureReason?: string } {
+		const branch = this.sessionManager.getBranch();
+		const coordinates = this.sessionManager.getLatestContextCoordinates();
+		const scope = resolveTaskNoteScope(branch, coordinates.promptGeneration);
+		if (scope === undefined) return { activeCount: 0, staleCount: 0 };
+		const projection = buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch));
+		if (projection.status !== "valid") {
+			return { activeCount: 0, staleCount: 0, lastFailureReason: projection.reason };
+		}
+		const lastFailureReason = [...this.sessionManager.getBranchWithTrace()]
+			.reverse()
+			.find(
+				(entry) =>
+					entry.type === "trace" &&
+					entry.event.type === "context/task_note" &&
+					entry.event.data.outcome === "rejected" &&
+					entry.event.data.reasonCode !== undefined,
+			);
+		return {
+			activeCount: projection.snapshot.items.length,
+			staleCount: projection.snapshot.items.filter((item) => item.freshness === "stale").length,
+			...(lastFailureReason?.type === "trace" &&
+			lastFailureReason.event.type === "context/task_note" &&
+			lastFailureReason.event.data.reasonCode !== undefined
+				? { lastFailureReason: lastFailureReason.event.data.reasonCode }
+				: {}),
+		};
+	}
+
+	private async _resumePreparedContextRollover(): Promise<void> {
+		if (this._rolloverResumeInFlight) return await this._rolloverResumeInFlight;
+		const promise = this._resumePreparedContextRolloverImpl();
+		this._rolloverResumeInFlight = promise;
+		try {
+			await promise;
+		} finally {
+			if (this._rolloverResumeInFlight === promise) this._rolloverResumeInFlight = undefined;
+		}
+	}
+
+	private async _resumePreparedContextRolloverImpl(): Promise<void> {
+		const state = this.sessionManager.getContextRolloverState();
+		if (state.dispatchState === "outcome_unknown") {
+			this._extensionUIContext?.notify(
+				"Context rollover stopped: Provider or tool outcome is unknown. Nothing was replayed automatically; inspect external state before sending a new prompt.",
+				"error",
+			);
+			return;
+		}
+		if (state.dispatchState === "finished" && state.dispatchId && state.rolloverId) {
+			const finishedDispatch = [...this.sessionManager.getBranch()]
+				.reverse()
+				.find(
+					(entry): entry is ContextRolloverDispatchEntry =>
+						entry.type === "context_rollover_dispatch" && entry.dispatchId === state.dispatchId,
+				);
+			if (finishedDispatch?.outcome === "context_limit") {
+				const rollover = [...this.sessionManager.getBranch()]
+					.reverse()
+					.find(
+						(entry): entry is ContextRolloverEntry =>
+							entry.type === "context_rollover" && entry.rolloverId === state.rolloverId,
+					);
+				if (rollover) {
+					let action = await this._runTargetEpochMaintenance(rollover);
+					if (action === "continue") {
+						this._isAgentRunActive = true;
+						try {
+							while (action === "continue") {
+								await this.agent.continue();
+								action = await this._handlePostAgentRun();
+							}
+						} finally {
+							await this._emitAgentSettled();
+						}
+					}
+				}
+			}
+			return;
+		}
+		if (state.dispatchState !== "prepared" || !state.rolloverId) return;
+		const rollover = [...this.sessionManager.getBranch()]
+			.reverse()
+			.find(
+				(entry): entry is ContextRolloverEntry =>
+					entry.type === "context_rollover" && entry.rolloverId === state.rolloverId,
+			);
+		if (!rollover) return;
+		if (
+			rollover.dispatchId !==
+			createContextRolloverDispatchId(rollover.rolloverId, rollover.preparedRequestFingerprint)
+		) {
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId: rollover.dispatchId,
+				rolloverId: rollover.rolloverId,
+				state: "blocked",
+				requestFingerprint: rollover.preparedRequestFingerprint,
+				reason: "dispatch_prepare_mismatch",
+			});
+			return;
+		}
+		const cancelledDeliveryIds = new Set(
+			this.sessionManager
+				.getBranch()
+				.filter(
+					(entry): entry is Extract<SessionEntry, { type: "delivery_cancelled" }> =>
+						entry.type === "delivery_cancelled",
+				)
+				.map((entry) => entry.deliveryId),
+		);
+		const pendingDeliveryIds = new Set(this._pendingDeliveryStore.snapshot().items.map((item) => item.queueItemId));
+		const missingDeliveryIds = rollover.reservedDeliveryIds.filter((id) => !pendingDeliveryIds.has(id));
+		if (missingDeliveryIds.length > 0 && missingDeliveryIds.every((id) => cancelledDeliveryIds.has(id))) {
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId: rollover.dispatchId,
+				rolloverId: rollover.rolloverId,
+				state: "cancelled",
+				requestFingerprint: rollover.preparedRequestFingerprint,
+			});
+			return;
+		}
+		let preparation: PreparedContinuation;
+		try {
+			preparation = await this.agent.prepareContinuation(this.sessionManager.buildSessionContext().messages, {
+				requiredQueueItemIds: rollover.reservedDeliveryIds,
+			});
+		} catch {
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId: rollover.dispatchId,
+				rolloverId: rollover.rolloverId,
+				state: "blocked",
+				requestFingerprint: rollover.preparedRequestFingerprint,
+				reason: "dispatch_prepare_mismatch",
+			});
+			return;
+		}
+		if (
+			preparation.requestFingerprint !== rollover.preparedRequestFingerprint ||
+			preparation.baseContextFingerprint !== rollover.preparationBaseFingerprint ||
+			preparation.budget.tokens !== rollover.preparedTokens ||
+			JSON.stringify(preparation.reservedQueueItemIds) !== JSON.stringify(rollover.reservedDeliveryIds)
+		) {
+			this.agent.releasePreparedContinuation(preparation);
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId: rollover.dispatchId,
+				rolloverId: rollover.rolloverId,
+				state: "blocked",
+				requestFingerprint: preparation.requestFingerprint,
+				reason: "dispatch_prepare_mismatch",
+			});
+			return;
+		}
+		try {
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId: rollover.dispatchId,
+				rolloverId: rollover.rolloverId,
+				state: "started",
+				requestFingerprint: preparation.requestFingerprint,
+				reservedDeliveryIds: [...preparation.reservedQueueItemIds],
+			});
+		} catch {
+			this.agent.releasePreparedContinuation(preparation);
+			return;
+		}
+		this._rolloverDispatchPreparationId = preparation.preparationId;
+		this._isAgentRunActive = true;
+		let dispatchFinished = false;
+		try {
+			await this.agent.dispatchPreparedContinuation(preparation);
+			const runState = this.agent.state.runState;
+			const dispatchOutcome = contextRolloverDispatchOutcome(runState, this._promptAborted);
+			this.sessionManager.appendContextRolloverDispatch({
+				dispatchId: rollover.dispatchId,
+				rolloverId: rollover.rolloverId,
+				state: "finished",
+				requestFingerprint: preparation.requestFingerprint,
+				outcome: dispatchOutcome,
+			});
+			dispatchFinished = true;
+			const operationUsage = this.sessionManager.getContextOperationUsage(
+				rollover.promptGeneration,
+				rollover.targetContextEpoch,
+			);
+			this._contextMaintenanceBudget = createContextMaintenanceBudget(
+				rollover.promptGeneration,
+				rollover.targetContextEpoch,
+				operationUsage,
+			);
+			if (dispatchOutcome === "context_limit") {
+				let action = await this._runTargetEpochMaintenance(rollover);
+				while (action === "continue") {
+					await this.agent.continue();
+					action = await this._handlePostAgentRun();
+				}
+			}
+		} catch {
+			if (!dispatchFinished) {
+				this.sessionManager.appendContextRolloverDispatch({
+					dispatchId: rollover.dispatchId,
+					rolloverId: rollover.rolloverId,
+					state: "blocked",
+					requestFingerprint: preparation.requestFingerprint,
+					reason: "dispatch_outcome_unknown",
+				});
+			}
+		} finally {
+			this._rolloverDispatchPreparationId = undefined;
+			await this._emitAgentSettled();
+		}
+	}
+
+	private async _runTargetEpochMaintenance(rollover: ContextRolloverEntry): Promise<ContextMaintenanceAction> {
+		if (
+			this._contextMaintenanceBudget.promptGeneration !== rollover.promptGeneration ||
+			this._contextMaintenanceBudget.contextEpoch !== rollover.targetContextEpoch
+		) {
+			const usage = this.sessionManager.getContextOperationUsage(
+				rollover.promptGeneration,
+				rollover.targetContextEpoch,
+			);
+			this._contextMaintenancePromptGeneration = rollover.promptGeneration;
+			this._contextMaintenanceBudget = createContextMaintenanceBudget(
+				rollover.promptGeneration,
+				rollover.targetContextEpoch,
+				usage,
+			);
+		}
+		return await this._runContextMaintenance({
+			triggerId: this._nextContextMaintenanceTriggerId(),
+			cause: "budget_limit",
+			phase: "mid_run",
+			continuation: "required",
+		});
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
@@ -3257,6 +4777,7 @@ export class AgentSession {
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		await this._resumePreparedContextRollover();
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -3603,6 +5124,13 @@ export class AgentSession {
 			exit_plan_mode: createExitPlanModeToolDefinition(this),
 			web_fetch: createWebFetchToolDefinition(this._webFetchOps),
 			history_get: createHistoryGetToolDefinition(this.sessionManager),
+			context_note: createContextNoteToolDefinition({
+				sessionManager: this.sessionManager,
+				getPromptGeneration: () => this._contextMaintenanceBudget.promptGeneration,
+				getContextEpoch: () => this._contextMaintenanceBudget.contextEpoch,
+				getTraceTurn: () => Math.max(0, this._nextTraceTurn - 1),
+				onTrace: (event) => this._appendTraceSafely(event),
+			}),
 		});
 		if (this.settingsManager.getMemorySettings().enabled) {
 			Object.assign(baseToolDefinitions, {
@@ -3659,7 +5187,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", "history_get"];
+			: ["read", "bash", "edit", "write", "history_get", "context_note"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
@@ -4196,11 +5724,11 @@ export class AgentSession {
 				addUsageToTotals(usageTotals, entry.event.data.usage);
 			if (
 				entry.type === "custom" &&
-				entry.customType === "two-pass-prefire" &&
-				isPrefixCheckpoint(entry.data) &&
-				entry.data.usage
+				entry.customType === "context-rollover-checkpoint" &&
+				isContextRolloverCheckpointEnvelope(entry.data) &&
+				entry.data.checkpoint.compactionPrefix.usage
 			) {
-				addUsageToTotals(usageTotals, entry.data.usage);
+				addUsageToTotals(usageTotals, entry.data.checkpoint.compactionPrefix.usage);
 			}
 			if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
 				addUsageToTotals(usageTotals, entry.usage);

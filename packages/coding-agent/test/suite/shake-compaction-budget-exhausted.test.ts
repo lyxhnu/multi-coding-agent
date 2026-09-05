@@ -1,12 +1,22 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type {
+	ContextMaintenanceAction,
+	ContextMaintenanceBudget,
+	ContextMaintenanceSnapshot,
+	ReductionAttemptResult,
+} from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 type SessionInternals = {
-	_midPromptCompactions: number;
-	_lastLimitedInput?: number;
-	_handlePostAgentRun: () => Promise<boolean>;
-	_runAutoCompaction: (reason: "threshold", willRetry: boolean) => Promise<boolean>;
+	_contextMaintenanceBudget: ContextMaintenanceBudget;
+	_handlePostAgentRun: () => Promise<ContextMaintenanceAction>;
+	_runSoftCompaction: (
+		cause: "budget_limit" | "provider_overflow" | "threshold",
+		willRetry: boolean,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	) => Promise<ReductionAttemptResult>;
 };
 
 describe("shake when the mid-prompt compaction budget is exhausted", () => {
@@ -33,34 +43,43 @@ describe("shake when the mid-prompt compaction budget is exhausted", () => {
 	}
 	it("requests a rescue after the third compaction without another summary call", async () => {
 		const { h, internals } = await seed();
-		internals._midPromptCompactions = 3;
+		internals._contextMaintenanceBudget.softCompactionOperationsStarted = 3;
 		await h.session.agent.continue();
 		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "context_limit" } });
-		await expect(internals._handlePostAgentRun()).resolves.toBe(true);
+		await expect(internals._handlePostAgentRun()).resolves.toBe("continue");
 		expect(h.eventsOfType("shake")[0]?.reason).toBe("compaction-budget-exhausted");
-		expect(internals._midPromptCompactions).toBe(3);
+		expect(internals._contextMaintenanceBudget.softCompactionOperationsStarted).toBe(3);
 		expect(h.faux.state.callCount).toBe(0);
 	});
 	it("uses compaction while the bounded allowance remains", async () => {
 		const { h, internals } = await seed();
-		const summary = vi.spyOn(internals, "_runAutoCompaction").mockResolvedValue(false);
+		const summary = vi
+			.spyOn(internals, "_runSoftCompaction")
+			.mockImplementation(async (_cause, _retry, value, index) => ({
+				outcome: "failed",
+				method: "soft_compaction",
+				attemptIndex: index,
+				requestFingerprint: value.fingerprint,
+				tokensBefore: value.budget.tokens,
+				reason: "provider_failed",
+			}));
 		await h.session.agent.continue();
 		await internals._handlePostAgentRun();
-		expect(summary).toHaveBeenCalledWith("threshold", true);
-		expect(internals._midPromptCompactions).toBe(1);
+		expect(summary).toHaveBeenCalledWith("budget_limit", true, expect.any(Object), expect.any(Number));
+		expect(internals._contextMaintenanceBudget.softCompactionOperationsStarted).toBe(1);
 	});
 	it("leaves a comfortable context alone", async () => {
 		const { h, internals } = await seed(1000);
-		internals._midPromptCompactions = 3;
+		internals._contextMaintenanceBudget.softCompactionOperationsStarted = 3;
 		h.setResponses([fauxAssistantMessage("done")]);
 		await h.session.agent.continue();
-		await expect(internals._handlePostAgentRun()).resolves.toBe(false);
+		await expect(internals._handlePostAgentRun()).resolves.toBe("wait");
 		expect(h.eventsOfType("shake")).toHaveLength(0);
-		expect(internals._midPromptCompactions).toBe(3);
+		expect(internals._contextMaintenanceBudget.softCompactionOperationsStarted).toBe(3);
 	});
 	it("rebuilds context and continues without replaying original tools", async () => {
 		const { h, internals } = await seed();
-		internals._midPromptCompactions = 3;
+		internals._contextMaintenanceBudget.softCompactionOperationsStarted = 3;
 		await h.session.agent.continue();
 		await internals._handlePostAgentRun();
 		const result = h.session.messages.find((message) => message.role === "toolResult");
@@ -75,29 +94,38 @@ describe("shake when the mid-prompt compaction budget is exhausted", () => {
 		const { h, internals } = await seed(100);
 		h.sessionManager.appendMessage({ role: "user", content: "plain ".repeat(80000), timestamp: 4 });
 		h.session.agent.state.messages = h.sessionManager.buildSessionContext().messages;
-		internals._midPromptCompactions = 3;
+		internals._contextMaintenanceBudget.softCompactionOperationsStarted = 3;
 		await h.session.agent.continue();
 		await internals._handlePostAgentRun();
-		await expect(internals._handlePostAgentRun()).resolves.toBe(false);
+		await expect(internals._handlePostAgentRun()).resolves.toBe("stop");
 		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "context_limit" } });
 		expect(h.eventsOfType("compaction_start")).toHaveLength(0);
 	});
 	it("does not resubmit an unchanged limited request", async () => {
 		const { h, internals } = await seed();
-		vi.spyOn(internals, "_runAutoCompaction").mockResolvedValue(false);
+		vi.spyOn(internals, "_runSoftCompaction").mockImplementation(async (_cause, _retry, value, index) => ({
+			outcome: "failed",
+			method: "soft_compaction",
+			attemptIndex: index,
+			requestFingerprint: value.fingerprint,
+			tokensBefore: value.budget.tokens,
+			reason: "provider_failed",
+		}));
 		await h.session.agent.continue();
 		await internals._handlePostAgentRun();
-		await expect(internals._handlePostAgentRun()).resolves.toBe(false);
-		expect(internals._midPromptCompactions).toBe(1);
+		await expect(internals._handlePostAgentRun()).resolves.toBe("stop");
+		expect(internals._contextMaintenanceBudget.softCompactionOperationsStarted).toBe(1);
 		expect(h.faux.state.callCount).toBe(0);
 	});
 	it("resets the allowance and previous limit when a new prompt starts", async () => {
 		const { h, internals } = await seed(1000);
-		internals._midPromptCompactions = 3;
-		internals._lastLimitedInput = 120000;
+		const generation = internals._contextMaintenanceBudget.promptGeneration;
+		internals._contextMaintenanceBudget.softCompactionOperationsStarted = 3;
+		internals._contextMaintenanceBudget.rejectedRequestFingerprints.add("limited-request");
 		h.setResponses([fauxAssistantMessage("done")]);
 		await h.session.prompt("hello");
-		expect(internals._midPromptCompactions).toBe(0);
-		expect(internals._lastLimitedInput).toBeUndefined();
+		expect(internals._contextMaintenanceBudget.promptGeneration).toBe(generation + 1);
+		expect(internals._contextMaintenanceBudget.softCompactionOperationsStarted).toBe(0);
+		expect(internals._contextMaintenanceBudget.rejectedRequestFingerprints.size).toBe(0);
 	});
 });

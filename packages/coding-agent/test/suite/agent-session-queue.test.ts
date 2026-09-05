@@ -382,6 +382,21 @@ describe("AgentSession queue characterization", () => {
 
 		expect(countsAtQueuedMessageStart).toEqual([0]);
 		expect(harness.session.pendingMessageCount).toBe(0);
+		const entries = harness.sessionManager.getBranch();
+		const pendingIndex = entries.findIndex(
+			(entry) => entry.type === "pending_delivery" && entry.message.role === "user",
+		);
+		const receiptIndex = entries.findIndex((entry) => entry.type === "delivery_receipt");
+		const queuedMessageEntries = entries.filter(
+			(entry) =>
+				entry.type === "message" &&
+				entry.message.role === "user" &&
+				JSON.stringify(entry.message.content).includes("queued"),
+		);
+		expect(pendingIndex).toBeGreaterThanOrEqual(0);
+		expect(receiptIndex).toBeGreaterThan(pendingIndex);
+		expect(queuedMessageEntries).toHaveLength(0);
+		expect(JSON.stringify(harness.sessionManager.buildSessionContext().messages).match(/queued/g)).toHaveLength(1);
 	});
 
 	it("throws when queueing an extension command with steer", async () => {

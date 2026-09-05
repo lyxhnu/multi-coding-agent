@@ -10,6 +10,12 @@ export {
 	createLocalBashOperations,
 } from "./bash.ts";
 export {
+	type ContextNoteToolDetails,
+	type ContextNoteToolInput,
+	type ContextNoteToolOptions,
+	createContextNoteToolDefinition,
+} from "./context-note.ts";
+export {
 	createEditTool,
 	createEditToolDefinition,
 	type EditOperations,

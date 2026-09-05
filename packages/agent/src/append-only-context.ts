@@ -68,6 +68,20 @@ export class StablePrefix {
 		this.#snapshot = null;
 	}
 
+	/** Create an isolated copy suitable for speculative request preparation. */
+	fork(): StablePrefix {
+		const copy = new StablePrefix();
+		copy.#snapshot = this.#snapshot;
+		copy.#version = this.#version;
+		return copy;
+	}
+
+	/** Replace this prefix with a previously prepared copy. */
+	replaceWith(source: StablePrefix): void {
+		this.#snapshot = source.#snapshot;
+		this.#version = source.#version;
+	}
+
 	/**
 	 * The cached prefix.
 	 * @throws if `build()` was never called.
@@ -119,6 +133,11 @@ export class AppendOnlyLog {
 
 	clear(): void {
 		this.#entries = [];
+	}
+
+	/** Replace the log without sharing its mutable backing array. */
+	replaceWith(source: AppendOnlyLog): void {
+		this.#entries = source.#entries.slice();
 	}
 }
 
@@ -214,6 +233,29 @@ export class AppendOnlyContextManager {
 	/** Force the prefix to be rebuilt on the next `build()` (e.g. after a tool set change). */
 	invalidate(): void {
 		this.prefix.invalidate();
+	}
+
+	/**
+	 * Create an isolated manager for speculative request preparation.
+	 * The live cache is unchanged until {@link replaceWith} is called.
+	 */
+	fork(): AppendOnlyContextManager {
+		const copy = new AppendOnlyContextManager();
+		copy.prefix.replaceWith(this.prefix.fork());
+		copy.log.replaceWith(this.log);
+		copy.#lastSyncCount = this.#lastSyncCount;
+		copy.#messageDigests = this.#messageDigests.slice();
+		copy.#modelKey = this.#modelKey;
+		return copy;
+	}
+
+	/** Commit a prepared manager snapshot. */
+	replaceWith(source: AppendOnlyContextManager): void {
+		this.prefix.replaceWith(source.prefix);
+		this.log.replaceWith(source.log);
+		this.#lastSyncCount = source.#lastSyncCount;
+		this.#messageDigests = source.#messageDigests.slice();
+		this.#modelKey = source.#modelKey;
 	}
 
 	/**

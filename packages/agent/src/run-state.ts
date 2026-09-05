@@ -25,6 +25,8 @@ export function reduceAgentRunState(state: AgentRunState, event: AgentEvent): Ag
 	if (running.phase.type === "cancelling" && event.type !== "agent_end") return running;
 
 	switch (event.type) {
+		case "queue_delivery":
+			return running;
 		case "context_budget":
 			if (running.phase.type !== "preparing") throw new Error("Context preflight outside preparing phase");
 			return running;

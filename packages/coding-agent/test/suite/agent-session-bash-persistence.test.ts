@@ -161,6 +161,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		const entries = harness.sessionManager.getBranch();
 		expect(entries.map((entry) => entry.type)).toEqual([
 			"custom_message",
+			"custom",
 			"message",
 			"message",
 			"message",
@@ -173,6 +174,7 @@ describe("AgentSession bash and persistence characterization", () => {
 			"toolResult",
 			"assistant",
 		]);
+		expect(entries[1]).toMatchObject({ type: "custom", customType: "context-prompt-generation" });
 	});
 
 	it("does not emit message_end for bash execution messages", async () => {

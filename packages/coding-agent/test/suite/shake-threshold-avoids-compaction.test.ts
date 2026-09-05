@@ -5,6 +5,7 @@ import {
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ContextMaintenanceAction } from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 /**
@@ -16,7 +17,10 @@ import { createHarness, type Harness } from "./harness.ts";
  */
 
 type SessionInternals = {
-	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
+	_checkCompaction: (
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck?: boolean,
+	) => Promise<ContextMaintenanceAction>;
 };
 
 const CONTEXT_WINDOW = 128_000;
@@ -129,7 +133,7 @@ describe("threshold compaction tries shake first", () => {
 
 		const compacted = await internals._checkCompaction(createAssistant(harness, OVER_THRESHOLD_TOKENS));
 
-		expect(compacted).toBe(false);
+		expect(compacted).toBe("wait");
 		const shakes = harness.eventsOfType("shake");
 		expect(shakes).toHaveLength(1);
 		expect(shakes[0].reason).toBe("threshold");
@@ -174,7 +178,7 @@ describe("threshold compaction tries shake first", () => {
 
 		const compacted = await internals._checkCompaction(createAssistant(harness, UNDER_THRESHOLD_TOKENS));
 
-		expect(compacted).toBe(false);
+		expect(compacted).toBe("wait");
 		expect(harness.eventsOfType("shake")).toHaveLength(0);
 		expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
 		expect(countCalls()).toBe(0);

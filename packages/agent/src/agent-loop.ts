@@ -7,13 +7,18 @@ import {
 	type AssistantMessage,
 	type Context,
 	type ContextBudget,
+	type ContextBudgetOptions,
 	calculateContextBudget,
 	contextFingerprint,
 	EventStream,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
 	type ThinkingLevel,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
+import type { AppendOnlyContextManager } from "./append-only-context.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AgentContext,
@@ -23,10 +28,41 @@ import type {
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	QueuedAgentMessage,
 	StreamFn,
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+
+/** Final immutable first-request snapshot created before a continuation is dispatched. */
+export interface PreparedAgentRequest {
+	readonly preparationId?: string;
+	readonly model: Model<any>;
+	readonly context: Context;
+	readonly budget: ContextBudget;
+	readonly reasoning: SimpleStreamOptions["reasoning"];
+	readonly requestFingerprint: string;
+	readonly usageContextMessages: readonly Message[];
+	readonly appendOnlyContext?: AppendOnlyContextManager;
+}
+
+export function createProviderRequestFingerprint(
+	context: Context,
+	model: Model<any>,
+	options: { reasoning?: SimpleStreamOptions["reasoning"]; budget?: ContextBudgetOptions } = {},
+): string {
+	const serialized = JSON.stringify({
+		context: contextFingerprint(context, model),
+		reasoning: options.reasoning ?? null,
+		budget: options.budget ?? {},
+	});
+	let hash = 2166136261;
+	for (let index = 0; index < serialized.length; index++) {
+		hash ^= serialized.charCodeAt(index);
+		hash = Math.imul(hash, 16777619);
+	}
+	return (hash >>> 0).toString(36);
+}
 
 /**
  * How many turns in a row may be recovered from an output-token-limit truncation that produced no tool
@@ -227,6 +263,40 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+/**
+ * Continue from an already prepared first provider request.
+ * Transform, conversion, budgeting, and queue selection have already happened.
+ */
+export async function runAgentLoopPrepared(
+	context: AgentContext,
+	injectedItems: QueuedAgentMessage[],
+	preparedRequest: PreparedAgentRequest,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): Promise<AgentMessage[]> {
+	const injectedMessages = injectedItems.map((item) => item.message);
+	const newMessages = injectedMessages.slice();
+	const currentContext: AgentContext = {
+		...context,
+		messages: [...context.messages, ...injectedMessages],
+	};
+
+	await emit({ type: "agent_start" });
+	await emit({ type: "turn_start" });
+	if (injectedItems.length > 0) {
+		await emit({ type: "queue_delivery", preparationId: preparedRequest.preparationId, items: injectedItems });
+	}
+	for (const message of injectedMessages) {
+		await emit({ type: "message_start", message });
+		await emit({ type: "message_end", message });
+	}
+
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn(), preparedRequest);
+	return newMessages;
+}
+
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	return new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
@@ -244,6 +314,7 @@ async function runLoop(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
+	preparedFirstRequest?: PreparedAgentRequest,
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
@@ -257,7 +328,8 @@ async function runLoop(
 	// recovery to its first rung forever.
 	let truncationFloor: ThinkingLevel | undefined;
 	// Check for steering messages at start (user may have typed while waiting)
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let pendingMessages: AgentMessage[] = preparedFirstRequest ? [] : (await config.getSteeringMessages?.()) || [];
+	let preparedRequest = preparedFirstRequest;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -283,7 +355,15 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			const message = await streamAssistantResponse(
+				currentContext,
+				config,
+				signal,
+				emit,
+				streamFunction,
+				preparedRequest,
+			);
+			preparedRequest = undefined;
 			if ("decision" in message) {
 				await emit({
 					type: "agent_end",
@@ -411,69 +491,27 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
+	preparedRequest?: PreparedAgentRequest,
 ): Promise<AssistantMessage | ContextBudget> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
-	}
-
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context. In append-only mode the prefix and the already-sent messages are reused
-	// verbatim so the provider's prompt cache stays warm; see append-only-context.ts.
-	let llmContext: Context;
-	if (config.appendOnlyContext) {
-		config.appendOnlyContext.syncMessages(llmMessages);
-		llmContext = config.appendOnlyContext.build(context);
-	} else {
-		llmContext = {
-			systemPrompt: context.systemPrompt,
-			messages: llmMessages,
-			tools: context.tools,
-		};
-	}
-
-	// Detach the request from live transcript/tool objects before awaiting listeners or authentication.
-	llmContext = {
-		...llmContext,
-		messages: llmContext.messages.map((message) => {
-			const snapshot = { ...message };
-			snapshot.content = structuredClone(message.content);
-			if (snapshot.role === "toolResult" && snapshot.addedToolNames)
-				snapshot.addedToolNames = [...snapshot.addedToolNames];
-			return snapshot;
-		}),
-		tools: llmContext.tools?.map(({ name, description, parameters, constrainedSampling }) => ({
-			name,
-			description,
-			parameters: structuredClone(parameters),
-			...(constrainedSampling ? { constrainedSampling: structuredClone(constrainedSampling) } : {}),
-		})),
-	};
-	signal?.throwIfAborted();
-	const budget = calculateContextBudget(config.model, llmContext, {
-		outputReserveTokens: config.maxTokens,
-		...config.getContextBudgetOptions?.(config.model),
-	});
+	const request = preparedRequest ?? (await prepareAgentRequest(context, config, signal));
+	const { budget } = request;
 	await emit({ type: "context_budget", budget });
 	if (budget.decision === "context_limit") return budget;
-	const requestMessages = llmContext.messages.slice();
 	await emit({
 		type: "request_start",
-		model: config.model,
-		context: llmContext,
-		reasoning: config.reasoning,
+		model: request.model,
+		context: request.context,
+		reasoning: request.reasoning,
 	});
 
 	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+		(config.getApiKey ? await config.getApiKey(request.model.provider) : undefined) || config.apiKey;
 	signal?.throwIfAborted();
 
-	const response = await streamFunction(config.model, llmContext, {
+	const response = await streamFunction(request.model, request.context, {
 		...config,
+		reasoning: request.reasoning,
 		apiKey: resolvedApiKey,
 		signal,
 	});
@@ -514,8 +552,8 @@ async function streamAssistantResponse(
 			case "error": {
 				const finalMessage = await response.result();
 				finalMessage.usageContextFingerprint = contextFingerprint(
-					{ ...llmContext, messages: [...requestMessages, finalMessage] },
-					config.model,
+					{ ...request.context, messages: [...request.usageContextMessages, finalMessage] },
+					request.model,
 				);
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
@@ -533,8 +571,8 @@ async function streamAssistantResponse(
 
 	const finalMessage = await response.result();
 	finalMessage.usageContextFingerprint = contextFingerprint(
-		{ ...llmContext, messages: [...requestMessages, finalMessage] },
-		config.model,
+		{ ...request.context, messages: [...request.usageContextMessages, finalMessage] },
+		request.model,
 	);
 	if (addedPartial) {
 		context.messages[context.messages.length - 1] = finalMessage;
@@ -544,6 +582,85 @@ async function streamAssistantResponse(
 	}
 	await emit({ type: "message_end", message: finalMessage });
 	return finalMessage;
+}
+
+/** Build the exact first provider request without sending it or mutating append-only live state. */
+export async function prepareAgentRequest(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): Promise<PreparedAgentRequest> {
+	let messages = context.messages;
+	if (config.transformContext) {
+		messages = await config.transformContext(messages, signal);
+	}
+
+	const llmMessages = await config.convertToLlm(messages);
+	const usageContextMessages = config.projectUsageContext?.(llmMessages) ?? llmMessages;
+	const lastMessage = llmMessages[llmMessages.length - 1];
+	if (!lastMessage) {
+		throw new Error("Cannot prepare continuation: final provider context has no messages");
+	}
+	if (lastMessage.role === "assistant") {
+		throw new Error("Cannot prepare continuation from message role: assistant");
+	}
+
+	const preparedAppendOnlyContext = config.appendOnlyContext?.fork();
+	let llmContext: Context;
+	if (preparedAppendOnlyContext) {
+		preparedAppendOnlyContext.syncMessages(llmMessages);
+		llmContext = preparedAppendOnlyContext.build(context);
+	} else {
+		llmContext = {
+			systemPrompt: context.systemPrompt,
+			messages: llmMessages,
+			tools: context.tools,
+		};
+	}
+
+	llmContext = detachRequestContext(llmContext);
+	signal?.throwIfAborted();
+	const budgetOptions = {
+		outputReserveTokens: config.maxTokens,
+		...config.getContextBudgetOptions?.(config.model),
+	};
+	const budget = calculateContextBudget(config.model, llmContext, budgetOptions);
+	return {
+		model: config.model,
+		context: llmContext,
+		budget,
+		reasoning: config.reasoning,
+		usageContextMessages: detachRequestContext({
+			systemPrompt: context.systemPrompt,
+			messages: usageContextMessages,
+			tools: context.tools,
+		}).messages,
+		requestFingerprint: createProviderRequestFingerprint(llmContext, config.model, {
+			reasoning: config.reasoning,
+			budget: budgetOptions,
+		}),
+		appendOnlyContext: preparedAppendOnlyContext,
+	};
+}
+
+function detachRequestContext(context: Context): Context {
+	return {
+		...context,
+		messages: context.messages.map((message) => {
+			const snapshot = { ...message };
+			snapshot.content = structuredClone(message.content);
+			if (snapshot.role === "toolResult" && snapshot.addedToolNames) {
+				snapshot.addedToolNames = [...snapshot.addedToolNames];
+			}
+			return snapshot;
+		}),
+		tools: context.tools?.map(({ name, description, parameters, constrainedSampling }) => ({
+			name,
+			description,
+			parameters: structuredClone(parameters),
+			...(constrainedSampling ? { constrainedSampling: structuredClone(constrainedSampling) } : {}),
+		})),
+	};
 }
 
 /**

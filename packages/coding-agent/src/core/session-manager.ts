@@ -28,12 +28,19 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import type {
+	ContextRolloverBlockedReason,
+	ContextRolloverBundle,
+	ContextRolloverRevisions,
+} from "./context-rollover.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	formatContextRolloverHandoff,
+	formatTodoStateProjection,
 } from "./messages.ts";
 import type { SessionTraceEvent } from "./trace.ts";
 
@@ -63,6 +70,80 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+}
+
+export type PendingDeliveryChannel = "steering" | "follow_up" | "next_prompt";
+
+export interface PendingDeliveryEntry extends SessionEntryBase {
+	type: "pending_delivery";
+	deliveryId: string;
+	channel: PendingDeliveryChannel;
+	message: AgentMessage;
+}
+
+export interface DeliveryReceiptEntry extends SessionEntryBase {
+	type: "delivery_receipt";
+	deliveryId: string;
+	preparationId?: string;
+}
+
+export interface DeliveryCancelledEntry extends SessionEntryBase {
+	type: "delivery_cancelled";
+	deliveryId: string;
+}
+
+export interface ContextOperationEntry extends SessionEntryBase {
+	type: "context_operation";
+	operationId: string;
+	operationKind: "checkpoint" | "soft_compaction" | "overflow_retry";
+	state: "started" | "finished";
+	promptGeneration: number;
+	contextEpoch: number;
+	sourceFingerprint: string;
+	outcome?: string;
+}
+
+export interface ContextProgressEntry extends SessionEntryBase {
+	type: "context_progress";
+	evidenceId: string;
+	evidenceKind: "non_read_effect" | "verification" | "task_completed";
+	targetFingerprint: string;
+	subjectId?: string;
+	inputFingerprint?: string;
+	resultFingerprint: string;
+	outcome: "succeeded" | "failed";
+	toolCallId?: string;
+	taskId?: string;
+}
+
+export interface ContextRolloverEntry extends SessionEntryBase {
+	type: "context_rollover";
+	rolloverId: string;
+	dispatchId: string;
+	promptGeneration: number;
+	sourceContextEpoch: number;
+	targetContextEpoch: number;
+	checkpointEntryId: string;
+	bundle: ContextRolloverBundle;
+	expectedRevisions: ContextRolloverRevisions;
+	sourceTokens: number;
+	preparedTokens: number;
+	sourceRequestFingerprint: string;
+	preparedRequestFingerprint: string;
+	preparationBaseFingerprint: string;
+	reservedDeliveryIds: string[];
+	strongProgressCreditIds: string[];
+}
+
+export interface ContextRolloverDispatchEntry extends SessionEntryBase {
+	type: "context_rollover_dispatch";
+	dispatchId: string;
+	rolloverId: string;
+	state: "started" | "finished" | "blocked" | "cancelled";
+	requestFingerprint: string;
+	reservedDeliveryIds?: string[];
+	outcome?: "completed" | "context_limit" | "aborted" | "failed";
+	reason?: ContextRolloverBlockedReason;
 }
 
 /** Log-only execution trace. It is anchored to the current leaf but never becomes a tree node. */
@@ -177,6 +258,13 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
 export type SessionEntry =
 	| SessionMessageEntry
+	| PendingDeliveryEntry
+	| DeliveryReceiptEntry
+	| DeliveryCancelledEntry
+	| ContextOperationEntry
+	| ContextProgressEntry
+	| ContextRolloverEntry
+	| ContextRolloverDispatchEntry
 	| SessionTraceEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
@@ -443,16 +531,7 @@ function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
 	if (entry.type === "message") {
-		const message = entry.message;
-		// Session files are parsed without validation; old versions, forks, or
-		// hand-edited files can contain messages with null/missing content.
-		if (
-			(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
-			message.content == null
-		) {
-			return [{ ...message, content: [] }];
-		}
-		return [message];
+		return [normalizeContextMessage(entry.message)];
 	}
 	if (entry.type === "custom_message") {
 		return [
@@ -466,6 +545,18 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		return [createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp)];
 	}
 	return [];
+}
+
+function normalizeContextMessage(message: AgentMessage): AgentMessage {
+	// Session files are parsed without validation; old versions, forks, or
+	// hand-edited files can contain messages with null/missing content.
+	if (
+		(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
+		message.content == null
+	) {
+		return { ...message, content: [] };
+	}
+	return message;
 }
 
 /**
@@ -560,7 +651,67 @@ export function buildSessionContext(
 ): SessionContext {
 	const path = buildSessionPath(entries, leafId, byId);
 	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
+	const pendingByDeliveryId = new Map(
+		path
+			.filter((entry): entry is PendingDeliveryEntry => entry.type === "pending_delivery")
+			.map((entry) => [entry.deliveryId, entry]),
+	);
+	const projectEntry = (entry: SessionEntry): AgentMessage[] => {
+		if (entry.type === "delivery_receipt") {
+			const pending = pendingByDeliveryId.get(entry.deliveryId);
+			return pending ? [normalizeContextMessage(pending.message)] : [];
+		}
+		if (entry.type === "context_rollover_dispatch" && entry.state === "started") {
+			return (entry.reservedDeliveryIds ?? []).flatMap((deliveryId) => {
+				const pending = pendingByDeliveryId.get(deliveryId);
+				return pending ? [normalizeContextMessage(pending.message)] : [];
+			});
+		}
+		return sessionEntryToContextMessages(entry);
+	};
+	let latestRolloverIndex = -1;
+	for (let index = path.length - 1; index >= 0; index--) {
+		if (path[index].type === "context_rollover") {
+			latestRolloverIndex = index;
+			break;
+		}
+	}
+	if (latestRolloverIndex >= 0) {
+		const rollover = path[latestRolloverIndex] as ContextRolloverEntry;
+		const pathById = new Map(path.map((entry) => [entry.id, entry]));
+		const activeEntries = rollover.bundle.activeEntryIds.flatMap((id) => {
+			const entry = pathById.get(id);
+			return entry ? [entry] : [];
+		});
+		const afterBoundary = path.slice(latestRolloverIndex + 1);
+		const redactions = collectShakeRedactions(path);
+		const redactedActive = applyRedactions(activeEntries, redactions);
+		const redactedAfter = applyRedactions(afterBoundary, redactions);
+		const latestTodo = [...path]
+			.reverse()
+			.find((entry) => entry.type === "custom" && entry.customType === "todo-state");
+		const timestamp = "1970-01-01T00:00:00.000Z";
+		const handoff = createCustomMessage(
+			"context-rollover",
+			formatContextRolloverHandoff(rollover.bundle),
+			false,
+			{ rolloverId: rollover.rolloverId, historyAllowlist: rollover.bundle.historyAllowlist },
+			timestamp,
+		);
+		const todo = createCustomMessage(
+			"todo-state-projection",
+			formatTodoStateProjection(latestTodo?.type === "custom" ? latestTodo.data : undefined),
+			false,
+			undefined,
+			timestamp,
+		);
+		return {
+			messages: [handoff, ...redactedActive.flatMap(projectEntry), todo, ...redactedAfter.flatMap(projectEntry)],
+			thinkingLevel,
+			model,
+		};
+	}
+	const messages = buildContextEntries(entries, leafId, byId).flatMap(projectEntry);
 	return { messages, thinkingLevel, model };
 }
 
@@ -1112,16 +1263,24 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some(
+		const mustPersist = this.fileEntries.some(
 			(e) =>
 				(e.type === "message" && e.message.role === "assistant") ||
+				e.type === "pending_delivery" ||
+				e.type === "delivery_receipt" ||
+				e.type === "delivery_cancelled" ||
+				e.type === "context_operation" ||
+				e.type === "context_progress" ||
+				e.type === "context_rollover" ||
+				e.type === "context_rollover_dispatch" ||
 				e.type === "compaction" ||
-				(e.type === "custom" && e.customType === "two-pass-prefire") ||
+				(e.type === "custom" && e.customType === "task-note-event") ||
+				(e.type === "custom" && e.customType === "context-rollover-checkpoint") ||
 				(e.type === "trace" &&
 					e.event.type === "context/budget" &&
 					e.event.data.budget.decision === "context_limit"),
 		);
-		if (!hasAssistant) {
+		if (!mustPersist) {
 			if (this.flushed) {
 				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
 			} else {
@@ -1210,6 +1369,211 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/** Persist a queue item before exposing it to the Agent. */
+	appendPendingDelivery(deliveryId: string, channel: PendingDeliveryChannel, message: AgentMessage): string {
+		const entry: PendingDeliveryEntry = {
+			type: "pending_delivery",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			deliveryId,
+			channel,
+			message,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Record ordinary queue delivery at the point the message enters Agent context. */
+	appendDeliveryReceipt(deliveryId: string, preparationId?: string): string {
+		const entry: DeliveryReceiptEntry = {
+			type: "delivery_receipt",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			deliveryId,
+			preparationId,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Persist an explicit queue clear without projecting the message into model context. */
+	appendDeliveryCancelled(deliveryId: string): string {
+		const entry: DeliveryCancelledEntry = {
+			type: "delivery_cancelled",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			deliveryId,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	appendContextOperation(input: Omit<ContextOperationEntry, keyof SessionEntryBase | "type">): string {
+		const entry: ContextOperationEntry = {
+			type: "context_operation",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			...input,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	appendContextProgress(input: Omit<ContextProgressEntry, keyof SessionEntryBase | "type">): string {
+		const entry: ContextProgressEntry = {
+			type: "context_progress",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			...input,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	appendContextRollover(input: Omit<ContextRolloverEntry, keyof SessionEntryBase | "type">): string {
+		const entry: ContextRolloverEntry = {
+			type: "context_rollover",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			...input,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	appendContextRolloverDispatch(input: Omit<ContextRolloverDispatchEntry, keyof SessionEntryBase | "type">): string {
+		const entry: ContextRolloverDispatchEntry = {
+			type: "context_rollover_dispatch",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			...input,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	getContextOperationUsage(
+		promptGeneration: number,
+		contextEpoch: number,
+	): {
+		checkpoint: number;
+		softCompaction: number;
+		overflowRetry: number;
+	} {
+		const started = new Map<string, ContextOperationEntry>();
+		for (const entry of this.getBranch()) {
+			if (
+				entry.type === "context_operation" &&
+				entry.state === "started" &&
+				entry.promptGeneration === promptGeneration &&
+				entry.contextEpoch === contextEpoch
+			) {
+				started.set(entry.operationId, entry);
+			}
+		}
+		const operations = [...started.values()];
+		return {
+			checkpoint: operations.filter((entry) => entry.operationKind === "checkpoint").length,
+			softCompaction: operations.filter((entry) => entry.operationKind === "soft_compaction").length,
+			overflowRetry: operations.filter((entry) => entry.operationKind === "overflow_retry").length,
+		};
+	}
+
+	getLatestContextCoordinates(): { promptGeneration: number; contextEpoch: number } {
+		let promptGeneration = 0;
+		let contextEpoch = 0;
+		for (const entry of this.getBranch()) {
+			if (
+				entry.type === "custom" &&
+				entry.customType === "context-prompt-generation" &&
+				typeof entry.data === "object" &&
+				entry.data !== null &&
+				"promptGeneration" in entry.data &&
+				typeof entry.data.promptGeneration === "number"
+			) {
+				promptGeneration = entry.data.promptGeneration;
+				contextEpoch = 0;
+			} else if (entry.type === "context_operation") {
+				if (entry.promptGeneration > promptGeneration) {
+					promptGeneration = entry.promptGeneration;
+					contextEpoch = entry.contextEpoch;
+				} else if (entry.promptGeneration === promptGeneration) {
+					contextEpoch = Math.max(contextEpoch, entry.contextEpoch);
+				}
+			} else if (entry.type === "context_rollover") {
+				if (entry.promptGeneration > promptGeneration) {
+					promptGeneration = entry.promptGeneration;
+					contextEpoch = entry.targetContextEpoch;
+				} else if (entry.promptGeneration === promptGeneration) {
+					contextEpoch = Math.max(contextEpoch, entry.targetContextEpoch);
+				}
+			}
+		}
+		return { promptGeneration, contextEpoch };
+	}
+
+	getContextRolloverState(): {
+		contextEpoch: number;
+		rolloverCount: number;
+		dispatchState: "none" | "prepared" | "started" | "finished" | "blocked" | "cancelled" | "outcome_unknown";
+		dispatchId?: string;
+		rolloverId?: string;
+	} {
+		const branch = this.getBranch();
+		const coordinates = this.getLatestContextCoordinates();
+		let currentPromptStart = -1;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (
+				entry.type === "custom" &&
+				entry.customType === "context-prompt-generation" &&
+				typeof entry.data === "object" &&
+				entry.data !== null &&
+				"promptGeneration" in entry.data &&
+				entry.data.promptGeneration === coordinates.promptGeneration
+			) {
+				currentPromptStart = index;
+				break;
+			}
+		}
+		const rollovers = branch.filter(
+			(entry): entry is ContextRolloverEntry =>
+				entry.type === "context_rollover" && entry.promptGeneration === coordinates.promptGeneration,
+		);
+		const latestRollover = rollovers.at(-1);
+		const latestDispatch = branch
+			.slice(currentPromptStart + 1)
+			.reverse()
+			.find(
+				(entry): entry is ContextRolloverDispatchEntry =>
+					entry.type === "context_rollover_dispatch" &&
+					(latestRollover === undefined || entry.dispatchId === latestRollover.dispatchId),
+			);
+		let dispatchState: ReturnType<SessionManager["getContextRolloverState"]>["dispatchState"] = latestRollover
+			? "prepared"
+			: "none";
+		if (latestDispatch?.state === "started") dispatchState = "outcome_unknown";
+		else if (latestDispatch) dispatchState = latestDispatch.state;
+		return {
+			contextEpoch: coordinates.contextEpoch,
+			rolloverCount: rollovers.length,
+			dispatchState,
+			...(latestDispatch?.dispatchId === undefined ? {} : { dispatchId: latestDispatch.dispatchId }),
+			...(latestDispatch?.rolloverId === undefined
+				? latestRollover === undefined
+					? {}
+					: { rolloverId: latestRollover.rolloverId }
+				: { rolloverId: latestDispatch.rolloverId }),
+		};
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
@@ -1683,7 +2047,7 @@ export class SessionManager {
 				(e) =>
 					(e.type === "message" && e.message.role === "assistant") ||
 					e.type === "compaction" ||
-					(e.type === "custom" && e.customType === "two-pass-prefire") ||
+					(e.type === "custom" && e.customType === "context-rollover-checkpoint") ||
 					(e.type === "trace" &&
 						e.event.type === "context/budget" &&
 						e.event.data.budget.decision === "context_limit"),

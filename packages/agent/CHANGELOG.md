@@ -5,9 +5,11 @@
 ### Breaking Changes
 
 - Replaced the independent `AgentState.isStreaming`, `streamingMessage`, `pendingToolCalls`, and `errorMessage` fields with the explicit discriminated `AgentState.runState` lifecycle.
+- Replaced raw steering/follow-up queue messages with stable `QueuedAgentMessage` values and routed `Agent.continue()` through the new prepare/dispatch continuation contract.
 
 ### Added
 
+- Added immutable `PreparedContinuation` handles that reserve queued deliveries and guarantee preview/dispatch reuse of the same transformed provider request.
 - Added final-request `context_budget` events and structured `context_limit` outcomes without synthetic assistant messages; checks run after transforms, conversion and append-only assembly.
 - Added scoped history references to shake placeholders when the host makes history reads available.
 - Added `shake`, a mechanical context reduction pass that replaces whole tool results and large fenced/XML blocks with placeholders without calling a model. Exposes `collectShakeRegions`, `buildRedactions`, `applyRedactions`, `buildShakenIndex`, `resolveShakeConfig`, and the `DEFAULT_SHAKE_CONFIG`/`AGGRESSIVE_SHAKE_CONFIG`/`RESCUE_SHAKE_CONFIG` presets.

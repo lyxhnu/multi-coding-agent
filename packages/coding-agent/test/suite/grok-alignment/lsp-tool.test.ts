@@ -20,7 +20,14 @@ describe("lsp tool (M6)", () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		expect(harness.session.getAllTools().map((t) => t.name)).not.toContain("lsp");
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "bash", "edit", "write", "history_get"]);
+		expect(harness.session.getActiveToolNames()).toEqual([
+			"read",
+			"bash",
+			"edit",
+			"write",
+			"history_get",
+			"context_note",
+		]);
 	});
 
 	it("registers a configured server without expanding the default active tool set", async () => {

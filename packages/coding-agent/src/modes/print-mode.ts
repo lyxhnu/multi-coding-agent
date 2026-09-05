@@ -125,9 +125,17 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		for (const message of messages) {
 			await session.prompt(message);
 		}
+		if (session.contextRolloverState.dispatchState === "outcome_unknown") {
+			console.error(
+				"Context rollover stopped: Provider or tool outcome is unknown. Nothing was replayed automatically; inspect external state before sending a new prompt.",
+			);
+			return 1;
+		}
 
 		if (session.state.runState.status === "idle" && session.state.runState.lastOutcome?.type === "context_limit") {
-			console.error("context_limit: insufficient context after bounded reduction; task is not complete.");
+			console.error(
+				"context_limit: context maintenance is exhausted and the task is not complete; reduce context or switch to a model with a larger context window.",
+			);
 			return 1;
 		}
 		if (mode === "text") {

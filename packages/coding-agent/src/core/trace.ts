@@ -8,17 +8,29 @@ import type {
 	Tool,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
+import type {
+	BudgetVerification,
+	ContextMaintenanceAction,
+	ContextMaintenanceCause,
+	ContextMaintenancePhase,
+	ContextMaintenanceReasonCode,
+	ContextMaintenanceState,
+	ContinuationIntent,
+	ReductionMethod,
+} from "./compaction/context-maintenance.ts";
+import type { ContextRolloverBlockedReason } from "./context-rollover.ts";
+import type { TaskNoteKind } from "./task-note-projection.ts";
 import type { TaskKind, TaskStatus } from "./tasks/types.ts";
 
-export type TraceRequestTool = Pick<Tool, "name" | "description" | "parameters" | "constrainedSampling">;
+export type TraceRequestTool = Pick<Tool, "name">;
 
 /** Exact, serializable request state at the low-level provider boundary. */
 export interface TraceRequestHeader {
 	provider: string;
 	model: string;
 	reasoning?: ThinkingLevel;
-	systemPrompt?: string;
-	messages: Message[];
+	/** Message roles only; request正文 is intentionally excluded from the trace. */
+	messages: Array<Pick<Message, "role">>;
 	tools?: TraceRequestTool[];
 }
 
@@ -32,11 +44,11 @@ export type TraceAssistantChunk =
 	| { type: "thinking_delta"; contentIndex: number; delta: string }
 	| { type: "thinking_end"; contentIndex: number; content: string }
 	| { type: "toolcall_start"; contentIndex: number }
-	| { type: "toolcall_delta"; contentIndex: number; delta: string }
+	| { type: "toolcall_delta"; contentIndex: number }
 	| {
 			type: "toolcall_end";
 			contentIndex: number;
-			toolCall: Extract<Extract<Message, { role: "assistant" }>["content"][number], { type: "toolCall" }>;
+			toolCall: { id: string; name: string };
 	  }
 	| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse"> }
 	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; errorMessage?: string };
@@ -61,6 +73,71 @@ export type SessionTraceEvent =
 	  }
 	| { type: "request/header"; data: { turn: number; step: number; header: TraceRequestHeader } }
 	| { type: "context/budget"; data: { turn: number; step: number; budget: ContextBudget } }
+	| {
+			type: "context/maintenance";
+			data: {
+				maintenanceId: string;
+				triggerId?: string;
+				turn: number;
+				promptGeneration: number;
+				cause: ContextMaintenanceCause;
+				phase: ContextMaintenancePhase;
+				state: ContextMaintenanceState;
+				method?: ReductionMethod;
+				attemptIndex?: number;
+				requestFingerprint: string;
+				outcome:
+					| "entered"
+					| "committed"
+					| "unavailable"
+					| "failed"
+					| "superseded"
+					| "vetoed"
+					| "ready"
+					| "blocked"
+					| "cancelled"
+					| "dispatched";
+				tokensBefore?: number;
+				tokensAfter?: number;
+				budgetDecision?: ContextBudget["decision"];
+				verification?: BudgetVerification | "not_required";
+				continuation?: ContinuationIntent;
+				nextAction?: ContextMaintenanceAction;
+				dispatchStatus?: "executed" | "coalesced";
+				reasonCode?: ContextMaintenanceReasonCode;
+			};
+	  }
+	| {
+			type: "context/rollover";
+			data: {
+				rolloverId: string;
+				checkpointId?: string;
+				dispatchId?: string;
+				turn: number;
+				promptGeneration: number;
+				sourceContextEpoch: number;
+				targetContextEpoch?: number;
+				phase: "checkpoint" | "rollover" | "preparation" | "dispatch";
+				outcome:
+					| "entered"
+					| "waiting"
+					| "committed"
+					| "discarded"
+					| "prepared"
+					| "started"
+					| "finished"
+					| "blocked"
+					| "cancelled"
+					| "outcome_unknown";
+				sourceRequestFingerprint?: string;
+				preparedRequestFingerprint?: string;
+				sourceTokens?: number;
+				preparedTokens?: number;
+				reservedDeliveryCount?: number;
+				strongProgressCreditCount?: number;
+				reasonCode?: ContextRolloverBlockedReason;
+			};
+	  }
 	| {
 			type: "compaction/summary";
 			data: {
@@ -93,7 +170,7 @@ export type SessionTraceEvent =
 	| { type: "assistant/chunk"; data: { turn: number; step: number; chunk: TraceAssistantChunk } }
 	| {
 			type: "tool/call";
-			data: { turn: number; step: number; callId: string; name: string; arguments: unknown };
+			data: { turn: number; step: number; callId: string; name: string };
 	  }
 	| {
 			type: "tool/result";
@@ -109,23 +186,32 @@ export type SessionTraceEvent =
 				to: TaskStatus;
 				reason?: string;
 			};
+	  }
+	| {
+			type: "context/task_note";
+			data: {
+				turn: number;
+				eventId?: string;
+				batchId?: string;
+				promptGeneration: number;
+				contextEpoch: number;
+				kind?: TaskNoteKind;
+				key?: string;
+				operation?: "upsert" | "retract" | "project";
+				outcome: "accepted" | "rejected" | "rebuilt";
+				activeCount?: number;
+				staleCount?: number;
+				reasonCode?: string;
+			};
 	  };
 
 export function createTraceRequestHeader(event: Extract<AgentEvent, { type: "request_start" }>): TraceRequestHeader {
-	const tools = event.context.tools?.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		parameters: structuredClone(tool.parameters),
-		...(tool.constrainedSampling === undefined
-			? {}
-			: { constrainedSampling: structuredClone(tool.constrainedSampling) }),
-	}));
+	const tools = event.context.tools?.map((tool) => ({ name: tool.name }));
 	return {
 		provider: event.model.provider,
 		model: event.model.id,
 		...(event.reasoning === undefined ? {} : { reasoning: event.reasoning }),
-		...(event.context.systemPrompt === undefined ? {} : { systemPrompt: event.context.systemPrompt }),
-		messages: structuredClone(event.context.messages),
+		messages: event.context.messages.map((message) => ({ role: message.role })),
 		...(tools === undefined || tools.length === 0 ? {} : { tools }),
 	};
 }
@@ -149,12 +235,12 @@ export function createTraceAssistantChunk(event: AssistantMessageEvent): TraceAs
 		case "toolcall_start":
 			return { type: event.type, contentIndex: event.contentIndex };
 		case "toolcall_delta":
-			return { type: event.type, contentIndex: event.contentIndex, delta: event.delta };
+			return { type: event.type, contentIndex: event.contentIndex };
 		case "toolcall_end":
 			return {
 				type: event.type,
 				contentIndex: event.contentIndex,
-				toolCall: structuredClone(event.toolCall),
+				toolCall: { id: event.toolCall.id, name: event.toolCall.name },
 			};
 		case "done":
 			return { type: event.type, reason: event.reason };

@@ -52,6 +52,12 @@ export type ToolExecutionMode = "sequential" | "parallel";
  */
 export type QueueMode = "all" | "one-at-a-time";
 
+/** Queue item with a stable host-owned identity used for durable delivery receipts. */
+export interface QueuedAgentMessage {
+	queueItemId: string;
+	message: AgentMessage;
+}
+
 /** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
@@ -195,6 +201,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * ```
 	 */
 	convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+
+	/**
+	 * Projects the converted provider messages onto the durable transcript used to validate reported usage.
+	 * Request-only metadata may be removed here; the provider request itself is unchanged.
+	 */
+	projectUsageContext?: (messages: Message[]) => Message[];
 
 	/**
 	 * Optional transform applied to the context before `convertToLlm`.
@@ -487,6 +499,7 @@ export type AgentEvent =
 	| { type: "agent_start" }
 	| { type: "agent_end"; messages: AgentMessage[]; outcome?: AgentRunOutcome }
 	| { type: "context_budget"; budget: ContextBudget }
+	| { type: "queue_delivery"; preparationId?: string; items: readonly QueuedAgentMessage[] }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }

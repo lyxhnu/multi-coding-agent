@@ -656,6 +656,7 @@ export async function generateSummaryWithUsage(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	replaceInstructions = false,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -663,8 +664,13 @@ export async function generateSummaryWithUsage(
 	);
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (customInstructions) {
+	let basePrompt =
+		replaceInstructions && customInstructions
+			? customInstructions
+			: previousSummary
+				? UPDATE_SUMMARIZATION_PROMPT
+				: SUMMARIZATION_PROMPT;
+	if (customInstructions && !replaceInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
 

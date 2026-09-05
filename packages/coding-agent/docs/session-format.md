@@ -215,10 +215,10 @@ Durable, log-only execution events used by `/trace`. A trace entry's `parentId` 
 ```jsonl
 {"type":"trace","id":"t1a2b3c4","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:01.010Z","event":{"type":"turn/start","data":{"turn":0}}}
 {"type":"trace","id":"t2b3c4d5","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:01.020Z","event":{"type":"step/start","data":{"turn":0,"step":0}}}
-{"type":"trace","id":"t3c4d5e6","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:01.030Z","event":{"type":"request/header","data":{"turn":0,"step":0,"header":{"provider":"anthropic","model":"claude-sonnet-4-5","systemPrompt":"...","messages":[],"tools":[]}}}}
+{"type":"trace","id":"t3c4d5e6","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:01.030Z","event":{"type":"request/header","data":{"turn":0,"step":0,"header":{"provider":"anthropic","model":"claude-sonnet-4-5","messages":[{"role":"user"}],"tools":[{"name":"bash"}]}}}}
 ```
 
-The trace vocabulary is `turn/start`, `turn/end`, `step/start`, `step/end`, `request/header`, `assistant/chunk`, `tool/call`, `tool/result`, and `task/state`. Background task transitions stay associated with the turn that created the task even when they settle later. Final user, assistant, and tool-result messages remain ordinary `message` entries, so the same JSONL file is the only source of truth.
+The trace vocabulary is `turn/start`, `turn/end`, `step/start`, `step/end`, `request/header`, `assistant/chunk`, `tool/call`, `tool/result`, `task/state`, and `context/task_note`. Task-note traces contain only scope coordinates, operation, kind, key, outcome, event/batch ID, counts, and failure reason; note text and evidence are not copied. Request headers contain only provider-safe metadata and message roles; system prompts, message bodies, tool schemas, and tool arguments are never copied into trace entries. Background task transitions stay associated with the turn that created the task even when they settle later. Final user, assistant, and tool-result messages remain ordinary `message` entries, so the same JSONL file is the only source of truth.
 
 ### ModelChangeEntry
 
@@ -279,6 +279,19 @@ Extension state persistence. Does NOT participate in LLM context.
 ```
 
 Use `customType` to identify your extension's entries on reload. Interactive mode can render custom entries via `pi.registerEntryRenderer(customType, renderer)`, but they still do not participate in LLM context.
+
+Built-in task continuity uses two strict custom-entry payloads:
+
+- `task-note-event`: one accepted, system-stamped semantic-index event from `context_note`.
+- `context-rollover-checkpoint`: one atomic `{ checkpoint, taskNoteBatch }` envelope from checkpoint prefire. `checkpoint.compactionPrefix` contains the reusable two-pass compaction summary and its source identity; there is no separate prefix-checkpoint entry.
+
+Task-note scope is `{ taskScopeId, promptGeneration }`. `createdInContextEpoch` records provenance only, so an active note remains visible across context epochs. The projection is rebuilt from the active branch ancestry; it is never persisted as a second snapshot. Raw Task Note or Checkpoint entries do not enter model context. On rollover, the system validates them against authoritative user, tool, Todo, queue, progress, and task state, then injects only the final Handoff.
+
+```json
+{"type":"custom","id":"n1","parentId":"m1","timestamp":"2026-09-04T00:00:00.000Z","customType":"task-note-event","data":{"version":1,"eventId":"sha256...","scope":{"taskScopeId":"sha256...","promptGeneration":1},"createdInContextEpoch":2,"operation":"upsert","kind":"constraint","key":"compatibility","text":"Do not preserve backward compatibility.","sourceRefs":[{"entryId":"m1"}],"evidence":[],"source":{"type":"model_tool","toolCallId":"call_1"}}}
+```
+
+Checkpoint payloads are not accepted in the former bare-checkpoint shape. The checkpoint and all Note candidates either validate and persist together, or nothing is committed.
 
 ### CustomMessageEntry
 

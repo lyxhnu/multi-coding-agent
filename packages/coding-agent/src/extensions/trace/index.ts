@@ -54,6 +54,10 @@ function traceSummary(entry: SessionTraceEntry): string {
 			return `turn/end ${event.data.outcome?.type ?? event.data.stopReason ?? "unknown"}${event.data.willRetry ? " · retry" : ""}`;
 		case "context/budget":
 			return `context/budget ${event.data.budget.decision} · ${event.data.budget.tokens} input tokens`;
+		case "context/maintenance":
+			return `context/maintenance ${event.data.state} · ${event.data.outcome}${event.data.method ? ` · ${event.data.method}` : ""}${event.data.nextAction ? ` · ${event.data.nextAction}` : ""}`;
+		case "context/rollover":
+			return `context/rollover epoch ${event.data.sourceContextEpoch}${event.data.targetContextEpoch === undefined ? "" : `→${event.data.targetContextEpoch}`} · ${event.data.phase} · ${event.data.outcome}${event.data.reasonCode ? ` · ${event.data.reasonCode}` : ""}`;
 		case "memory/archive":
 			return `memory/archive ${event.data.reason} · ${event.data.written ?? 0} written`;
 		case "compaction/summary":
@@ -68,17 +72,19 @@ function traceSummary(entry: SessionTraceEntry): string {
 		}
 		case "assistant/chunk": {
 			const chunk = event.data.chunk;
-			if (chunk.type === "text_delta" || chunk.type === "thinking_delta" || chunk.type === "toolcall_delta") {
+			if (chunk.type === "text_delta" || chunk.type === "thinking_delta") {
 				return `assistant/chunk ${chunk.type} ${JSON.stringify(compactText(chunk.delta, 48))}`;
 			}
 			return `assistant/chunk ${chunk.type}`;
 		}
 		case "tool/call":
-			return `tool/call ${event.data.name} ${compactText(JSON.stringify(event.data.arguments), 56)}`;
+			return `tool/call ${event.data.name}`;
 		case "tool/result":
 			return `tool/result ${event.data.name} · ${event.data.isError ? "error" : "ok"}`;
 		case "task/state":
 			return `task/state ${event.data.kind} ${event.data.from ?? "created"} → ${event.data.to}`;
+		case "context/task_note":
+			return `context/task_note ${event.data.operation ?? "project"} ${event.data.kind === undefined ? "" : `${event.data.kind}/${event.data.key ?? ""}`} · ${event.data.outcome}${event.data.activeCount === undefined ? "" : ` · ${event.data.activeCount} active/${event.data.staleCount ?? 0} stale`}${event.data.reasonCode ? ` · ${event.data.reasonCode}` : ""}`;
 	}
 }
 

@@ -6,9 +6,27 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type CompactionPreparation, compact } from "../../src/core/compaction/compaction.ts";
+import type {
+	ContextMaintenanceSnapshot,
+	ReductionAttemptResult,
+} from "../../src/core/compaction/context-maintenance.ts";
 import { projectSessionsDir } from "../../src/core/memory/memory-store.ts";
 import { createHistoryGetToolDefinition } from "../../src/core/tools/history-get.ts";
 import { createHarness, type Harness } from "./harness.ts";
+
+type CompactionInternals = {
+	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
+	_runSoftCompaction: (
+		cause: "threshold",
+		willRetry: boolean,
+		snapshot: ContextMaintenanceSnapshot,
+		attemptIndex: number,
+	) => Promise<ReductionAttemptResult>;
+};
+
+async function compactOnce(internals: CompactionInternals): Promise<ReductionAttemptResult> {
+	return await internals._runSoftCompaction("threshold", false, await internals._contextMaintenanceSnapshot(), 1);
+}
 
 describe("memory-context-integrity: cross-module boundaries", () => {
 	it("E01/E03/K03/K04 preserves constraints through tools, shake, incremental compaction and disk restart", async () => {
@@ -69,19 +87,67 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		);
 		expect(executions).toBe(1);
 		h.setResponses([
-			fauxAssistantMessage("Constraint: never publish without approval. Pending read review."),
-			fauxAssistantMessage("Saved history reviewed; approval required."),
+			(context) => {
+				const requestText = context.messages
+					.flatMap((message) =>
+						typeof message.content === "string"
+							? [message.content]
+							: message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+					)
+					.join("\n");
+				const payload = JSON.parse(requestText.split("\n\n").at(-1)!) as {
+					sourceEntries: Array<{
+						id: string;
+						type: string;
+						message?: { role: string; content: string | Array<{ type: string; text?: string }> };
+					}>;
+				};
+				const users = payload.sourceEntries.filter(
+					(entry) => entry.type === "message" && entry.message?.role === "user",
+				);
+				const objective = users.at(-1);
+				const constraint = users.find((entry) => JSON.stringify(entry.message?.content).includes("never publish"));
+				if (!objective?.message || !constraint) throw new Error("missing checkpoint sources");
+				const objectiveText =
+					typeof objective.message.content === "string"
+						? objective.message.content
+						: objective.message.content.map((part) => part.text ?? "").join("\n");
+				return fauxAssistantMessage(
+					JSON.stringify({
+						checkpoint: {
+							version: 1,
+							objective: { text: objectiveText, sourceEntryIds: [objective.id] },
+							userConstraints: [
+								{
+									text: "never publish without approval.",
+									sourceEntryIds: [constraint.id],
+								},
+							],
+							acceptanceCriteria: { status: "not_specified", items: [] },
+							decisions: [],
+							completedWork: [],
+							currentState: {
+								text: "Saved history reviewed; approval required.",
+								evidenceEntryIds: [objective.id],
+							},
+							failedAttempts: [],
+							nextAction: { text: "Continue the review.", evidenceEntryIds: [] },
+							historyRefs: [],
+						},
+						noteUpdateCandidates: [],
+					}),
+				);
+			},
 		]);
-		const internals = h.session as unknown as {
+		const internals = h.session as unknown as CompactionInternals & {
 			_maybeStartTwoPassPrefire(): void;
-			_runAutoCompaction(reason: "threshold", retry: boolean): Promise<boolean>;
 		};
 		internals._maybeStartTwoPassPrefire();
 		await vi.waitFor(() =>
 			expect(
 				h.sessionManager
 					.getBranch()
-					.some((entry) => entry.type === "custom" && entry.customType === "two-pass-prefire"),
+					.some((entry) => entry.type === "custom" && entry.customType === "context-rollover-checkpoint"),
 			).toBe(true),
 		);
 		h.setResponses([fauxAssistantMessage("tail progress")]);
@@ -97,7 +163,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 				return fauxAssistantMessage("Next: review changes; approval required.");
 			},
 		]);
-		await internals._runAutoCompaction("threshold", false);
+		await compactOnce(internals);
 		expect(h.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			aborted: false,
 			result: { summary: expect.stringContaining("never publish without approval") },
@@ -261,7 +327,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 			parameters: Type.Object({}),
 			execute: async () => {
 				executions++;
-				h.session.agent[queue]({ role: "user", content: queuedText, timestamp: 2 });
+				await h.session[queue](queuedText);
 				return { content: [{ type: "text", text: "queued" }], details: {} };
 			},
 		};
@@ -280,15 +346,11 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		expect(executions).toBe(1);
 		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "context_limit" } });
 		expect(
-			h.sessionManager
-				.getEntries()
-				.filter(
-					(entry) =>
-						entry.type === "message" &&
-						entry.message.role === "user" &&
-						JSON.stringify(entry.message.content).includes("queued constraint"),
-				),
+			h.session.messages.filter(
+				(message) => message.role === "user" && JSON.stringify(message.content).includes("queued constraint"),
+			),
 		).toHaveLength(1);
+		expect(h.sessionManager.getEntries().filter((entry) => entry.type === "delivery_receipt")).toHaveLength(1);
 		expect(h.session.agent.hasQueuedMessages()).toBe(false);
 	});
 
@@ -358,9 +420,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		await h.session.prompt("first");
 		await h.session.prompt("second");
 		vi.spyOn(h.session.memoryStore, "maybeConsolidate").mockRejectedValue(new Error("simulated archive failure"));
-		await (
-			h.session as unknown as { _runAutoCompaction(reason: "threshold", retry: boolean): Promise<boolean> }
-		)._runAutoCompaction("threshold", false);
+		await compactOnce(h.session as unknown as CompactionInternals);
 		expect(h.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			aborted: false,
 			result: { summary: "Durable project convention" },
