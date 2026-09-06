@@ -9,6 +9,7 @@
 
 ### Added
 
+- Added final-request control hooks, a single restricted state-saving turn, and `context_transition` outcomes after complete tool batches.
 - Added immutable `PreparedContinuation` handles that reserve queued deliveries and guarantee preview/dispatch reuse of the same transformed provider request.
 - Added final-request `context_budget` events and structured `context_limit` outcomes without synthetic assistant messages; checks run after transforms, conversion and append-only assembly.
 - Added scoped history references to shake placeholders when the host makes history reads available.

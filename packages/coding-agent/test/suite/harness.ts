@@ -61,12 +61,14 @@ export function getAssistantTexts(harness: Harness): string[] {
 }
 
 export interface HarnessOptions {
+	/** Preserve provider request identity in disk restart tests. */
+	fauxApi?: string;
 	persistSession?: boolean;
 	sessionFile?: string;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
-	tools?: AgentTool[];
+	tools?: AgentTool[] | ((cwd: string) => AgentTool[]);
 	initialActiveToolNames?: string[];
 	allowedToolNames?: string[];
 	excludedToolNames?: string[];
@@ -113,11 +115,11 @@ function createTempDir(): string {
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
 	const tempDir = createTempDir();
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
+		api: options.fauxApi,
 		models: options.models,
 	});
 	fauxProvider.setResponses([]);
 	const model = fauxProvider.getModel();
-	const toolMap = options.tools ? Object.fromEntries(options.tools.map((tool) => [tool.name, tool])) : undefined;
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
@@ -126,6 +128,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		: options.persistSession
 			? SessionManager.create(tempDir, join(tempDir, "sessions"))
 			: SessionManager.inMemory(tempDir);
+	const cwd = sessionManager.getCwd();
+	const tools = typeof options.tools === "function" ? options.tools(cwd) : options.tools;
+	const toolMap = tools ? Object.fromEntries(tools.map((tool) => [tool.name, tool])) : undefined;
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -200,7 +205,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		agent,
 		sessionManager,
 		settingsManager,
-		cwd: tempDir,
+		cwd,
 		modelRuntime: getModelRuntime(modelRegistry),
 		resourceLoader,
 		baseToolsOverride: toolMap,

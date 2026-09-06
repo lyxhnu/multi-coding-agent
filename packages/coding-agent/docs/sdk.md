@@ -258,7 +258,7 @@ session.agent.state.tools = tools; // copies the top-level array
 await session.agent.waitForIdle();
 ```
 
-An idle run is not necessarily successful. After `agent_settled`, inspect `session.agent.state.runState.lastOutcome`. A `context_limit` outcome carries the final `ContextBudget` and means the task did not complete; automatic reduction has stopped. Do not infer completion from the last assistant text or from `prompt()` resolving. Cancellation does not automatically submit queued work.
+An idle run is not necessarily successful. After `agent_settled`, inspect `session.agent.state.runState.lastOutcome`. A `context_limit` outcome carries the final `ContextBudget` and means the task did not complete; automatic reduction has stopped. Do not infer completion from the last assistant text or from `prompt()` resolving. An unresolved `context_transition` is also incomplete. `session.contextRolloverState` exposes dispatch state; `outcome_unknown` is never automatically replayed. Bind extensions on a reopened session to resume an identical prepared, unstarted dispatch. Cancellation does not automatically submit queued work.
 
 ### Events
 
@@ -301,8 +301,8 @@ session.subscribe((event) => {
       // Agent started processing prompt
       break;
     case "agent_end":
-      // One low-level run ended; event.outcome may be context_limit.
-      // Session-level compaction/retry may still follow.
+      // One low-level run ended; event.outcome may be context_limit or context_transition.
+      // Session-level window transition/retry may still follow.
       break;
     case "context_budget":
       // event.budget is calculated from the final transformed request.
@@ -501,14 +501,14 @@ const { session } = await createAgentSession({ resourceLoader: loader });
 Specify which built-in tools to enable:
 
 - Filesystem/process tool names: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
-- Default session tools: `read`, `bash`, `edit`, `write`, `history_get`
+- Default session tools: `read`, `bash`, `edit`, `write`, `history`, `context_note`, `get_context_remaining`, `new_context`
 - `noTools: "all"` disables all tools
 - `noTools: "builtin"` disables default built-ins while keeping extension and custom tools enabled
 - `excludeTools` disables specific built-in, extension, or custom tool names after any `tools` allowlist is applied
 
 The `edit` tool returns `details.diff` for Pi's TUI display and `details.patch` as a standard unified patch for SDK consumers.
 
-`history_get` is bound to the session manager. It accepts `{ entryId, blockIndex?, offset?, limit? }` and reads saved text only from shaken ancestors on the active branch, including compacted ancestors. Pagination counts Unicode code points (default 4000, maximum 8000); multiple blocks require `blockIndex`. Memory-tool snapshots are not readable. Explicit `tools` lists remain restrictive: include `history_get` if wanted. The standalone `createCodingTools(cwd)` factory still creates only filesystem/process tools; `createAgentSession()` registers the session-bound history tool. `createHistoryGetToolDefinition(sessionManager)` is exported for custom hosts, which must apply their own normal tool permission wrapper. See [memory and context](memory-context.md).
+`history` supports `list_windows`, `list_items`, `read_item`, and literal `search` on delivered, visible active-branch history. Each page is bounded to 2048 estimated tokens; text offsets use UTF-16 and page ends preserve surrogate pairs. `context_note` supports metadata queries, item reads, resume-reference resolution, and semantic upsert/retract. `get_context_remaining` exposes the latest final-request budget; `new_context({ reason })` records a transition request for the session to handle after the full tool batch. Explicit tool allowlists remain restrictive. Standalone `createCodingTools(cwd)` still creates filesystem/process tools. Custom hosts using `createHistoryToolDefinition(sessionManager)` must apply their normal permission wrapper. See [memory and context](memory-context.md).
 
 ```typescript
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
@@ -1051,7 +1051,7 @@ await mode.run();
 
 ### runPrintMode
 
-Single-shot mode: send prompts, output result, exit. `runPrintMode()` returns exit code `1` for an unresolved `context_limit`, in both text and JSON modes; propagate this return value in your host process:
+Single-shot mode: send prompts, output result, exit. `runPrintMode()` returns exit code `1` for an unresolved `context_limit` or `context_transition`, in both text and JSON modes; propagate this return value in your host process:
 
 ```typescript
 import {
@@ -1180,7 +1180,7 @@ createCodingTools
 createReadOnlyTools
 createReadTool, createBashTool, createEditTool, createWriteTool
 createGrepTool, createFindTool, createLsTool
-createHistoryGetToolDefinition
+createHistoryToolDefinition
 
 // Types
 type CreateAgentSessionOptions

@@ -4,6 +4,4 @@
 
 export * from "./branch-summarization.ts";
 export * from "./compaction.ts";
-export * from "./compaction-policy.ts";
-export * from "./context-maintenance.ts";
 export * from "./utils.ts";

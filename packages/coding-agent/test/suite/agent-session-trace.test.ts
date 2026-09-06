@@ -52,8 +52,9 @@ describe("AgentSession trace", () => {
 				}),
 			);
 			expect(requests[0]?.data.header).not.toHaveProperty("systemPrompt");
-			expect(requests[0]?.data.header.messages.map((message) => message.role)).toEqual(["user"]);
+			expect(requests[0]?.data.header.messages.map((message) => message.role)).toEqual(["user", "user"]);
 			expect(requests[1]?.data.header.messages.map((message) => message.role)).toEqual([
+				"user",
 				"user",
 				"assistant",
 				"toolResult",

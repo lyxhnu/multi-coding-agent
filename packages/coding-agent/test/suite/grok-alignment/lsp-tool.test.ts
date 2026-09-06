@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
@@ -25,8 +26,10 @@ describe("lsp tool (M6)", () => {
 			"bash",
 			"edit",
 			"write",
-			"history_get",
+			"history",
 			"context_note",
+			"get_context_remaining",
+			"new_context",
 		]);
 	});
 
@@ -115,7 +118,7 @@ describe("lsp tool (M6)", () => {
 	});
 
 	it("spec 11: a server that keeps crashing on startup is restarted at most MAX_SERVER_RESTARTS (2) times, then given up on", async () => {
-		const spawnLogPath = `${(await import("node:os")).tmpdir()}/pi-lsp-spawn-log-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
+		const spawnLogPath = `${tmpdir()}/pi-lsp-spawn-log-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
 		const crashingServers = [
 			{
 				extensions: [".faketslang"],

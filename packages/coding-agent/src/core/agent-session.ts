@@ -6,7 +6,7 @@
  * - Agent state access
  * - Event subscription with automatic session persistence
  * - Model and thinking level management
- * - Compaction (manual and auto)
+ * - Manual compaction and automatic context windows
  * - Bash execution
  * - Session switching and branching
  *
@@ -19,24 +19,23 @@ import { basename, dirname, resolve } from "node:path";
 import type {
 	Agent,
 	AgentEvent,
+	AgentLoopAfterTurnControl,
 	AgentMessage,
 	AgentState,
 	AgentTool,
-	PreparedContinuation,
 	PrepareNextTurnContext,
 	ShakeConfig,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
-	applyRedactions,
 	buildRedactions,
 	collectShakeRegions,
 	DEFAULT_SHAKE_CONFIG,
 	estimateShakeSavings,
-	RESCUE_SHAKE_CONFIG,
+	prepareAgentRequest,
 	resolveShakeConfig,
 } from "@earendil-works/pi-agent-core";
-import { type ContextBudget, calculateContextBudget, contentText } from "@earendil-works/pi-ai";
+import { type Context, type ContextBudget, contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -66,57 +65,40 @@ import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
-	createPrefixCheckpoint,
-	isCheckpointUsage,
-	type PrefixSummaryCheckpoint,
-	reusePrefixCheckpoint,
-	validatePrefixCheckpoint,
-} from "./compaction/checkpoint.ts";
-import {
-	type CompactionEntryDetails,
 	type CompactionResult,
-	type ContextMaintenanceAction,
-	type ContextMaintenanceBudget,
-	type ContextMaintenanceOutcome,
-	type ContextMaintenanceSnapshot,
-	type ContextMaintenanceTransition,
-	type ContextMaintenanceTrigger,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
-	createContextMaintenanceBudget,
-	createContextMaintenanceRequestFingerprint,
-	createContextMaintenanceSourceFingerprint,
-	createWallClockBudgetSignal,
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
-	generateSummaryWithUsage,
 	prepareCompaction,
-	type ReductionAttemptResult,
-	type ReductionFailureReason,
-	type ReductionMethod,
-	type ReductionWarning,
-	resolveContextMaintenanceAction,
-	runContextMaintenance,
-	shouldPrefireTwoPass,
 } from "./compaction/index.ts";
 import {
-	assembleContextRolloverBundle,
-	type ContextRolloverBundle,
-	type ContextRolloverCommitResult,
-	collectStrongProgressCreditIds,
-	createContextRolloverCheckpointEnvelope,
-	createContextRolloverDispatchId,
+	type ContextReadBudgetReservation,
+	type ContextRemaining,
+	contextRemaining,
+	STATE_SAVE_CONTROL_TOKENS,
+	STATE_SAVE_OUTPUT_TOKENS,
+} from "./context-budget.ts";
+import {
+	type ContextRecoveryReferences,
+	ContextRollover,
+	type ContextTransitionCause,
+	type ContinuationStateValidation,
+	collectCompleteToolTransactions,
+	contextRecoveryCoverage,
+	currentContextRecoveryReferences,
 	fingerprintContextRolloverValue,
-	formatContextRolloverCheckpointPrompt,
-	isContextRolloverCheckpointEnvelope,
-	parseContextRolloverCheckpointOutput,
-	selectLatestContextRolloverCheckpoint,
-	shouldStartContextRollover,
-	validateFinalHandoff,
-	validatePreparedRolloverBudget,
+	getSaveStateOperation,
+	RECOVERY_OUTPUT_TOKENS,
+	RECOVERY_TOOL_NAMES,
+	SAVE_STATE_MAX_SAMPLES,
+	type SaveStateOperationSnapshot,
+	validateCommittedRecovery,
+	validateContinuationState,
 } from "./context-rollover.ts";
+import { formatContextWindow } from "./context-window.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -150,7 +132,6 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { PendingInteractionRegistry } from "./interactions/pending-interactions.ts";
 import { LspManager, type LspServerConfig } from "./lsp/lsp-manager.ts";
 import { McpManager, type McpServerConfig } from "./mcp/mcp-manager.ts";
-import { extractMemory, memoryExtractionContext } from "./memory/consolidation.ts";
 import { createOpenAiCompatibleEmbedder, resolveEmbeddingConfig } from "./memory/embeddings.ts";
 import { MemoryStore } from "./memory/memory-store.ts";
 import { type BashExecutionMessage, type CustomMessage, createCustomMessage } from "./messages.ts";
@@ -174,16 +155,13 @@ import type {
 	BranchSummaryEntry,
 	CompactionEntry,
 	ContextProgressEntry,
-	ContextRolloverDispatchEntry,
 	ContextRolloverEntry,
 	SessionEntry,
 	SessionManager,
 } from "./session-manager.ts";
 import {
-	buildSessionContext,
 	CURRENT_SESSION_VERSION,
 	collectShakenIndex,
-	collectShakeRedactions,
 	getLatestCompactionEntry,
 	getLatestCustomEntryData,
 	type SessionHeader,
@@ -215,7 +193,8 @@ import {
 import { TodoStateStore } from "./todo/todo-state.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createContextNoteToolDefinition } from "./tools/context-note.ts";
-import { createHistoryGetToolDefinition } from "./tools/history-get.ts";
+import { createContextRemainingToolDefinition, createNewContextToolDefinition } from "./tools/context-window.ts";
+import { createHistoryToolDefinition } from "./tools/history.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createLspToolDefinition } from "./tools/lsp.ts";
 import { createMcpSearchToolDefinition } from "./tools/mcp-search-tool.ts";
@@ -226,6 +205,7 @@ import { createEnterPlanModeToolDefinition, createExitPlanModeToolDefinition } f
 import { createTaskToolDefinition } from "./tools/task.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { boundToolResultContent } from "./tools/tool-result-budget.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "./tools/truncate.ts";
 import {
 	createDefaultWebFetchOperations,
 	createWebFetchToolDefinition,
@@ -455,80 +435,12 @@ function messageText(message: AgentMessage): string {
 	return contentText(message.content, "");
 }
 
-const TASK_NOTE_REFERENCE_CATALOG_TYPE = "task-note-reference-catalog";
-const TASK_NOTE_REFERENCE_CATALOG_PREFIX = "Task Note reference catalog (system metadata; not evidence by itself).";
-const MAX_TASK_NOTE_REFERENCE_CATALOG_ENTRIES = 64;
+type PostRunAction = "continue" | "continue_save_state" | "wait" | "stop";
 
-function createTaskNoteReferenceCatalog(branch: readonly SessionEntry[]): CustomMessage | undefined {
-	const references = branch.flatMap((entry): Record<string, unknown>[] => {
-		if (entry.type === "message") {
-			const reference: Record<string, unknown> = {
-				entryId: entry.id,
-				entryType: entry.type,
-				role: entry.message.role,
-			};
-			if (entry.message.role === "assistant") {
-				const toolCalls = entry.message.content.flatMap((block) =>
-					block.type === "toolCall" ? [{ toolCallId: block.id, toolName: block.name }] : [],
-				);
-				if (toolCalls.length > 0) reference.toolCalls = toolCalls;
-			} else if (entry.message.role === "toolResult") {
-				reference.toolCallId = entry.message.toolCallId;
-				reference.toolName = entry.message.toolName;
-				reference.isError = entry.message.isError;
-			}
-			return [reference];
-		}
-		if (entry.type === "context_progress") {
-			return [
-				{
-					entryId: entry.id,
-					entryType: entry.type,
-					evidenceKind: entry.evidenceKind,
-					outcome: entry.outcome,
-					...(entry.toolCallId === undefined ? {} : { toolCallId: entry.toolCallId }),
-					...(entry.taskId === undefined ? {} : { taskId: entry.taskId }),
-					...(entry.subjectId === undefined ? {} : { subjectId: entry.subjectId }),
-				},
-			];
-		}
-		if (entry.type === "custom_message" && entry.customType === "user-provenance") {
-			return [{ entryId: entry.id, entryType: entry.type, customType: entry.customType }];
-		}
-		return [];
-	});
-	const visibleReferences = references.slice(-MAX_TASK_NOTE_REFERENCE_CATALOG_ENTRIES);
-	if (visibleReferences.length === 0) return undefined;
-	return {
-		role: "custom",
-		customType: TASK_NOTE_REFERENCE_CATALOG_TYPE,
-		content:
-			`${TASK_NOTE_REFERENCE_CATALOG_PREFIX} ` +
-			"Use these persisted entry IDs for context_note sourceRefs/evidenceRefs. " +
-			`Authority and evidence come only from the referenced Session entry.\n${JSON.stringify(visibleReferences)}`,
-		display: false,
-		timestamp: 0,
-	};
-}
-
-function contextRolloverDispatchOutcome(
-	runState: AgentState["runState"],
-	promptAborted: boolean,
-): ContextRolloverDispatchEntry["outcome"] {
-	if (runState.status === "idle") {
-		switch (runState.lastOutcome?.type) {
-			case "context_limit":
-				return "context_limit";
-			case "aborted":
-				return "aborted";
-			case "failed":
-				return "failed";
-			case "completed":
-				return "completed";
-		}
-	}
-	return promptAborted ? "aborted" : "failed";
-}
+const SAVE_STATE_SUPERSESSION_INSTRUCTION =
+	"If context_note query returns an active next_action/current, include supersedesEventId set exactly to that item's eventId in the upsert; omit supersedesEventId only when no active entry exists.";
+const SAVE_STATE_CONTENT_INSTRUCTION =
+	"The text must choose exactly one immediate action that can finish within one context window, such as editing one named file or running one named check, and preserve the established findings needed for that action, including the exact failure, Task outcome, completed required Memory or external reads, and command. Keep later work in referenced Todos instead of combining every remaining step into next_action. Do not turn completed inspection, retrieval, or known failed attempts back into future work.";
 
 // ============================================================================
 // Constants
@@ -536,6 +448,7 @@ function contextRolloverDispatchOutcome(
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const SAVE_STATE_TOOL_NAMES = ["history", "context_note", "get_context_remaining", "new_context"] as const;
 
 // ============================================================================
 // AgentSession Class
@@ -558,24 +471,21 @@ export class AgentSession {
 	private _pendingDeliveryStore: PendingDeliveryStore;
 	private _deliveredPendingMessages = new WeakSet<object>();
 	private _rolloverDispatchPreparationId: string | undefined;
-	private _rolloverResumeInFlight: Promise<void> | undefined;
-	private _contextRolloverInFlight: { sourceRequestFingerprint: string; promise: Promise<boolean> } | undefined;
+	private _contextRollover!: ContextRollover;
+	private _contextRemaining: ContextRemaining | undefined;
+	private _latestRequest: { budget: ContextBudget; requestFingerprint: string } | undefined;
+	private _lastProviderRequest: Context | undefined;
+	private _controlReadTokens = 0;
+	private _recoveryNoProgressCount = 0;
+	private _recoveryProgressRolloverId: string | undefined;
+	private _recoveryProgressFingerprints = new Set<string>();
+	private _deferredContextTransition = false;
 	private _toolEvidenceInputs = new Map<string, { toolName: string; args: unknown }>();
+	private _toolBatchSizeByCallId = new Map<string, number>();
+	private _controlReadBudgetByCallId = new Map<string, number>();
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
-	private _autoCompactionAbortController: AbortController | undefined = undefined;
-	private _contextMaintenanceAbortController: AbortController | undefined = undefined;
-	private _contextMaintenancePromptGeneration = 0;
-	private _contextMaintenanceTriggerSequence = 0;
-	private _contextMaintenanceBudget: ContextMaintenanceBudget = createContextMaintenanceBudget(0);
-	private _contextMaintenanceInFlight:
-		| { fingerprint: string; maintenanceId: string; promise: Promise<ContextMaintenanceOutcome> }
-		| undefined;
-	/** At most one prefix checkpoint generation is in flight. */
-	private _twoPassPrefireInFlight = false;
-	private _twoPassPrefireAbortController: AbortController | undefined = undefined;
-	private _contextCheckpointPromise: Promise<void> | undefined;
 	private _promptAborted = false;
 
 	// Branch summarization state
@@ -648,17 +558,6 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this._pendingDeliveryStore = new PendingDeliveryStore(this.sessionManager);
-		const contextCoordinates = this.sessionManager.getLatestContextCoordinates();
-		const contextUsage = this.sessionManager.getContextOperationUsage(
-			contextCoordinates.promptGeneration,
-			contextCoordinates.contextEpoch,
-		);
-		this._contextMaintenancePromptGeneration = contextCoordinates.promptGeneration;
-		this._contextMaintenanceBudget = createContextMaintenanceBudget(
-			contextCoordinates.promptGeneration,
-			contextCoordinates.contextEpoch,
-			contextUsage,
-		);
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -695,6 +594,8 @@ export class AgentSession {
 			enabled: reminderPolicy.enabled && reminderPolicy.todoNudge.enabled,
 		});
 		this._taskManager = new TaskManager((transition) => {
+			if (["completed", "blocked", "failed", "cancelled"].includes(transition.to))
+				this._scheduleDeferredContextTransition();
 			let turn = this._taskTraceTurns.get(transition.taskId);
 			if (transition.from === undefined) {
 				if (this._traceTurn === undefined) return;
@@ -739,11 +640,32 @@ export class AgentSession {
 		// (see the todo_write tool construction in _buildRuntime) persists every subsequent mutation
 		// back via the same mechanism.
 		const persistedTodoState = getLatestCustomEntryData<ReturnType<TodoStateStore["toJSON"]>>(
-			this.sessionManager.getEntries(),
+			this.sessionManager.getBranch(),
 			"todo-state",
 		);
 		this._todoStateStore = persistedTodoState ? TodoStateStore.fromJSON(persistedTodoState) : new TodoStateStore();
 		this._pendingInteractions = new PendingInteractionRegistry();
+		this._contextRollover = new ContextRollover({
+			agent: this.agent,
+			manager: this.sessionManager,
+			revisions: () => this._contextRolloverRevisions(),
+			isBusy: () =>
+				this._pendingInteractions.list().length > 0 ||
+				this._taskManager.list().some((task) => task.status === "running" || task.status === "cancelling"),
+			isCancelled: () => this._promptAborted,
+			pendingDeliveryIds: () => this._pendingDeliveryStore.snapshot().items.map((item) => item.queueItemId),
+			canRecover: (recovery) => this._canRecoverContext(recovery),
+			workThresholdPercent: () => this.settingsManager.getContextWorkThresholdPercent(),
+			measureSource: () => this._measureRequest(),
+			onDispatch: (id) => {
+				this._rolloverDispatchPreparationId = id;
+			},
+			onTrace: (data) =>
+				this._appendTraceSafely({
+					type: "context/rollover",
+					data: { turn: Math.max(0, this._nextTraceTurn - 1), ...data },
+				}),
+		});
 		this._subagentDepth = config.subagentDepth ?? 0;
 		const memoryEmbeddingConfig = resolveEmbeddingConfig(
 			this.settingsManager.getMemorySettings().embedding,
@@ -834,8 +756,7 @@ export class AgentSession {
 	 * Manual memory flush (spec 10.5 Phase 1: "手动 /memory flush"). Summarizes everything in the current
 	 * branch (not just a to-be-dropped compaction prefix — keepRecentTokens is forced to 0 so almost all
 	 * of it lands in messagesToSummarize) and writes the result into *project* memory, through the same
-	 * secret filter as every other memory write (see appendProject). Unlike the automatic post-commit
-	 * flush (CompactionPolicy.memoryFlushEnabled, spec 9.6), this never touches the live session: no
+	 * secret filter as every other memory write (see appendProject). This never touches the live session: no
 	 * messages are dropped and no compaction entry is appended.
 	 */
 	async flushMemoryNow(
@@ -1003,7 +924,7 @@ export class AgentSession {
 				: undefined;
 
 			return {
-				content: boundToolResultContent(hookResult?.content ?? result.content),
+				content: hookResult?.content ?? result.content,
 				details: hookResult?.details ?? result.details,
 				isError: hookResult?.isError ?? isError,
 				usage: hookResult?.usage ?? result.usage,
@@ -1011,6 +932,28 @@ export class AgentSession {
 		};
 
 		this.agent.guardToolCall = async ({ toolCall, args }) => {
+			const { windowId } = this.sessionManager.ensureContextWindow();
+			const coordinates = this.sessionManager.getLatestContextCoordinates();
+			const saving = getSaveStateOperation(this.sessionManager, windowId, coordinates.promptGeneration);
+			if (saving && !saving.finished && !SAVE_STATE_TOOL_NAMES.some((name) => name === toolCall.name))
+				return {
+					block: true,
+					reason: "Only History, Note, budget and window control tools are allowed during state saving",
+				};
+			const recovering = this._recoveringRollover();
+			if (
+				recovering &&
+				(!RECOVERY_TOOL_NAMES.some((name) => name === toolCall.name) ||
+					(toolCall.name === "context_note" &&
+						typeof args === "object" &&
+						args !== null &&
+						"operation" in args &&
+						args.operation !== "query"))
+			)
+				return {
+					block: true,
+					reason: "Only recovery reads and budget queries are allowed until sourced bodies enter a request",
+				};
 			const result = this._permissionService.evaluate(toolCall.name, args, toolCall.id);
 			if (result.decision === "allow") {
 				return undefined;
@@ -1037,52 +980,719 @@ export class AgentSession {
 		};
 	}
 
+	private _permissionAllows(toolName: string, args: unknown): boolean {
+		return (
+			decideToolPermission({
+				mode: this._planModeState.status !== "off" ? "plan" : this.settingsManager.getPermissionMode(),
+				allow: this.settingsManager.getPermissionAllowRules(),
+				deny: this.settingsManager.getPermissionDenyRules(),
+				cwd: this._cwd,
+				toolName,
+				args,
+			}).decision === "allow"
+		);
+	}
+
+	private _canRecoverContext(recovery?: ContextRecoveryReferences): boolean {
+		if (!RECOVERY_TOOL_NAMES.every((toolName) => this.getActiveToolNames().includes(toolName))) return false;
+		const checks: Array<{ toolName: string; args: unknown }> = recovery
+			? [
+					{ toolName: "context_note", args: { operation: "query", item: recovery.nextActionEventId } },
+					...recovery.relatedNoteEventIds.map((item) => ({
+						toolName: "context_note",
+						args: { operation: "query", item },
+					})),
+					...[...recovery.requirementSourceRefs, ...recovery.requiredHistoryRefs].map((reference) => ({
+						toolName: "history",
+						args: { operation: "read_item", ...reference },
+					})),
+					...recovery.todoIds.map((todoId) => ({
+						toolName: "history",
+						args: { operation: "read_item", entryId: recovery.todoStateEntryId, todoId },
+					})),
+				]
+			: [
+					{ toolName: "context_note", args: { operation: "query" } },
+					{ toolName: "history", args: { operation: "list_items", role: "user" } },
+				];
+		return checks.every((check) => this._permissionAllows(check.toolName, check.args));
+	}
+
+	private _taskNoteRevision(promptGeneration: number): string | undefined {
+		const branch = this.sessionManager.getBranch();
+		const scope = resolveTaskNoteScope(branch, promptGeneration);
+		if (!scope) return undefined;
+		const projection = buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch));
+		return projection.status === "valid" ? projection.snapshot.revision : undefined;
+	}
+
+	private _startSaveState(
+		requestFingerprint: string,
+		transitionCause: ContextTransitionCause = "work_budget_reached",
+	):
+		| { type: "failed"; message: string }
+		| {
+				type: "save_state";
+				message: CustomMessage;
+				toolNames: readonly string[];
+				maxTokens: number;
+				failureMessage: string;
+		  } {
+		const { windowId } = this.sessionManager.ensureContextWindow();
+		const coordinates = this.sessionManager.getLatestContextCoordinates();
+		if (!SAVE_STATE_TOOL_NAMES.every((toolName) => this.getActiveToolNames().includes(toolName))) {
+			return { type: "failed", message: "recovery_unavailable: missing save-state tool" };
+		}
+		if (
+			!this._permissionAllows("history", { operation: "list_items", role: "user" }) ||
+			!this._permissionAllows("context_note", { operation: "query" })
+		) {
+			return { type: "failed", message: "recovery_unavailable: save-state query is denied" };
+		}
+		const startTaskNoteRevision = this._taskNoteRevision(coordinates.promptGeneration);
+		const businessCutoffEntryId = this.sessionManager.getLeafId();
+		if (!startTaskNoteRevision || !businessCutoffEntryId) {
+			return { type: "failed", message: "continuation_state_missing: task scope is unavailable" };
+		}
+		const operationId = randomUUID();
+		this.sessionManager.appendContextOperation({
+			operationId,
+			operationKind: "save_state",
+			transitionCause,
+			state: "started",
+			windowId,
+			...coordinates,
+			sourceFingerprint: requestFingerprint,
+			businessCutoffEntryId,
+			startTaskNoteRevision,
+			controlBudgetTokens: STATE_SAVE_CONTROL_TOKENS,
+			outputBudgetTokens: STATE_SAVE_OUTPUT_TOKENS,
+			samplesUsed: 0,
+			consumedControlTokens: 0,
+			consumedOutputTokens: 0,
+		});
+		this._appendTraceSafely({
+			type: "context/save_state",
+			data: {
+				turn: Math.max(0, this._nextTraceTurn - 1),
+				operationId,
+				windowId,
+				phase: "started",
+				businessCutoffEntryId,
+				samplesUsed: 0,
+				consumedControlTokens: 0,
+				consumedOutputTokens: 0,
+			},
+		});
+		this._controlReadTokens = STATE_SAVE_CONTROL_TOKENS;
+		return {
+			type: "save_state",
+			message: {
+				role: "custom",
+				customType: "context-save-state",
+				content:
+					"State saving started before rollover; no resumeRef exists yet. Do not use the business cutoff entry ID as a resumeRef. " +
+					'First call history exactly with {"operation":"list_items","role":"user"}; list_windows is insufficient because it does not return the source entry IDs. ' +
+					'Query existing Notes with context_note {"operation":"query"} and no resumeRef. ' +
+					`${SAVE_STATE_SUPERSESSION_INSTRUCTION} ` +
+					`${SAVE_STATE_CONTENT_INSTRUCTION} ` +
+					'Then call context_note with {"operation":"upsert","kind":"next_action","key":"current","text":"...","sourceRefs":[...],"evidenceRefs":[],"resume":{"relatedNotes":[],"requiredHistoryRefs":[...],"requirementSourceRefs":[...],"todoIds":[...]}}. ' +
+					'The key must be exactly "current". Include any directly required Notes and references in resume. Ordinary business tools are unavailable.',
+				display: false,
+				details: { windowId, businessCutoffEntryId },
+				timestamp: Date.now(),
+			},
+			toolNames: SAVE_STATE_TOOL_NAMES,
+			maxTokens: Math.min(STATE_SAVE_OUTPUT_TOKENS, this.agent.state.model.maxTokens),
+			failureMessage: "save_state_budget_exhausted",
+		};
+	}
+
+	private _appendContextControlMessage(message: Extract<AgentMessage, { role: "custom" }>): void {
+		this.agent.state.messages.push(message);
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+		);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
+	}
+
+	private _saveStateUsage(businessCutoffEntryId: string): {
+		samplesUsed: number;
+		controlTokens: number;
+		outputTokens: number;
+	} {
+		const branch = this.sessionManager.getBranch();
+		const cutoff = branch.findIndex((entry) => entry.id === businessCutoffEntryId);
+		let samplesUsed = 0;
+		let controlTokens = 0;
+		let outputTokens = 0;
+		for (const entry of branch.slice(cutoff + 1)) {
+			const messages = sessionEntryToContextMessages(entry);
+			for (const message of messages) {
+				const tokens = estimateTokens(message);
+				if (message.role === "assistant") {
+					samplesUsed++;
+					outputTokens += tokens;
+				} else {
+					controlTokens += tokens;
+				}
+			}
+		}
+		return { samplesUsed, controlTokens, outputTokens };
+	}
+
+	private _finishSaveState(
+		operation: SaveStateOperationSnapshot,
+		usage: ReturnType<AgentSession["_saveStateUsage"]>,
+		validation: Extract<ContinuationStateValidation, { status: "valid" }>,
+	): void {
+		const current = getSaveStateOperation(this.sessionManager, operation.windowId, operation.promptGeneration);
+		if (current?.finished) return;
+		this.sessionManager.appendContextOperation({
+			operationId: operation.operationId,
+			operationKind: "save_state",
+			transitionCause: operation.transitionCause,
+			state: "finished",
+			windowId: operation.windowId,
+			promptGeneration: operation.promptGeneration,
+			contextEpoch: operation.contextEpoch,
+			sourceFingerprint: operation.sourceFingerprint,
+			businessCutoffEntryId: operation.businessCutoffEntryId,
+			startTaskNoteRevision: operation.startTaskNoteRevision,
+			controlBudgetTokens: operation.controlBudgetTokens,
+			outputBudgetTokens: operation.outputBudgetTokens,
+			samplesUsed: usage.samplesUsed,
+			consumedControlTokens: usage.controlTokens,
+			consumedOutputTokens: usage.outputTokens,
+			finalTaskNoteRevision: validation.finalTaskNoteRevision,
+			nextActionEventId: validation.nextActionEventId,
+			relatedNoteEventIds: validation.relatedNoteEventIds,
+			noteFreshness: validation.noteFreshness,
+			requiredHistoryRefs: validation.requiredHistoryRefs,
+			requirementSourceRefs: validation.requirementSourceRefs,
+			todoIds: validation.todoIds,
+			outcome: "saved",
+		});
+		this._appendTraceSafely({
+			type: "context/save_state",
+			data: {
+				turn: Math.max(0, this._nextTraceTurn - 1),
+				operationId: operation.operationId,
+				windowId: operation.windowId,
+				phase: "finished",
+				businessCutoffEntryId: operation.businessCutoffEntryId,
+				samplesUsed: usage.samplesUsed,
+				consumedControlTokens: usage.controlTokens,
+				consumedOutputTokens: usage.outputTokens,
+			},
+		});
+	}
+
+	private _reserveContextReadBudget(requestedTokens: number, toolCallId: string): ContextReadBudgetReservation {
+		const snapshot = this._contextRemaining;
+		if (!snapshot || snapshot.phase === "normal") {
+			return {
+				tokens: snapshot?.remainingWorkTokens ?? null,
+				settle: () => {},
+			};
+		}
+		const batchCap = this._controlReadBudgetByCallId.get(toolCallId) ?? this._controlReadTokens;
+		const reserved = Math.max(0, Math.min(requestedTokens, batchCap, this._controlReadTokens));
+		this._controlReadTokens -= reserved;
+		let settled = false;
+		return {
+			tokens: reserved,
+			settle: (usedTokens) => {
+				if (settled) return;
+				settled = true;
+				this._controlReadBudgetByCallId.delete(toolCallId);
+				this._controlReadTokens += Math.max(0, reserved - Math.max(0, Math.min(reserved, usedTokens)));
+			},
+		};
+	}
+
+	private _recoveringRollover(): ContextRolloverEntry | undefined {
+		const branch = this.sessionManager.getBranch();
+		const rollover = this._currentContextRollover(branch);
+		if (!rollover) return undefined;
+		const rolloverIndex = branch.findIndex((entry) => entry.id === rollover.id);
+		const completed = branch
+			.slice(rolloverIndex + 1)
+			.some(
+				(entry) =>
+					entry.type === "custom_message" &&
+					entry.customType === "context-recovery-complete" &&
+					typeof entry.details === "object" &&
+					entry.details !== null &&
+					"rolloverId" in entry.details &&
+					entry.details.rolloverId === rollover.rolloverId,
+			);
+		return completed ? undefined : rollover;
+	}
+
+	private _currentContextRollover(branch = this.sessionManager.getBranch()): ContextRolloverEntry | undefined {
+		const { promptGeneration } = this.sessionManager.getLatestContextCoordinates();
+		const windowId = this.sessionManager.ensureContextWindow().windowId;
+		return [...branch]
+			.reverse()
+			.find(
+				(entry): entry is ContextRolloverEntry =>
+					entry.type === "context_rollover" &&
+					entry.promptGeneration === promptGeneration &&
+					entry.windowId === windowId,
+			);
+	}
+
+	private _completedRecoveryAwaitingBusinessRequest(): boolean {
+		const branch = this.sessionManager.getBranch();
+		const rollover = this._currentContextRollover(branch);
+		if (!rollover) return false;
+		const rolloverIndex = branch.findIndex((entry) => entry.id === rollover.id);
+		const completionIndex = branch.findIndex(
+			(entry, index) =>
+				index > rolloverIndex &&
+				entry.type === "custom_message" &&
+				entry.customType === "context-recovery-complete" &&
+				typeof entry.details === "object" &&
+				entry.details !== null &&
+				"rolloverId" in entry.details &&
+				entry.details.rolloverId === rollover.rolloverId,
+		);
+		if (rolloverIndex < 0) return false;
+		return (
+			completionIndex > rolloverIndex &&
+			!branch
+				.slice(completionIndex + 1)
+				.some((entry) => entry.type === "message" && entry.message.role === "assistant")
+		);
+	}
+
+	private _resumableInterruptedDispatch():
+		| { rollover: ContextRolloverEntry; lastAssistant: AssistantMessage }
+		| undefined {
+		if (this.contextRolloverState.dispatchState !== "outcome_unknown") return undefined;
+		const branch = this.sessionManager.getBranch();
+		const rollover = this._currentContextRollover(branch);
+		if (!rollover) return undefined;
+		let startIndex = -1;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (
+				entry.type === "context_rollover_dispatch" &&
+				entry.dispatchId === rollover.dispatchId &&
+				entry.state === "started"
+			) {
+				startIndex = index;
+				break;
+			}
+		}
+		if (startIndex < 0) return undefined;
+		const branchTail = branch.slice(startIndex + 1);
+		const assistants = branchTail.flatMap((entry) =>
+			entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : [],
+		);
+		const lastAssistant = assistants.at(-1);
+		if (!lastAssistant || lastAssistant.stopReason === "error" || lastAssistant.stopReason === "aborted")
+			return undefined;
+		try {
+			collectCompleteToolTransactions(branchTail);
+		} catch {
+			return undefined;
+		}
+		const timeline = this.sessionManager.getBranchWithTrace();
+		let timelineStart = -1;
+		for (let index = timeline.length - 1; index >= 0; index--) {
+			const entry = timeline[index];
+			if (
+				entry.type === "context_rollover_dispatch" &&
+				entry.dispatchId === rollover.dispatchId &&
+				entry.state === "started"
+			) {
+				timelineStart = index;
+				break;
+			}
+		}
+		if (timelineStart < 0) return undefined;
+		const requestCount = timeline
+			.slice(timelineStart + 1)
+			.filter((entry) => entry.type === "trace" && entry.event.type === "request/header").length;
+		if (requestCount === 0 || requestCount !== assistants.length) return undefined;
+		return { rollover, lastAssistant };
+	}
+
+	private _restoreRecoveryProgress(rollover: ContextRolloverEntry): void {
+		if (this._recoveryProgressRolloverId === rollover.rolloverId) return;
+		this._recoveryProgressRolloverId = rollover.rolloverId;
+		this._recoveryNoProgressCount = 0;
+		this._recoveryProgressFingerprints.clear();
+		for (const entry of this.sessionManager.getBranchWithTrace()) {
+			if (
+				entry.type !== "trace" ||
+				entry.event.type !== "context/recovery" ||
+				entry.event.data.rolloverId !== rollover.rolloverId ||
+				entry.event.data.phase !== "reading"
+			)
+				continue;
+			const { coveredUnits, progressFingerprint } = entry.event.data;
+			if (coveredUnits > 0 && !this._recoveryProgressFingerprints.has(progressFingerprint)) {
+				this._recoveryNoProgressCount = 0;
+				this._recoveryProgressFingerprints.add(progressFingerprint);
+			} else this._recoveryNoProgressCount++;
+		}
+	}
+
+	private async _afterContextControlTurn(turn: PrepareNextTurnContext): Promise<AgentLoopAfterTurnControl> {
+		const { windowId } = this.sessionManager.ensureContextWindow();
+		const coordinates = this.sessionManager.getLatestContextCoordinates();
+		const operation = getSaveStateOperation(this.sessionManager, windowId, coordinates.promptGeneration);
+		if (operation && !operation.finished) {
+			const usage = this._saveStateUsage(operation.businessCutoffEntryId);
+			const validation = validateContinuationState(this.sessionManager, operation);
+			const base = {
+				operationId: operation.operationId,
+				operationKind: "save_state" as const,
+				transitionCause: operation.transitionCause,
+				windowId: operation.windowId,
+				promptGeneration: operation.promptGeneration,
+				contextEpoch: operation.contextEpoch,
+				sourceFingerprint: operation.sourceFingerprint,
+				businessCutoffEntryId: operation.businessCutoffEntryId,
+				startTaskNoteRevision: operation.startTaskNoteRevision,
+				controlBudgetTokens: operation.controlBudgetTokens,
+				outputBudgetTokens: operation.outputBudgetTokens,
+				samplesUsed: usage.samplesUsed,
+				consumedControlTokens: usage.controlTokens,
+				consumedOutputTokens: usage.outputTokens,
+			};
+			if (validation.status === "valid") {
+				this._finishSaveState(operation, usage, validation);
+				return { type: "context_transition" };
+			}
+			this.sessionManager.appendContextOperation({ ...base, state: "started", outcome: validation.reason });
+			const remainingControl = operation.controlBudgetTokens - usage.controlTokens;
+			const remainingOutput = operation.outputBudgetTokens - usage.outputTokens;
+			if (usage.samplesUsed >= SAVE_STATE_MAX_SAMPLES || remainingControl <= 0 || remainingOutput <= 0) {
+				this._appendTraceSafely({
+					type: "context/save_state",
+					data: {
+						turn: Math.max(0, this._nextTraceTurn - 1),
+						operationId: operation.operationId,
+						windowId: operation.windowId,
+						phase: "failed",
+						businessCutoffEntryId: operation.businessCutoffEntryId,
+						samplesUsed: usage.samplesUsed,
+						consumedControlTokens: usage.controlTokens,
+						consumedOutputTokens: usage.outputTokens,
+						reasonCode: validation.reason,
+					},
+				});
+				return { type: "failed", message: validation.reason };
+			}
+			this._appendTraceSafely({
+				type: "context/save_state",
+				data: {
+					turn: Math.max(0, this._nextTraceTurn - 1),
+					operationId: operation.operationId,
+					windowId: operation.windowId,
+					phase: "progress",
+					businessCutoffEntryId: operation.businessCutoffEntryId,
+					samplesUsed: usage.samplesUsed,
+					consumedControlTokens: usage.controlTokens,
+					consumedOutputTokens: usage.outputTokens,
+					reasonCode: validation.reason,
+				},
+			});
+			this._controlReadTokens = Math.max(0, remainingControl);
+			const controlMessage = createCustomMessage(
+				"context-save-state-correction",
+				`The continuation contract is incomplete (${validation.reason}). Query exact sources if needed, then update next_action/current. ${SAVE_STATE_SUPERSESSION_INSTRUCTION} ${SAVE_STATE_CONTENT_INSTRUCTION} ${SAVE_STATE_MAX_SAMPLES - usage.samplesUsed} sampling attempt(s) remain.`,
+				false,
+				{ operationId: operation.operationId, reason: validation.reason },
+				new Date().toISOString(),
+			);
+			return {
+				type: "continue",
+				messages: [controlMessage],
+				update: {
+					context: {
+						...turn.context,
+						tools: this.agent.state.tools.filter((tool) =>
+							SAVE_STATE_TOOL_NAMES.some((name) => name === tool.name),
+						),
+					},
+					maxTokens: Math.min(remainingOutput, this.agent.state.model.maxTokens),
+				},
+			};
+		}
+
+		const recovering = this._recoveringRollover();
+		if (recovering) {
+			this._restoreRecoveryProgress(recovering);
+			if (!validateCommittedRecovery(this.sessionManager, recovering)) {
+				return { type: "failed", message: "recovery_reference_invalid" };
+			}
+			const recovery = currentContextRecoveryReferences(this.sessionManager, recovering.recovery);
+			if (!this._canRecoverContext(recovery)) return { type: "failed", message: "recovery_unavailable" };
+			const coverage = contextRecoveryCoverage(
+				this.sessionManager,
+				this._lastProviderRequest?.messages ?? [],
+				recovery,
+			);
+			if (coverage.coveredUnits > 0 && !this._recoveryProgressFingerprints.has(coverage.progressFingerprint)) {
+				this._recoveryNoProgressCount = 0;
+				this._recoveryProgressFingerprints.add(coverage.progressFingerprint);
+			} else {
+				this._recoveryNoProgressCount++;
+			}
+			if (coverage.complete) {
+				this._appendTraceSafely({
+					type: "context/recovery",
+					data: {
+						turn: Math.max(0, this._nextTraceTurn - 1),
+						rolloverId: recovering.rolloverId,
+						phase: "complete",
+						coveredUnits: coverage.coveredUnits,
+						missingCount: 0,
+						progressFingerprint: coverage.progressFingerprint,
+						pages: coverage.pages,
+					},
+				});
+				const message = createCustomMessage(
+					"context-recovery-complete",
+					"Required continuation sources are present in the preceding provider request. Continue the current task from next_action/current.",
+					false,
+					{ rolloverId: recovering.rolloverId, coverage: coverage.progressFingerprint },
+					new Date().toISOString(),
+				);
+				return {
+					type: "continue",
+					messages: [message],
+					update: {
+						context: { ...turn.context, tools: this.agent.state.tools.slice() },
+						maxTokens: this.agent.state.model.maxTokens,
+					},
+				};
+			}
+			if (this._recoveryNoProgressCount >= 3) {
+				this._appendTraceSafely({
+					type: "context/recovery",
+					data: {
+						turn: Math.max(0, this._nextTraceTurn - 1),
+						rolloverId: recovering.rolloverId,
+						phase: "failed",
+						coveredUnits: coverage.coveredUnits,
+						missingCount: coverage.missing.length,
+						progressFingerprint: coverage.progressFingerprint,
+						pages: coverage.pages,
+						reasonCode: "recovery_no_progress",
+					},
+				});
+				return { type: "failed", message: "recovery_no_progress" };
+			}
+			this._appendTraceSafely({
+				type: "context/recovery",
+				data: {
+					turn: Math.max(0, this._nextTraceTurn - 1),
+					rolloverId: recovering.rolloverId,
+					phase: "reading",
+					coveredUnits: coverage.coveredUnits,
+					missingCount: coverage.missing.length,
+					progressFingerprint: coverage.progressFingerprint,
+					pages: coverage.pages,
+				},
+			});
+			return {
+				type: "continue",
+				messages: [
+					createCustomMessage(
+						"context-recovery-required",
+						`Recovery is incomplete. Read the missing sourced bodies before business work: ${coverage.missing.slice(0, 8).join(", ")}. If an earlier page was removed from the final request, query it again with verify=true.`,
+						false,
+						{ rolloverId: recovering.rolloverId, missing: coverage.missing },
+						new Date().toISOString(),
+					),
+				],
+				update: {
+					context: {
+						...turn.context,
+						tools: this.agent.state.tools.filter((tool) =>
+							RECOVERY_TOOL_NAMES.some((name) => name === tool.name),
+						),
+					},
+					maxTokens: Math.min(RECOVERY_OUTPUT_TOKENS, this.agent.state.model.maxTokens),
+				},
+			};
+		}
+
+		if (this._pendingContextTransition()) {
+			const started = this._startSaveState(
+				this._latestRequest?.requestFingerprint ?? fingerprintContextRolloverValue(this.agent.state.messages),
+				"model_requested",
+			);
+			if (started.type === "failed") return started;
+			return {
+				type: "continue",
+				messages: [started.message],
+				update: {
+					context: {
+						...turn.context,
+						tools: this.agent.state.tools.filter((tool) => started.toolNames.includes(tool.name)),
+					},
+					maxTokens: started.maxTokens,
+				},
+			};
+		}
+		return undefined;
+	}
+
 	/**
-	 * Stop the agent loop between turns once the context can no longer comfortably hold another response,
-	 * so the post-run path can compact and continue.
-	 *
-	 * Auto-compaction is otherwise only consulted in _handlePostAgentRun — i.e. after agent.prompt()
-	 * returns. A single prompt routinely runs dozens of tool-calling turns, and benchmark runs showed
-	 * exactly what that costs: three tasks drove the context to 97% of the window across 34-82 turns with
-	 * zero compactions, until responses were being truncated at three tokens. The 85% threshold was never
-	 * wrong, it simply never got read.
-	 *
-	 * Deliberately not compacting from inside the loop: compaction calls a model and rewrites the
-	 * context, which is not safe to do underneath a running turn. Asking the loop to stop cleanly reuses
-	 * the compact-then-continue path that already works.
+	 * Inspect the final request budget and enter the persisted save/recovery state machine.
 	 */
 	private _installContextGuard(): void {
-		this.agent.getContextBudgetOptions = () =>
-			this.settingsManager.getCompactionSettings().enabled
-				? {
-						thresholdPercent: this.settingsManager.getCompactionPolicy().autoCompactThresholdPercent,
-						reserveTokens: this.settingsManager.getCompactionSettings().reserveTokens,
-					}
-				: {};
+		this.agent.getContextBudgetOptions = () => ({});
+		this.agent.controlRequest = (budget, requestFingerprint) => {
+			const { windowId } = this.sessionManager.ensureContextWindow();
+			const coordinates = this.sessionManager.getLatestContextCoordinates();
+			this._latestRequest = { budget, requestFingerprint };
+			const recovering = this._recoveringRollover();
+			if (recovering) {
+				if (!validateCommittedRecovery(this.sessionManager, recovering))
+					return { type: "failed", message: "recovery_reference_invalid" };
+				const recovery = currentContextRecoveryReferences(this.sessionManager, recovering.recovery);
+				const recoveryRemaining = contextRemaining(
+					budget,
+					{
+						windowId,
+						measuredAtEntryId: this.sessionManager.getLeafId(),
+						requestConfigRevision: this._requestConfigFingerprint(),
+					},
+					this.settingsManager.getContextWorkThresholdPercent(),
+					"recovering",
+				);
+				const remainingControlTokens = recoveryRemaining.remainingControlTokens ?? 0;
+				this._controlReadTokens = remainingControlTokens;
+				this._contextRemaining = recoveryRemaining;
+				if (!this._canRecoverContext(recovery)) return { type: "failed", message: "recovery_unavailable" };
+				if (budget.decision === "context_limit" || remainingControlTokens === 0)
+					return { type: "failed", message: "recovery_workset_too_large" };
+				return undefined;
+			}
+
+			const saveOperation = getSaveStateOperation(this.sessionManager, windowId, coordinates.promptGeneration);
+			if (saveOperation) {
+				const usage = this._saveStateUsage(saveOperation.businessCutoffEntryId);
+				if (saveOperation.finished) {
+					const validation = validateContinuationState(this.sessionManager, saveOperation);
+					if (validation.status === "valid") return { type: "context_transition" };
+					const remainingControlTokens = Math.max(0, saveOperation.controlBudgetTokens - usage.controlTokens);
+					const remainingOutputTokens = Math.max(0, saveOperation.outputBudgetTokens - usage.outputTokens);
+					if (
+						usage.samplesUsed >= SAVE_STATE_MAX_SAMPLES ||
+						remainingControlTokens === 0 ||
+						remainingOutputTokens === 0
+					)
+						return { type: "failed", message: validation.reason };
+					this.sessionManager.appendContextOperation({
+						operationId: saveOperation.operationId,
+						operationKind: "save_state",
+						transitionCause: saveOperation.transitionCause,
+						state: "started",
+						windowId: saveOperation.windowId,
+						promptGeneration: saveOperation.promptGeneration,
+						contextEpoch: saveOperation.contextEpoch,
+						sourceFingerprint: saveOperation.sourceFingerprint,
+						businessCutoffEntryId: saveOperation.businessCutoffEntryId,
+						startTaskNoteRevision: saveOperation.startTaskNoteRevision,
+						controlBudgetTokens: saveOperation.controlBudgetTokens,
+						outputBudgetTokens: saveOperation.outputBudgetTokens,
+						samplesUsed: usage.samplesUsed,
+						consumedControlTokens: usage.controlTokens,
+						consumedOutputTokens: usage.outputTokens,
+						outcome: validation.reason,
+					});
+					this._controlReadTokens = remainingControlTokens;
+					return {
+						type: "save_state",
+						message: createCustomMessage(
+							"context-save-state-correction",
+							`The saved continuation became invalid (${validation.reason}) after a new delivered fact. Reconfirm next_action/current in the same save operation. ${SAVE_STATE_SUPERSESSION_INSTRUCTION} ${SAVE_STATE_CONTENT_INSTRUCTION}`,
+							false,
+							{ operationId: saveOperation.operationId, reason: validation.reason },
+							new Date().toISOString(),
+						),
+						toolNames: SAVE_STATE_TOOL_NAMES,
+						maxTokens: Math.min(remainingOutputTokens, this.agent.state.model.maxTokens),
+						failureMessage: validation.reason,
+					};
+				}
+				const remainingControlTokens = Math.max(0, saveOperation.controlBudgetTokens - usage.controlTokens);
+				this._controlReadTokens = remainingControlTokens;
+				this._contextRemaining = contextRemaining(
+					budget,
+					{
+						windowId,
+						measuredAtEntryId: this.sessionManager.getLeafId(),
+						requestConfigRevision: this._requestConfigFingerprint(),
+					},
+					this.settingsManager.getContextWorkThresholdPercent(),
+					"save_state",
+					remainingControlTokens,
+				);
+				if (budget.decision === "context_limit") return { type: "failed", message: "save_state_budget_exhausted" };
+				return undefined;
+			}
+
+			this._contextRemaining = contextRemaining(
+				budget,
+				{
+					windowId,
+					measuredAtEntryId: this.sessionManager.getLeafId(),
+					requestConfigRevision: this._requestConfigFingerprint(),
+				},
+				this.settingsManager.getContextWorkThresholdPercent(),
+			);
+			if (this._completedRecoveryAwaitingBusinessRequest() && this._contextRemaining.phase !== "normal") {
+				return { type: "failed", message: "recovery_workset_too_large" };
+			}
+			if (!this.autoCompactionEnabled || this._contextRemaining.phase === "normal") return undefined;
+			return this._startSaveState(requestFingerprint);
+		};
+		this.agent.afterTurnControl = async (turn) => await this._afterContextControlTurn(turn);
 	}
 
-	private async _requestBudget(): Promise<ContextBudget> {
-		return (await this._contextMaintenanceSnapshot()).budget;
+	private _pendingContextTransition() {
+		const windowId = this.sessionManager.ensureContextWindow().windowId;
+		const promptGeneration = this.sessionManager.getLatestContextCoordinates().promptGeneration;
+		return this.sessionManager
+			.getBranch()
+			.reverse()
+			.find(
+				(entry) =>
+					entry.type === "context_transition_request" &&
+					entry.windowId === windowId &&
+					entry.promptGeneration === promptGeneration,
+			);
 	}
 
-	private async _contextMaintenanceSnapshot(): Promise<ContextMaintenanceSnapshot> {
-		const model = this.agent.state.model;
-		const context = {
-			systemPrompt: this.agent.state.systemPrompt,
-			tools: this.agent.state.tools,
-			messages: await this.agent.convertToLlm(this.agent.state.messages),
-		};
-		const options = this.agent.getContextBudgetOptions?.(model) ?? {};
-		return {
-			fingerprint: createContextMaintenanceRequestFingerprint(
-				context,
-				model,
-				options,
-				this.agent.state.thinkingLevel === "off" ? undefined : this.agent.state.thinkingLevel,
-			),
-			sourceFingerprint: createContextMaintenanceSourceFingerprint(this.sessionManager.getBranch()),
-			budget: calculateContextBudget(model, context, options),
-		};
+	private async _measureRequest() {
+		const state = this.agent.state;
+		return await prepareAgentRequest(
+			{ systemPrompt: state.systemPrompt, tools: state.tools, messages: state.messages },
+			{
+				model: state.model,
+				reasoning: state.thinkingLevel === "off" ? undefined : state.thinkingLevel,
+				convertToLlm: this.agent.convertToLlm,
+				projectUsageContext: this.agent.projectUsageContext,
+				transformContext: this.agent.transformContext,
+				appendOnlyContext: this.agent.appendOnlyContext,
+				getContextBudgetOptions: this.agent.getContextBudgetOptions,
+			},
+			undefined,
+		);
 	}
 
 	private _validateCompactionCommit(
@@ -1093,7 +1703,7 @@ export class AgentSession {
 		const branch = this.sessionManager.getBranch();
 		const keptIndex = branch.findIndex((entry) => entry.id === firstKeptEntryId);
 		const firstMessage = branch.slice(keptIndex).find((entry) => entry.type === "message");
-		if (createContextMaintenanceSourceFingerprint(branch) !== sourceFingerprint) return "superseded";
+		if (fingerprintContextRolloverValue(branch) !== sourceFingerprint) return "superseded";
 		if (
 			!summary.trim() ||
 			keptIndex < 0 ||
@@ -1105,18 +1715,13 @@ export class AgentSession {
 	/**
 	 * Mechanical context reduction: replace the heaviest regions still in context with placeholders.
 	 *
-	 * Costs no model call, which is the whole point — it is the action available when the compaction
-	 * budget is spent, and the cheaper first attempt when the threshold is merely crossed. Returns the
-	 * estimated tokens freed; 0 means there was nothing eligible (the caller should fall through to
-	 * compaction rather than treat it as success).
+	 * Costs no model call. Returns estimated tokens freed; 0 means no region was eligible.
+	 * The final request budget still decides whether the current window can continue.
 	 *
 	 * Redactions are persisted as a {@link ShakeEntry} and replayed on every context build, so the
 	 * reduction survives a reload — unlike an in-place edit of an append-only log.
 	 */
-	private _commitShake(
-		config: ShakeConfig,
-		reason: ShakeReason,
-	): { tokensSaved: number; warnings: ReductionWarning[] } {
+	private _commitShake(config: ShakeConfig, reason: ShakeReason): { tokensSaved: number; warnings: string[] } {
 		const resolved = resolveShakeConfig(config, (warning) => console.warn(warning));
 		const entries = this.sessionManager.buildContextEntries();
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
@@ -1129,13 +1734,13 @@ export class AgentSession {
 		if (regions.length === 0) return { tokensSaved: 0, warnings: [] };
 
 		const historyAvailable =
-			this.getActiveToolNames().includes("history_get") &&
+			this.getActiveToolNames().includes("history") &&
 			decideToolPermission({
 				mode: this._planModeState.status !== "off" ? "plan" : this.settingsManager.getPermissionMode(),
 				allow: this.settingsManager.getPermissionAllowRules(),
 				deny: this.settingsManager.getPermissionDenyRules(),
 				cwd: this._cwd,
-				toolName: "history_get",
+				toolName: "history",
 				args: {},
 			}).decision === "allow";
 		const redactions = buildRedactions(entries, regions, historyAvailable);
@@ -1144,7 +1749,7 @@ export class AgentSession {
 		const tokensSaved = estimateShakeSavings(regions);
 		this.sessionManager.appendShake(redactions, tokensSaved, reason);
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
-		const warnings: ReductionWarning[] = [];
+		const warnings: string[] = [];
 		try {
 			this._emit({ type: "shake", reason, tokensSaved, regionCount: regions.length });
 		} catch {
@@ -1158,27 +1763,22 @@ export class AgentSession {
 	}
 
 	private _installAgentNextTurnRefresh(): void {
-		const previousProjectUsageContext = this.agent.projectUsageContext;
-		this.agent.projectUsageContext = (messages) => {
-			const projected = previousProjectUsageContext?.(messages) ?? messages;
-			return projected.filter(
-				(message) =>
-					message.role !== "user" ||
-					message.timestamp !== 0 ||
-					!contentText(message.content, "").startsWith(TASK_NOTE_REFERENCE_CATALOG_PREFIX),
-			);
-		};
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
-			const transformedMessages = previousTransformContext
-				? await previousTransformContext(messages, signal)
-				: messages;
-			const messagesWithoutCatalog = transformedMessages.filter(
-				(message) => message.role !== "custom" || message.customType !== TASK_NOTE_REFERENCE_CATALOG_TYPE,
-			);
-			if (!this.getActiveToolNames().includes("context_note")) return messagesWithoutCatalog;
-			const catalog = createTaskNoteReferenceCatalog(this.sessionManager.getBranch());
-			return catalog === undefined ? messagesWithoutCatalog : [...messagesWithoutCatalog, catalog];
+			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			if (transformed.some((message) => message.role === "custom" && message.customType === "context-window"))
+				return transformed;
+			const { windowId } = this.sessionManager.ensureContextWindow();
+			return [
+				createCustomMessage(
+					"context-window",
+					formatContextWindow(windowId),
+					false,
+					undefined,
+					"1970-01-01T00:00:00.000Z",
+				),
+				...transformed,
+			];
 		};
 
 		const previousPrepareNextTurnWithContext =
@@ -1187,26 +1787,23 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
-			const previousContext = previousSnapshot?.context ?? turn.context;
-			const refreshedMessages =
-				this.sessionManager.getContextRolloverState().contextEpoch > 0
-					? this.sessionManager.buildSessionContext().messages
-					: previousContext.messages;
-			const model = previousSnapshot?.model ?? this.agent.state.model;
-			const policy = this.settingsManager.getCompactionPolicy();
-			const budget = calculateContextBudget(model, {
-				systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
-				tools: this.agent.state.tools,
-				messages: await this.agent.convertToLlm(refreshedMessages),
-			});
-			if (shouldPrefireTwoPass(budget.tokens, model.contextWindow, policy)) this._maybeStartTwoPassPrefire();
+			let refreshedTurn = turn;
+			if (
+				this.autoCompactionEnabled &&
+				turn.toolResults.length > 0 &&
+				estimateMessagesTokens(turn.context.messages) >=
+					(this.agent.state.model.contextWindow * this.settingsManager.getContextWorkThresholdPercent()) / 100
+			) {
+				if (this._commitShake(DEFAULT_SHAKE_CONFIG, "threshold").tokensSaved > 0)
+					refreshedTurn = { ...turn, context: { ...turn.context, messages: this.agent.state.messages } };
+			}
+			const previousSnapshot = await previousPrepareNextTurnWithContext?.(refreshedTurn, signal);
+			const previousContext = previousSnapshot?.context ?? refreshedTurn.context;
 
 			return {
 				...previousSnapshot,
 				context: {
 					...previousContext,
-					messages: refreshedMessages,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
 					tools: this.agent.state.tools.slice(),
 				},
@@ -1265,7 +1862,7 @@ export class AgentSession {
 			const state = this.agent.state.runState;
 			if (state.status === "idle" && state.lastOutcome?.type === "context_limit") {
 				this._extensionUIContext?.notify(
-					"context_limit: context maintenance is exhausted and the task is not complete; reduce context or switch to a model with a larger context window.",
+					"context_limit: no valid continuation fits and the task is not complete; reduce context or switch to a model with a larger context window.",
 					"error",
 				);
 			}
@@ -1279,7 +1876,24 @@ export class AgentSession {
 			this._emit({ type: "agent_settled" });
 		} finally {
 			this._resolveIdleWaitIfIdle();
+			this._scheduleDeferredContextTransition();
 		}
+	}
+
+	private _scheduleDeferredContextTransition(): void {
+		queueMicrotask(() => {
+			if (
+				!this._deferredContextTransition ||
+				this._isAgentRunActive ||
+				this._promptAborted ||
+				this._pendingInteractions.list().length > 0 ||
+				this._taskManager.list().some((task) => task.status === "running" || task.status === "cancelling")
+			)
+				return;
+			void this._resumePreparedContextRollover().catch((error: unknown) => {
+				this._extensionUIContext?.notify(error instanceof Error ? error.message : String(error), "error");
+			});
+		});
 	}
 
 	/**
@@ -1344,7 +1958,9 @@ export class AgentSession {
 
 	/** Resolves a pending plan-exit (or other) approval — call from a TUI/RPC driver once the user decides. */
 	resolvePendingInteraction<T>(toolCallId: string, value: T): boolean {
-		return this._pendingInteractions.resolve(toolCallId, value);
+		const resolved = this._pendingInteractions.resolve(toolCallId, value);
+		this._scheduleDeferredContextTransition();
+		return resolved;
 	}
 
 	getPlanModeState(): PlanModeState {
@@ -1363,7 +1979,17 @@ export class AgentSession {
 
 	/** Maps a subagent capability_mode to concrete base tool names, filtered against this session's own registry so a subagent never gains a tool the parent itself does not have. */
 	private _capabilityModeToolNames(mode: "read-only" | "read-write" | "execute" | "all"): string[] {
-		const readOnly = ["read", "grep", "find", "ls", "todo_write", "history_get", "context_note"];
+		const readOnly = [
+			"read",
+			"grep",
+			"find",
+			"ls",
+			"todo_write",
+			"history",
+			"context_note",
+			"get_context_remaining",
+			"new_context",
+		];
 		const wanted =
 			mode === "read-only"
 				? readOnly
@@ -1414,6 +2040,21 @@ export class AgentSession {
 				},
 			};
 		} else if (event.type === "context_budget") {
+			const identity = this.sessionManager.ensureContextWindow();
+			const coordinates = this.sessionManager.getLatestContextCoordinates();
+			const saving = getSaveStateOperation(this.sessionManager, identity.windowId, coordinates.promptGeneration);
+			const phase = this._recoveringRollover() ? "recovering" : saving && !saving.finished ? "save_state" : "normal";
+			this._contextRemaining = contextRemaining(
+				event.budget,
+				{
+					windowId: identity.windowId,
+					measuredAtEntryId: this.sessionManager.getLeafId(),
+					requestConfigRevision: this._requestConfigFingerprint(),
+				},
+				this.settingsManager.getContextWorkThresholdPercent(),
+				phase,
+				phase === "normal" ? null : this._controlReadTokens,
+			);
 			traceEvent = { type: "context/budget", data: { turn, step: this._traceStep, budget: event.budget } };
 		} else if (event.type === "turn_start") {
 			this._traceStep++;
@@ -1514,10 +2155,9 @@ export class AgentSession {
 					entry.type === "context_progress" &&
 					entry.evidenceKind === "non_read_effect" &&
 					entry.outcome === "succeeded" &&
-					(toolName === "bash" ||
-						(subjectId !== undefined
-							? entry.subjectId === subjectId
-							: entry.targetFingerprint === targetFingerprint)),
+					(subjectId !== undefined
+						? entry.subjectId === subjectId
+						: entry.targetFingerprint === targetFingerprint),
 			);
 		if ((toolName === "read" || toolName === "bash" || failed) && latestEffect) {
 			this.sessionManager.appendContextProgress({
@@ -1549,10 +2189,38 @@ export class AgentSession {
 		}
 	}
 
+	private _boundPersistedToolResult(message: Extract<AgentMessage, { role: "toolResult" }>): void {
+		const sourceEntryId = this.sessionManager.appendToolResultSource(
+			message.toolCallId,
+			message.toolName,
+			message.content,
+			message.details,
+			message.isError,
+		);
+		const batchSize = this._toolBatchSizeByCallId.get(message.toolCallId) ?? 1;
+		const phaseTokens =
+			this._contextRemaining?.phase === "normal"
+				? this._contextRemaining.remainingWorkTokens
+				: this._contextRemaining?.remainingControlTokens;
+		const sharedBytes = Math.min(DEFAULT_MAX_BYTES, Math.max(512, (phaseTokens ?? DEFAULT_MAX_BYTES / 4) * 4));
+		const bounded = {
+			...message,
+			content: boundToolResultContent(message.content, {
+				maxBytes: Math.max(256, Math.floor(sharedBytes / batchSize)),
+				maxLines: Math.max(4, Math.floor(DEFAULT_MAX_LINES / batchSize)),
+				sourceEntryId,
+			}),
+		};
+		this._replaceMessageInPlace(message, bounded);
+		this._toolBatchSizeByCallId.delete(message.toolCallId);
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		this._recordTraceEvent(event);
-		if (event.type === "tool_execution_start") {
+		if (event.type === "request_start") {
+			this._lastProviderRequest = event.context;
+		} else if (event.type === "tool_execution_start") {
 			this._toolEvidenceInputs.set(event.toolCallId, {
 				toolName: event.toolName,
 				args: structuredClone(event.args),
@@ -1578,6 +2246,25 @@ export class AgentSession {
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			const toolCalls = event.message.content.filter((block) => block.type === "toolCall");
+			for (const toolCall of toolCalls) this._toolBatchSizeByCallId.set(toolCall.id, toolCalls.length);
+			const contextReads = toolCalls.filter(
+				(toolCall) =>
+					toolCall.name === "history" ||
+					(toolCall.name === "context_note" && toolCall.arguments.operation === "query"),
+			);
+			if (contextReads.length > 0 && this._contextRemaining?.phase !== "normal") {
+				const share = Math.floor(this._controlReadTokens / contextReads.length);
+				for (const toolCall of contextReads) this._controlReadBudgetByCallId.set(toolCall.id, share);
+			}
+		} else if (event.type === "message_end" && event.message.role === "toolResult") {
+			this._boundPersistedToolResult(event.message);
+		} else if (event.type === "turn_end" && event.message.role === "assistant") {
+			for (const block of event.message.content) {
+				if (block.type === "toolCall") this._controlReadBudgetByCallId.delete(block.id);
+			}
+		}
 
 		// Notify all listeners
 		if (event.type !== "request_start" && event.type !== "queue_delivery") {
@@ -1642,18 +2329,6 @@ export class AgentSession {
 			}
 		}
 		return false;
-	}
-
-	/** Find the last assistant message in agent state (including aborted ones) */
-	private _findLastAssistantMessage(): AssistantMessage | undefined {
-		const messages = this.agent.state.messages;
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i];
-			if (msg.role === "assistant") {
-				return msg as AssistantMessage;
-			}
-		}
-		return undefined;
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -1803,7 +2478,6 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	async dispose(): Promise<void> {
-		this._twoPassPrefireAbortController?.abort();
 		const cleanups = [
 			() => this.abortRetry(),
 			() => this.abortCompaction(),
@@ -1919,11 +2593,7 @@ export class AgentSession {
 
 	/** Whether compaction or branch summarization is currently running */
 	get isCompacting(): boolean {
-		return (
-			this._autoCompactionAbortController !== undefined ||
-			this._compactionAbortController !== undefined ||
-			this._branchSummaryAbortController !== undefined
-		);
+		return this._compactionAbortController !== undefined || this._branchSummaryAbortController !== undefined;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -2040,8 +2710,17 @@ export class AgentSession {
 		this._promptAborted = false;
 		try {
 			await this.agent.prompt(messages);
-			while ((await this._handlePostAgentRun()) === "continue") {
-				await this.agent.continue();
+			while (true) {
+				const action = await this._handlePostAgentRun();
+				if (action !== "continue" && action !== "continue_save_state") break;
+				await this.agent.continue(
+					action === "continue_save_state"
+						? {
+								toolNames: SAVE_STATE_TOOL_NAMES,
+								maxTokens: Math.min(STATE_SAVE_OUTPUT_TOKENS, this.agent.state.model.maxTokens),
+							}
+						: {},
+				);
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
@@ -2050,54 +2729,94 @@ export class AgentSession {
 		}
 	}
 
-	private async _handlePostAgentRun(): Promise<ContextMaintenanceAction> {
-		const msg = this._lastAssistantMessage;
-		this._lastAssistantMessage = undefined;
-		if (this._promptAborted) return "stop";
-		const runState = this.agent.state.runState;
-		if (runState.status === "idle" && runState.lastOutcome?.type === "context_limit") {
-			if (!this.autoCompactionEnabled) return "stop";
-			const snapshot = await this._contextMaintenanceSnapshot();
-			this._contextMaintenanceBudget.rejectedRequestFingerprints.add(snapshot.fingerprint);
-			return await this._runContextMaintenance({
-				triggerId: this._nextContextMaintenanceTriggerId(),
-				cause: "budget_limit",
-				phase: "mid_run",
-				continuation: "required",
-			});
+	private async _handlePostAgentRun(): Promise<PostRunAction> {
+		while (true) {
+			const msg = this._lastAssistantMessage;
+			this._lastAssistantMessage = undefined;
+			if (this._promptAborted) return "stop";
+			const state = this.agent.state.runState;
+			const outcome =
+				state.status === "idle" ? (state.lastOutcome?.type ?? this.contextRolloverState.outcome) : undefined;
+			const requested = this._pendingContextTransition();
+			const overflow =
+				msg?.stopReason === "error" &&
+				msg.content.every((block) => block.type !== "toolCall") &&
+				isContextOverflow(msg, this.model?.contextWindow ?? 0);
+			const currentWindow = this.sessionManager.ensureContextWindow();
+			const coordinates = this.sessionManager.getLatestContextCoordinates();
+			const activeSaveOperation = getSaveStateOperation(
+				this.sessionManager,
+				currentWindow.windowId,
+				coordinates.promptGeneration,
+			);
+			if (outcome === "failed" && activeSaveOperation && !activeSaveOperation.finished) return "stop";
+			if (
+				requested ||
+				(this.autoCompactionEnabled &&
+					(outcome === "context_limit" || outcome === "context_transition" || overflow))
+			) {
+				const saveOperation = activeSaveOperation;
+				if (!saveOperation) {
+					const transitionCause: ContextTransitionCause = requested
+						? "model_requested"
+						: overflow
+							? "provider_context_rejected"
+							: "work_budget_reached";
+					const started = this._startSaveState(
+						this._latestRequest?.requestFingerprint ?? fingerprintContextRolloverValue(this.agent.state.messages),
+						transitionCause,
+					);
+					if (started.type === "failed") {
+						this._extensionUIContext?.notify(started.message, "error");
+						return "stop";
+					}
+					this._appendContextControlMessage(started.message);
+					return "continue_save_state";
+				}
+				if (!saveOperation.finished) return "continue_save_state";
+				let request = this._latestRequest;
+				if (!request || this.agent.state.messages.at(-1)?.role !== "assistant")
+					request = await this._measureRequest();
+				if (!request) return "stop";
+				const cause = saveOperation.transitionCause;
+				const { windowId } = currentWindow;
+				const result = await this._contextRollover.run({
+					cause,
+					windowId,
+					requestId:
+						requested?.type === "context_transition_request" ? requested.requestId : `${windowId}:${cause}`,
+					budget: request.budget,
+					requestFingerprint: request.requestFingerprint,
+				});
+				if (result.outcome !== "dispatched") {
+					if (result.outcome === "blocked" && result.reason === "continuation_state_changed")
+						return "continue_save_state";
+					this._deferredContextTransition =
+						result.outcome === "blocked" && result.reason === "operation_in_flight";
+					if (result.outcome === "blocked") {
+						if (result.reason !== "operation_in_flight") {
+							this.agent.setIdleOutcome({ type: "failed", message: result.reason });
+						}
+						this._extensionUIContext?.notify(`Context rollover stopped: ${result.reason}`, "error");
+					}
+					return "stop";
+				}
+				continue;
+			}
+			if (msg && this._isRetryableError(msg) && (await this._prepareRetry(msg))) return "continue";
+			if (msg?.stopReason === "error" && this._retryAttempt > 0) {
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this._retryAttempt,
+					finalError: msg.errorMessage,
+				});
+				this._retryAttempt = 0;
+			}
+			if (outcome === "failed") return "stop";
+			if (this.agent.hasQueuedMessages()) return "continue";
+			return this._maybeTriggerTodoGate() ? "continue" : "wait";
 		}
-		if (!msg) {
-			return "wait";
-		}
-
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return "continue";
-		}
-
-		if (msg.stopReason === "error" && this._retryAttempt > 0) {
-			this._emit({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this._retryAttempt,
-				finalError: msg.errorMessage,
-			});
-			this._retryAttempt = 0;
-		}
-
-		// If the guard stopped a turn that was still issuing tool calls, a successful reduction must
-		// continue the agent. Otherwise a threshold shake/compaction turns into a silent mid-action stop.
-		const maintenanceAction = await this._checkCompaction(msg, true, msg.stopReason === "toolUse");
-		if (maintenanceAction !== "wait") return maintenanceAction;
-
-		// The agent loop drains both queues before emitting agent_end. Any messages
-		// here were queued by agent_end extension handlers and need a continuation.
-		if (this.agent.hasQueuedMessages()) {
-			return "continue";
-		}
-
-		// TodoGate (see reminder-policy.ts): queue a forced continuation while pending todos remain.
-		// Must run before _emitAgentSettled, otherwise the queued follow-up would never be drained.
-		return this._maybeTriggerTodoGate() ? "continue" : "wait";
 	}
 
 	/**
@@ -2215,14 +2934,7 @@ export class AgentSession {
 					reason: "dispatch_outcome_unknown",
 				});
 			}
-			this._beginContextMaintenancePrompt();
-
-			// Check if we need to compact before sending (catches aborted responses).
-			// The user's new prompt is sent below, so do not call agent.continue() here.
-			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
-			}
+			this._beginContextPrompt();
 
 			// Build messages array (custom message if any, then user message)
 			messages = [];
@@ -2491,7 +3203,7 @@ export class AgentSession {
 			}
 			this._emitQueueUpdate();
 		} else if (options?.triggerTurn) {
-			this._beginContextMaintenancePrompt();
+			this._beginContextPrompt();
 			await this._runAgentPrompt(appMessage);
 		} else {
 			this.agent.state.messages.push(appMessage);
@@ -2600,7 +3312,6 @@ export class AgentSession {
 	async abort(): Promise<void> {
 		this._promptAborted = true;
 		this.abortCompaction();
-		this._twoPassPrefireAbortController?.abort();
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
@@ -2856,7 +3567,7 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
-			const sourceFingerprint = createContextMaintenanceSourceFingerprint(pathEntries);
+			const sourceFingerprint = fingerprintContextRolloverValue(pathEntries);
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -3014,8 +3725,6 @@ export class AgentSession {
 	 */
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
-		this._autoCompactionAbortController?.abort();
-		this._contextMaintenanceAbortController?.abort();
 	}
 
 	/**
@@ -3025,130 +3734,35 @@ export class AgentSession {
 		this._branchSummaryAbortController?.abort();
 	}
 
-	private _beginContextMaintenancePrompt(): void {
-		this._contextMaintenancePromptGeneration++;
-		this._contextMaintenanceBudget = createContextMaintenanceBudget(this._contextMaintenancePromptGeneration, 0);
+	private _beginContextPrompt(): void {
+		this._deferredContextTransition = false;
+		this._latestRequest = undefined;
+		this._contextRemaining = undefined;
+		this._lastProviderRequest = undefined;
+		this._controlReadTokens = 0;
+		this._controlReadBudgetByCallId.clear();
+		this._recoveryNoProgressCount = 0;
+		this._recoveryProgressRolloverId = undefined;
+		this._recoveryProgressFingerprints.clear();
+		this.sessionManager.ensureContextWindow();
 		this.sessionManager.appendCustomEntry("context-prompt-generation", {
-			promptGeneration: this._contextMaintenancePromptGeneration,
+			promptGeneration: this.sessionManager.getLatestContextCoordinates().promptGeneration + 1,
 			contextEpoch: 0,
 		});
-	}
-
-	private _nextContextMaintenanceTriggerId(): string {
-		this._contextMaintenanceTriggerSequence++;
-		return `context-trigger-${this._contextMaintenancePromptGeneration}-${this._contextMaintenanceTriggerSequence}`;
-	}
-
-	private _recordContextMaintenanceTransition(
-		trigger: ContextMaintenanceTrigger,
-		transition: ContextMaintenanceTransition,
-	): void {
-		const attempt = transition.attempt;
-		if (transition.method === "soft_compaction" && transition.attemptIndex !== undefined) {
-			const operationId = `${transition.maintenanceId}:soft_compaction:${transition.attemptIndex}`;
-			this.sessionManager.appendContextOperation({
-				operationId,
-				operationKind: "soft_compaction",
-				state: attempt === undefined ? "started" : "finished",
-				promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-				contextEpoch: this._contextMaintenanceBudget.contextEpoch,
-				sourceFingerprint: transition.snapshot.sourceFingerprint,
-				...(attempt === undefined ? {} : { outcome: attempt.outcome }),
-			});
-		}
-		const outcome =
-			transition.state === "ready" || transition.state === "blocked" || transition.state === "cancelled"
-				? transition.state
-				: (attempt?.outcome ?? "entered");
-		this._appendTraceSafely({
-			type: "context/maintenance",
-			data: {
-				maintenanceId: transition.maintenanceId,
-				triggerId: trigger.triggerId,
-				turn: Math.max(0, this._nextTraceTurn - 1),
-				promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-				cause: trigger.cause,
-				phase: trigger.phase,
-				state: transition.state,
-				...(transition.method === undefined ? {} : { method: transition.method }),
-				...(attempt === undefined ? {} : { attemptIndex: attempt.attemptIndex }),
-				requestFingerprint: transition.snapshot.fingerprint,
-				outcome,
-				...(attempt === undefined ? {} : { tokensBefore: attempt.tokensBefore }),
-				...(attempt?.outcome === "committed" ? { tokensAfter: attempt.tokensAfter } : {}),
-				budgetDecision: transition.snapshot.budget.decision,
-				...(transition.verification === undefined ? {} : { verification: transition.verification }),
-				...(attempt?.outcome === "committed" ? { verification: attempt.verification } : {}),
-				...(transition.reasonCode === undefined ? {} : { reasonCode: transition.reasonCode }),
-			},
-		});
-	}
-
-	private async _runAutomaticShake(
-		method: Extract<ReductionMethod, "default_shake" | "rescue_shake">,
-		snapshot: ContextMaintenanceSnapshot,
-		attemptIndex: number,
-	): Promise<ReductionAttemptResult> {
-		if (this._contextMaintenanceAbortController?.signal.aborted || this._promptAborted) {
-			return {
-				outcome: "cancelled",
-				method,
-				attemptIndex,
-				requestFingerprint: snapshot.fingerprint,
-				tokensBefore: snapshot.budget.tokens,
-			};
-		}
-		const currentSourceFingerprint = createContextMaintenanceSourceFingerprint(this.sessionManager.getBranch());
-		if (currentSourceFingerprint !== snapshot.sourceFingerprint) {
-			return {
-				outcome: "superseded",
-				method,
-				attemptIndex,
-				requestFingerprint: snapshot.fingerprint,
-				currentFingerprint: currentSourceFingerprint,
-				tokensBefore: snapshot.budget.tokens,
-			};
-		}
-		const shakeResult = this._commitShake(
-			method === "default_shake" ? DEFAULT_SHAKE_CONFIG : RESCUE_SHAKE_CONFIG,
-			method === "default_shake" ? "threshold" : "compaction-budget-exhausted",
-		);
-		if (shakeResult.tokensSaved === 0) {
-			return {
-				outcome: "unavailable",
-				method,
-				attemptIndex,
-				requestFingerprint: snapshot.fingerprint,
-				tokensBefore: snapshot.budget.tokens,
-				reason: "no_candidate",
-			};
-		}
-		const after = await this._contextMaintenanceSnapshot();
-		return {
-			outcome: "committed",
-			method,
-			attemptIndex,
-			requestFingerprint: snapshot.fingerprint,
-			tokensBefore: snapshot.budget.tokens,
-			tokensAfter: after.budget.tokens,
-			budgetAfter: after.budget,
-			verification:
-				after.budget.decision === "fits"
-					? "fits"
-					: after.budget.decision === "context_limit"
-						? "still_limited"
-						: "unknown",
-			warnings: shakeResult.warnings,
-		};
 	}
 
 	private _contextRolloverRevisions() {
 		const todo = this._todoRevision();
 		const queue = this._pendingDeliveryStore.snapshot();
 		const branch = this.sessionManager.getBranch();
+		const scope = resolveTaskNoteScope(branch, this.sessionManager.getLatestContextCoordinates().promptGeneration);
+		const projection = scope
+			? buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch))
+			: undefined;
 		return {
+			taskNoteProjectionRevision: projection?.status === "valid" ? projection.snapshot.revision : "invalid",
 			sessionLeafId: this.sessionManager.getLeafId(),
-			sourceFingerprint: createContextMaintenanceSourceFingerprint(branch),
+			sourceFingerprint: fingerprintContextRolloverValue(branch),
 			todoStateEntryId: todo.entryId,
 			todoStateFingerprint: todo.fingerprint,
 			queueRevision: queue.revision,
@@ -3157,587 +3771,12 @@ export class AgentSession {
 		};
 	}
 
-	/**
-	 * Atomically compare all rollover revisions and append the authority entry.
-	 * This method is intentionally synchronous: the comparison and append are one
-	 * JavaScript turn, so no caller or hook can mutate the proposal between them.
-	 */
-	commitContextRollover(
-		expectedRevisions: ReturnType<AgentSession["_contextRolloverRevisions"]>,
-		input: Parameters<SessionManager["appendContextRollover"]>[0],
-	): ContextRolloverCommitResult {
-		if (JSON.stringify(this._contextRolloverRevisions()) !== JSON.stringify(expectedRevisions)) {
-			return { status: "superseded" };
-		}
-		try {
-			return { status: "committed", entryId: this.sessionManager.appendContextRollover(input) };
-		} catch {
-			return { status: "failed" };
-		}
-	}
-
-	private _traceContextRollover(
-		data: Omit<Extract<SessionTraceEvent, { type: "context/rollover" }>["data"], "turn">,
-	): void {
-		this._appendTraceSafely({
-			type: "context/rollover",
-			data: { turn: Math.max(0, this._nextTraceTurn - 1), ...data },
-		});
-	}
-
 	private _appendTraceSafely(event: SessionTraceEvent): void {
 		try {
 			this.sessionManager.appendTrace(event);
 		} catch {
 			console.warn("Failed to append context trace event");
 		}
-	}
-
-	private async _runContextRollover(
-		maintenanceId: string,
-		trigger: ContextMaintenanceTrigger,
-		outcome: Extract<ContextMaintenanceOutcome, { outcome: "blocked" }>,
-	): Promise<boolean> {
-		const inFlight = this._contextRolloverInFlight;
-		if (inFlight) {
-			if (inFlight.sourceRequestFingerprint === outcome.requestFingerprint) return await inFlight.promise;
-			await inFlight.promise;
-			return await this._runContextRollover(maintenanceId, trigger, outcome);
-		}
-		const promise = this._executeContextRollover(maintenanceId, trigger, outcome);
-		this._contextRolloverInFlight = { sourceRequestFingerprint: outcome.requestFingerprint, promise };
-		try {
-			return await promise;
-		} finally {
-			if (this._contextRolloverInFlight?.promise === promise) this._contextRolloverInFlight = undefined;
-		}
-	}
-
-	private async _executeContextRollover(
-		_maintenanceId: string,
-		trigger: ContextMaintenanceTrigger,
-		outcome: Extract<ContextMaintenanceOutcome, { outcome: "blocked" }>,
-		supersedeCount = 0,
-	): Promise<boolean> {
-		const coordinates = this.sessionManager.getLatestContextCoordinates();
-		const rolloverId = randomUUID();
-		const traceBase = {
-			rolloverId,
-			promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-			sourceContextEpoch: this._contextMaintenanceBudget.contextEpoch,
-		} as const;
-		this._traceContextRollover({ ...traceBase, phase: "rollover", outcome: "entered" });
-
-		const rollovers = this.sessionManager
-			.getBranch()
-			.filter((entry): entry is ContextRolloverEntry => entry.type === "context_rollover");
-		const promptRollovers = rollovers.filter(
-			(entry) => entry.promptGeneration === this._contextMaintenanceBudget.promptGeneration,
-		);
-		const block = (reason: Parameters<typeof this._traceContextRollover>[0]["reasonCode"]): false => {
-			this._traceContextRollover({ ...traceBase, phase: "rollover", outcome: "blocked", reasonCode: reason });
-			return false;
-		};
-		if (coordinates.contextEpoch !== this._contextMaintenanceBudget.contextEpoch) return block("source_changed");
-		if (
-			rollovers.some(
-				(entry) =>
-					entry.promptGeneration === this._contextMaintenanceBudget.promptGeneration &&
-					entry.sourceContextEpoch === coordinates.contextEpoch,
-			)
-		) {
-			return block("rollover_already_used");
-		}
-		if (promptRollovers.length >= 8) return block("rollover_limit");
-		if (
-			this._pendingInteractions.list().length > 0 ||
-			this._taskManager.list().some((task) => task.status === "running" || task.status === "cancelling")
-		) {
-			return block("operation_in_flight");
-		}
-		let checkpointResult = this._validContextRolloverCheckpoint();
-		if (!checkpointResult && this._contextCheckpointPromise) {
-			this._traceContextRollover({ ...traceBase, phase: "checkpoint", outcome: "waiting" });
-			await this._contextCheckpointPromise;
-			checkpointResult = this._validContextRolloverCheckpoint();
-		}
-		if (!checkpointResult) return block("checkpoint_missing");
-
-		const branch = this.sessionManager.getBranch();
-		const taskNoteScope = resolveTaskNoteScope(branch, this._contextMaintenanceBudget.promptGeneration);
-		if (taskNoteScope === undefined) return block("handoff_invalid");
-		const taskNoteProjection = buildTaskNoteProjectionFromBranch(
-			branch,
-			taskNoteScope,
-			createTaskNoteFreshnessResolver(branch),
-		);
-		if (taskNoteProjection.status !== "valid") return block("handoff_invalid");
-		const consumedCredits = new Set(rollovers.flatMap((entry) => entry.strongProgressCreditIds));
-		const latestRolloverIndex =
-			rollovers.length === 0 ? -1 : branch.findIndex((entry) => entry.id === rollovers.at(-1)?.id);
-		const progressCredits = collectStrongProgressCreditIds(branch.slice(latestRolloverIndex + 1), consumedCredits);
-		if (promptRollovers.length > 0 && progressCredits.length === 0) return block("no_strong_progress");
-
-		const revisions = this._contextRolloverRevisions();
-		const activeTodos = this._todoStateStore
-			.entries()
-			.flatMap(([id, todo]) =>
-				todo.status === "pending" || todo.status === "in_progress"
-					? [{ id, content: todo.content, priority: todo.priority, status: todo.status }]
-					: [],
-			);
-		let bundle: ContextRolloverBundle;
-		try {
-			bundle = assembleContextRolloverBundle({
-				checkpoint: checkpointResult.checkpoint,
-				checkpointEntryId: checkpointResult.entryId,
-				contextEntries: branch,
-				taskNoteProjection: taskNoteProjection.snapshot,
-				targetContextEpoch: coordinates.contextEpoch + 1,
-				activeTodos,
-				todoStateEntryId: revisions.todoStateEntryId,
-				todoStateFingerprint: revisions.todoStateFingerprint,
-				progressBaselineFingerprint: revisions.progressRevision,
-			});
-			bundle.sourceFingerprint = revisions.sourceFingerprint;
-			validateFinalHandoff({
-				bundle,
-				branch,
-				projection: taskNoteProjection.snapshot,
-				activeTodos,
-				contextWindow: this.model?.contextWindow ?? 0,
-			});
-		} catch (error) {
-			return block(
-				error instanceof Error && error.message === "tool_transaction_incomplete"
-					? "tool_transaction_incomplete"
-					: "handoff_invalid",
-			);
-		}
-
-		const activeIds = new Set(bundle.activeEntryIds);
-		const activeTokens = branch
-			.filter((entry) => activeIds.has(entry.id))
-			.flatMap((entry) =>
-				entry.type === "message"
-					? [entry.message]
-					: entry.type === "custom_message"
-						? [
-								createCustomMessage(
-									entry.customType,
-									entry.content,
-									entry.display,
-									entry.details,
-									entry.timestamp,
-								),
-							]
-						: [],
-			)
-			.reduce((total, message) => total + estimateTokens(message), 0);
-		if (activeTokens > Math.floor(outcome.budget.contextWindow * 0.2)) return block("active_suffix_too_large");
-
-		const provisional: ContextRolloverEntry = {
-			type: "context_rollover",
-			id: `provisional-${rolloverId}`,
-			parentId: revisions.sessionLeafId,
-			timestamp: "1970-01-01T00:00:00.000Z",
-			rolloverId,
-			dispatchId: "pending",
-			promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-			sourceContextEpoch: coordinates.contextEpoch,
-			targetContextEpoch: coordinates.contextEpoch + 1,
-			checkpointEntryId: checkpointResult.entryId,
-			bundle,
-			expectedRevisions: revisions,
-			sourceTokens: outcome.budget.tokens,
-			preparedTokens: 0,
-			sourceRequestFingerprint: outcome.requestFingerprint,
-			preparedRequestFingerprint: "pending",
-			preparationBaseFingerprint: "pending",
-			reservedDeliveryIds: [],
-			strongProgressCreditIds: progressCredits.slice(0, 1),
-		};
-		const candidateMessages = buildSessionContext(
-			[...this.sessionManager.getEntries(), provisional],
-			provisional.id,
-		).messages;
-		let preparation: PreparedContinuation;
-		try {
-			preparation = await this.agent.prepareContinuation(candidateMessages, { signal: trigger.signal });
-		} catch {
-			return block("invalid_continuation_context");
-		}
-		const budgetReason = validatePreparedRolloverBudget(preparation, outcome.budget, outcome.requestFingerprint);
-		if (budgetReason) {
-			this.agent.releasePreparedContinuation(preparation);
-			return block(budgetReason);
-		}
-		this._traceContextRollover({
-			...traceBase,
-			checkpointId: checkpointResult.checkpoint.checkpointId,
-			phase: "preparation",
-			outcome: "prepared",
-			targetContextEpoch: coordinates.contextEpoch + 1,
-			sourceRequestFingerprint: outcome.requestFingerprint,
-			preparedRequestFingerprint: preparation.requestFingerprint,
-			sourceTokens: outcome.budget.tokens,
-			preparedTokens: preparation.budget.tokens,
-			reservedDeliveryCount: preparation.reservedQueueItemIds.length,
-			strongProgressCreditCount: progressCredits.length,
-		});
-
-		const dispatchId = createContextRolloverDispatchId(rolloverId, preparation.requestFingerprint);
-		const commitResult = this.commitContextRollover(revisions, {
-			rolloverId,
-			dispatchId,
-			promptGeneration: provisional.promptGeneration,
-			sourceContextEpoch: provisional.sourceContextEpoch,
-			targetContextEpoch: provisional.targetContextEpoch,
-			checkpointEntryId: provisional.checkpointEntryId,
-			bundle,
-			expectedRevisions: revisions,
-			sourceTokens: outcome.budget.tokens,
-			preparedTokens: preparation.budget.tokens,
-			sourceRequestFingerprint: outcome.requestFingerprint,
-			preparedRequestFingerprint: preparation.requestFingerprint,
-			preparationBaseFingerprint: preparation.baseContextFingerprint,
-			reservedDeliveryIds: [...preparation.reservedQueueItemIds],
-			strongProgressCreditIds: progressCredits.slice(0, 1),
-		});
-		if (commitResult.status === "superseded") {
-			this.agent.releasePreparedContinuation(preparation);
-			if (supersedeCount === 0) {
-				return await this._executeContextRollover(_maintenanceId, trigger, outcome, 1);
-			}
-			return block("source_changed");
-		}
-		if (commitResult.status !== "committed") {
-			this.agent.releasePreparedContinuation(preparation);
-			return block("source_changed");
-		}
-		const pendingDeliveryIds = new Set(this._pendingDeliveryStore.snapshot().items.map((item) => item.queueItemId));
-		const cancelledDeliveryIds = preparation.reservedQueueItemIds.filter((id) => !pendingDeliveryIds.has(id));
-		if (cancelledDeliveryIds.length > 0) {
-			this.agent.releasePreparedContinuation(preparation);
-			this.agent.discardQueuedItems(cancelledDeliveryIds);
-			try {
-				this.sessionManager.appendContextRolloverDispatch({
-					dispatchId,
-					rolloverId,
-					state: "cancelled",
-					requestFingerprint: preparation.requestFingerprint,
-				});
-			} catch {
-				return block("source_changed");
-			}
-			this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "cancelled" });
-			return false;
-		}
-		const committedMessages = this.sessionManager.buildSessionContext().messages;
-		if (fingerprintContextRolloverValue(committedMessages) !== fingerprintContextRolloverValue(candidateMessages)) {
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId,
-				rolloverId,
-				state: "blocked",
-				requestFingerprint: preparation.requestFingerprint,
-				reason: "post_commit_mismatch",
-			});
-			this.agent.releasePreparedContinuation(preparation);
-			return block("post_commit_mismatch");
-		}
-		this._traceContextRollover({
-			...traceBase,
-			checkpointId: checkpointResult.checkpoint.checkpointId,
-			dispatchId,
-			phase: "rollover",
-			outcome: "committed",
-			targetContextEpoch: coordinates.contextEpoch + 1,
-		});
-		if (trigger.signal?.aborted || this._promptAborted) {
-			try {
-				this.sessionManager.appendContextRolloverDispatch({
-					dispatchId,
-					rolloverId,
-					state: "cancelled",
-					requestFingerprint: preparation.requestFingerprint,
-				});
-			} catch {
-				this.agent.releasePreparedContinuation(preparation);
-				return block("source_changed");
-			}
-			this.agent.releasePreparedContinuation(preparation);
-			this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "cancelled" });
-			return false;
-		}
-
-		try {
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId,
-				rolloverId,
-				state: "started",
-				requestFingerprint: preparation.requestFingerprint,
-				reservedDeliveryIds: [...preparation.reservedQueueItemIds],
-			});
-		} catch {
-			this.agent.releasePreparedContinuation(preparation);
-			return block("source_changed");
-		}
-		this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "started" });
-		this._rolloverDispatchPreparationId = preparation.preparationId;
-		try {
-			await this.agent.dispatchPreparedContinuation(preparation);
-		} catch {
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId,
-				rolloverId,
-				state: "blocked",
-				requestFingerprint: preparation.requestFingerprint,
-				reason: "dispatch_outcome_unknown",
-			});
-			this._traceContextRollover({
-				...traceBase,
-				dispatchId,
-				phase: "dispatch",
-				outcome: "outcome_unknown",
-				reasonCode: "dispatch_outcome_unknown",
-			});
-			return false;
-		} finally {
-			this._rolloverDispatchPreparationId = undefined;
-		}
-		const runState = this.agent.state.runState;
-		const dispatchOutcome = contextRolloverDispatchOutcome(runState, this._promptAborted);
-		this.sessionManager.appendContextRolloverDispatch({
-			dispatchId,
-			rolloverId,
-			state: "finished",
-			requestFingerprint: preparation.requestFingerprint,
-			outcome: dispatchOutcome,
-		});
-		this._contextMaintenanceBudget = createContextMaintenanceBudget(
-			this._contextMaintenanceBudget.promptGeneration,
-			coordinates.contextEpoch + 1,
-		);
-		this._traceContextRollover({ ...traceBase, dispatchId, phase: "dispatch", outcome: "finished" });
-		return true;
-	}
-
-	private async _runContextMaintenance(trigger: ContextMaintenanceTrigger): Promise<ContextMaintenanceAction> {
-		const initial = await this._contextMaintenanceSnapshot();
-		let maintenanceId: string;
-		let outcome: ContextMaintenanceOutcome;
-		const inFlight = this._contextMaintenanceInFlight;
-		if (inFlight) {
-			if (inFlight.fingerprint === initial.fingerprint) {
-				maintenanceId = inFlight.maintenanceId;
-				outcome = await inFlight.promise;
-			} else {
-				await inFlight.promise;
-				return await this._runContextMaintenance(trigger);
-			}
-		} else {
-			maintenanceId = `context-maintenance-${this._contextMaintenancePromptGeneration}-${this._contextMaintenanceTriggerSequence}`;
-			const controller = new AbortController();
-			this._contextMaintenanceAbortController = controller;
-			const machineTrigger = { ...trigger, signal: controller.signal };
-			const promise = runContextMaintenance(machineTrigger, this._contextMaintenanceBudget, {
-				measure: () => this._contextMaintenanceSnapshot(),
-				defaultShake: (snapshot, attemptIndex) => this._runAutomaticShake("default_shake", snapshot, attemptIndex),
-				softCompaction: (snapshot, attemptIndex) =>
-					this._runSoftCompaction(trigger.cause, trigger.continuation === "required", snapshot, attemptIndex),
-				rescueShake: (snapshot, attemptIndex) => this._runAutomaticShake("rescue_shake", snapshot, attemptIndex),
-				onTransition: (transition) => this._recordContextMaintenanceTransition(trigger, transition),
-				createMaintenanceId: () => maintenanceId,
-			});
-			this._contextMaintenanceInFlight = { fingerprint: initial.fingerprint, maintenanceId, promise };
-			try {
-				outcome = await promise;
-			} finally {
-				if (this._contextMaintenanceInFlight?.promise === promise) this._contextMaintenanceInFlight = undefined;
-				if (this._contextMaintenanceAbortController === controller) {
-					this._contextMaintenanceAbortController = undefined;
-				}
-			}
-		}
-
-		const requestedAction = resolveContextMaintenanceAction(outcome, trigger.continuation);
-		let action = requestedAction;
-		let dispatchStatus: "executed" | "coalesced" = "executed";
-		if (requestedAction === "continue") {
-			if (this._contextMaintenanceBudget.continuedRequestFingerprints.has(outcome.requestFingerprint)) {
-				action = "wait";
-				dispatchStatus = "coalesced";
-			} else {
-				this._contextMaintenanceBudget.continuedRequestFingerprints.add(outcome.requestFingerprint);
-				if (trigger.cause === "provider_overflow") {
-					this.sessionManager.appendContextOperation({
-						operationId: `${maintenanceId}:overflow_retry`,
-						operationKind: "overflow_retry",
-						state: "started",
-						promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-						contextEpoch: this._contextMaintenanceBudget.contextEpoch,
-						sourceFingerprint: initial.sourceFingerprint,
-					});
-					this._contextMaintenanceBudget.overflowRetriesUsed = 1;
-				}
-			}
-		}
-		this._appendTraceSafely({
-			type: "context/maintenance",
-			data: {
-				maintenanceId,
-				triggerId: trigger.triggerId,
-				turn: Math.max(0, this._nextTraceTurn - 1),
-				promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-				cause: trigger.cause,
-				phase: trigger.phase,
-				state: outcome.outcome === "ready" ? "ready" : outcome.outcome === "blocked" ? "blocked" : "cancelled",
-				requestFingerprint: outcome.requestFingerprint,
-				outcome: "dispatched",
-				budgetDecision: outcome.budget.decision,
-				continuation: trigger.continuation,
-				nextAction: requestedAction,
-				dispatchStatus,
-			},
-		});
-		if (
-			outcome.outcome === "blocked" &&
-			shouldStartContextRollover({
-				maintenance: outcome,
-				cause: trigger.cause,
-				continuation: trigger.continuation,
-				taskIsIncomplete:
-					trigger.cause === "budget_limit" ||
-					trigger.cause === "provider_overflow" ||
-					this._todoStateStore.hasPendingWork() ||
-					this._pendingDeliveryStore.snapshot().items.some((item) => item.channel !== "next_prompt") ||
-					(this.agent.state.runState.status === "idle" &&
-						this.agent.state.runState.lastOutcome?.type === "context_limit"),
-			}) &&
-			(await this._runContextRollover(maintenanceId, trigger, outcome))
-		) {
-			return await this._handlePostAgentRun();
-		}
-		return action;
-	}
-
-	/**
-	 * Check if compaction is needed and run it.
-	 * Called after agent_end and before prompt submission.
-	 *
-	 * Two cases:
-	 * 1. Overflow: LLM returned context overflow error, remove error message from agent state, compact, auto-retry
-	 * 2. Threshold: Context over threshold, compact, NO auto-retry (user continues manually)
-	 *
-	 * @param assistantMessage The assistant message to check
-	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
-	 * @param continueAfterReduction Whether a successful threshold reduction should resume the agent.
-	 * Use true only when the loop was stopped mid-action, e.g. a final assistant message with stopReason
-	 * "toolUse". A completed "stop" answer may be compacted for the next prompt but must not be
-	 * continued from an assistant message.
-	 */
-	private async _checkCompaction(
-		assistantMessage: AssistantMessage,
-		skipAbortedCheck = true,
-		continueAfterReduction = false,
-	): Promise<ContextMaintenanceAction> {
-		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled) return "wait";
-
-		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
-		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return "wait";
-
-		const contextWindow = this.model?.contextWindow ?? 0;
-
-		// Skip overflow check if the message came from a different model.
-		// This handles the case where user switched from a smaller-context model (e.g. opus)
-		// to a larger-context model (e.g. codex) - the overflow error from the old model
-		// shouldn't trigger compaction for the new model.
-		const sameModel =
-			this.model && assistantMessage.provider === this.model.provider && assistantMessage.model === this.model.id;
-
-		// Skip compaction checks if this assistant message is older than the latest
-		// compaction boundary. This prevents a stale pre-compaction usage/error
-		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
-		const assistantIsFromBeforeCompaction =
-			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
-		if (assistantIsFromBeforeCompaction) {
-			return "wait";
-		}
-
-		// Case 1: Overflow - LLM returned context overflow error, or reported usage exceeded
-		// the configured window. A successful response over the configured window should compact
-		// but must not retry: the assistant answer already completed and agent.continue() cannot
-		// continue from an assistant message.
-		if (sameModel && isContextOverflow(assistantMessage, contextWindow)) {
-			const willRetry = assistantMessage.stopReason !== "stop";
-			// Remove the error message from agent state (it IS saved to session for history,
-			// but we don't want it in context for the retry)
-			if (willRetry) {
-				const messages = this.agent.state.messages;
-				if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-					this.agent.state.messages = messages.slice(0, -1);
-				}
-			}
-			const snapshot = await this._contextMaintenanceSnapshot();
-			this._contextMaintenanceBudget.rejectedRequestFingerprints.add(snapshot.fingerprint);
-			return await this._runContextMaintenance({
-				triggerId: this._nextContextMaintenanceTriggerId(),
-				cause: "provider_overflow",
-				phase: "post_run",
-				continuation: willRetry ? "required" : "forbidden",
-			});
-		}
-
-		const budget = await this._requestBudget();
-		const policy = this.settingsManager.getCompactionPolicy();
-		if (budget.decision === "context_limit") {
-			return await this._runContextMaintenance({
-				triggerId: this._nextContextMaintenanceTriggerId(),
-				cause: "threshold",
-				phase: skipAbortedCheck ? "post_run" : "pre_prompt",
-				continuation: continueAfterReduction ? "required" : "forbidden",
-			});
-		}
-		if (shouldPrefireTwoPass(budget.tokens, contextWindow, policy)) this._maybeStartTwoPassPrefire();
-		return "wait";
-	}
-
-	private _validPrefixCheckpoint(): PrefixSummaryCheckpoint | undefined {
-		const branch = this.sessionManager.getBranch();
-		for (let index = branch.length - 1; index >= 0; index--) {
-			const entry = branch[index];
-			if (
-				entry.type !== "custom" ||
-				entry.customType !== "context-rollover-checkpoint" ||
-				!isContextRolloverCheckpointEnvelope(entry.data) ||
-				entry.data.checkpoint.contextEpoch !== this._contextMaintenanceBudget.contextEpoch
-			) {
-				continue;
-			}
-			const checkpoint = entry.data.checkpoint.compactionPrefix;
-			if (validatePrefixCheckpoint(branch, checkpoint)) return checkpoint;
-		}
-		return undefined;
-	}
-
-	private _validContextRolloverCheckpoint() {
-		const selected = selectLatestContextRolloverCheckpoint(
-			this.sessionManager.getBranch(),
-			this._contextMaintenanceBudget.promptGeneration,
-			this._contextMaintenanceBudget.contextEpoch,
-		);
-		if (!selected) return undefined;
-		const todo = this._todoRevision();
-		if (
-			selected.checkpoint.todoStateEntryId !== todo.entryId ||
-			selected.checkpoint.todoStateFingerprint !== todo.fingerprint ||
-			selected.checkpoint.requestConfigFingerprint !== this._requestConfigFingerprint()
-		) {
-			return undefined;
-		}
-		return selected;
 	}
 
 	private _requestConfigFingerprint(): string {
@@ -3804,705 +3843,6 @@ export class AgentSession {
 		}
 	}
 
-	/** Summarize a stable prefix once; append-only tail growth does not invalidate it. */
-	private _maybeStartTwoPassPrefire(): void {
-		if (this._twoPassPrefireInFlight || !this.model) return;
-		const operationUsage = this.sessionManager.getContextOperationUsage(
-			this._contextMaintenanceBudget.promptGeneration,
-			this._contextMaintenanceBudget.contextEpoch,
-		);
-		if (operationUsage.checkpoint >= 2) return;
-		const branch = structuredClone(this.sessionManager.getBranch());
-		const pathEntries = applyRedactions(branch, collectShakeRedactions(branch));
-		const existingCheckpoint = this._validContextRolloverCheckpoint();
-		if (existingCheckpoint) {
-			const coveredEndIndex = pathEntries.findIndex(
-				(entry) => entry.id === existingCheckpoint.checkpoint.coveredEndEntryId,
-			);
-			if (coveredEndIndex < 0) return;
-			const uncoveredTokens = pathEntries
-				.slice(coveredEndIndex + 1)
-				.flatMap((entry) => sessionEntryToContextMessages(entry))
-				.reduce((total, message) => total + estimateTokens(message), 0);
-			if (uncoveredTokens < Math.floor(this.model.contextWindow * 0.1)) return;
-		}
-		const preparation = prepareCompaction(pathEntries, this.settingsManager.getCompactionSettings());
-		if (!preparation) return;
-		const policy = this.settingsManager.getCompactionPolicy();
-		const selected = policy.compactModel ? this._resolveCompactModel(policy.compactModel) : this.model;
-		if (!selected && policy.strictCompactModel) return;
-		const model = selected ?? this.model;
-		this._twoPassPrefireInFlight = true;
-		const controller = new AbortController();
-		this._twoPassPrefireAbortController = controller;
-		const budget = createWallClockBudgetSignal(controller.signal, policy.wallClockBudgetSecs);
-		const operationId = `context-checkpoint-${this._contextMaintenanceBudget.promptGeneration}-${this._contextMaintenanceBudget.contextEpoch}-${operationUsage.checkpoint + 1}`;
-		const checkpointRolloverId = `checkpoint-${operationId}`;
-		this.sessionManager.appendContextOperation({
-			operationId,
-			operationKind: "checkpoint",
-			state: "started",
-			promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-			contextEpoch: this._contextMaintenanceBudget.contextEpoch,
-			sourceFingerprint: createContextMaintenanceSourceFingerprint(pathEntries),
-		});
-		const checkpointPromise = (async () => {
-			let operationOutcome = "failed";
-			try {
-				this._traceContextRollover({
-					rolloverId: checkpointRolloverId,
-					promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-					sourceContextEpoch: this._contextMaintenanceBudget.contextEpoch,
-					phase: "checkpoint",
-					outcome: "entered",
-				});
-				const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
-				const boundary = createPrefixCheckpoint(pathEntries, preparation, "pending");
-				const boundaryStart = pathEntries.findIndex((entry) => entry.id === boundary.coveredStartEntryId);
-				const boundaryEnd = pathEntries.findIndex((entry) => entry.id === boundary.coveredEndEntryId);
-				if (boundaryStart < 0 || boundaryEnd < boundaryStart) throw new Error("invalid_output");
-				const taskNoteScope = resolveTaskNoteScope(pathEntries, this._contextMaintenanceBudget.promptGeneration);
-				if (taskNoteScope === undefined) throw new Error("invalid_output");
-				const taskNoteProjection = buildTaskNoteProjectionFromBranch(
-					pathEntries,
-					taskNoteScope,
-					createTaskNoteFreshnessResolver(pathEntries),
-				);
-				if (taskNoteProjection.status !== "valid") throw new Error(taskNoteProjection.reason);
-				const activeTodos = this._todoStateStore
-					.entries()
-					.flatMap(([id, todo]) =>
-						todo.status === "pending" || todo.status === "in_progress"
-							? [{ id, content: todo.content, priority: todo.priority, status: todo.status }]
-							: [],
-					);
-				const checkpointPrompt = formatContextRolloverCheckpointPrompt({
-					coveredEntries: pathEntries.slice(boundaryStart, boundaryEnd + 1),
-					projection: taskNoteProjection.snapshot,
-					activeTodos,
-				});
-				const result = await generateSummaryWithUsage(
-					[],
-					model,
-					preparation.settings.reserveTokens,
-					apiKey,
-					headers,
-					budget.signal,
-					checkpointPrompt,
-					undefined,
-					this.thinkingLevel,
-					this.agent.streamFunction,
-					env,
-					this.settingsManager.getRetrySettings(),
-					undefined,
-					true,
-				);
-				budget.signal.throwIfAborted();
-				const output = parseContextRolloverCheckpointOutput(result.text);
-				const checkpointSummary = JSON.stringify(output.checkpoint);
-				const checkpoint = createPrefixCheckpoint(pathEntries, preparation, checkpointSummary, result.usage);
-				const valid = validatePrefixCheckpoint(this.sessionManager.getBranch(), checkpoint);
-				if (valid) {
-					if (Math.ceil(checkpoint.summary.length / 4) > Math.floor(model.contextWindow * 0.1)) {
-						throw new Error("Context rollover checkpoint exceeds 10% of the context window");
-					}
-					const todoRevision = this._todoRevision();
-					const checkpointEnvelope = createContextRolloverCheckpointEnvelope({
-						checkpointId: `rollover-${operationId}`,
-						promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-						contextEpoch: this._contextMaintenanceBudget.contextEpoch,
-						branch: pathEntries,
-						coveredStartEntryId: checkpoint.coveredStartEntryId,
-						coveredEndEntryId: checkpoint.coveredEndEntryId,
-						output,
-						taskNoteScope,
-						taskNoteProjection: taskNoteProjection.snapshot,
-						taskNoteEvents: taskNoteProjection.events,
-						todoStateEntryId: todoRevision.entryId,
-						todoStateFingerprint: todoRevision.fingerprint,
-						requestConfigFingerprint: this._requestConfigFingerprint(),
-						usage: result.usage,
-					});
-					this.sessionManager.appendCustomEntry("context-rollover-checkpoint", checkpointEnvelope);
-					const committedBranch = this.sessionManager.getBranch();
-					const rebuiltProjection = buildTaskNoteProjectionFromBranch(
-						committedBranch,
-						taskNoteScope,
-						createTaskNoteFreshnessResolver(committedBranch),
-					);
-					if (rebuiltProjection.status !== "valid") throw new Error(rebuiltProjection.reason);
-					this._appendTraceSafely({
-						type: "context/task_note",
-						data: {
-							turn: Math.max(0, this._nextTraceTurn - 1),
-							batchId: checkpointEnvelope.taskNoteBatch.batchId,
-							promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-							contextEpoch: this._contextMaintenanceBudget.contextEpoch,
-							operation: "project",
-							outcome: "rebuilt",
-							activeCount: rebuiltProjection.snapshot.items.length,
-							staleCount: rebuiltProjection.snapshot.items.filter((item) => item.freshness === "stale").length,
-						},
-					});
-					operationOutcome = "completed";
-					this._traceContextRollover({
-						rolloverId: checkpointRolloverId,
-						checkpointId: checkpointEnvelope.checkpoint.checkpointId,
-						promptGeneration: checkpointEnvelope.checkpoint.promptGeneration,
-						sourceContextEpoch: checkpointEnvelope.checkpoint.contextEpoch,
-						phase: "checkpoint",
-						outcome: "committed",
-					});
-				}
-				this._appendTraceSafely({
-					type: "compaction/summary",
-					data: {
-						turn: Math.max(0, this._nextTraceTurn - 1),
-						phase: "prefix",
-						outcome: valid ? "completed" : "discarded",
-						sourceFingerprint: checkpoint.sourceFingerprint,
-						firstKeptEntryId: preparation.firstKeptEntryId,
-						coveredStartEntryId: checkpoint.coveredStartEntryId,
-						coveredEndEntryId: checkpoint.coveredEndEntryId,
-						usage: checkpoint.usage,
-					},
-				});
-			} catch {
-				// No checkpoint is committed for incomplete or invalid sources.
-				this._traceContextRollover({
-					rolloverId: checkpointRolloverId,
-					promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-					sourceContextEpoch: this._contextMaintenanceBudget.contextEpoch,
-					phase: "checkpoint",
-					outcome: "discarded",
-				});
-			} finally {
-				this.sessionManager.appendContextOperation({
-					operationId,
-					operationKind: "checkpoint",
-					state: "finished",
-					promptGeneration: this._contextMaintenanceBudget.promptGeneration,
-					contextEpoch: this._contextMaintenanceBudget.contextEpoch,
-					sourceFingerprint: createContextMaintenanceSourceFingerprint(pathEntries),
-					outcome: operationOutcome,
-				});
-				budget.dispose();
-				if (this._twoPassPrefireAbortController === controller) {
-					this._twoPassPrefireAbortController = undefined;
-					this._twoPassPrefireInFlight = false;
-				}
-			}
-		})();
-		this._contextCheckpointPromise = checkpointPromise;
-		void checkpointPromise
-			.catch(() => {})
-			.finally(() => {
-				if (this._contextCheckpointPromise === checkpointPromise) this._contextCheckpointPromise = undefined;
-			});
-	}
-
-	/** Resolves CompactionPolicy.compactModel ("provider/modelId", or a bare modelId assumed to be on the current provider) to a concrete Model. Returns undefined if it cannot be found. */
-	private _resolveCompactModel(compactModelRef: string): Model<any> | undefined {
-		const slashIndex = compactModelRef.indexOf("/");
-		if (slashIndex > 0) {
-			const providerId = compactModelRef.slice(0, slashIndex);
-			const modelId = compactModelRef.slice(slashIndex + 1);
-			return this._modelRuntime.getModel(providerId, modelId);
-		}
-		if (this.model) {
-			const sameProvider = this._modelRuntime.getModel(this.model.provider, compactModelRef);
-			if (sameProvider) return sameProvider;
-		}
-		return undefined;
-	}
-
-	/** Execute one bounded soft-compaction operation. Continuation is decided by the maintenance caller. */
-	private async _runSoftCompaction(
-		cause: ContextMaintenanceTrigger["cause"],
-		willRetry: boolean,
-		snapshot: ContextMaintenanceSnapshot,
-		attemptIndex: number,
-	): Promise<ReductionAttemptResult> {
-		const reason = cause === "provider_overflow" ? "overflow" : "threshold";
-		const settings = this.settingsManager.getCompactionSettings();
-		let started = false;
-		let failureReason: ReductionFailureReason = "provider_failed";
-		let committedOutcome: Extract<ReductionAttemptResult, { outcome: "committed" }> | undefined;
-		if (this._contextCheckpointPromise) await this._contextCheckpointPromise;
-		this._twoPassPrefireAbortController?.abort();
-
-		try {
-			if (!this.model) {
-				return {
-					outcome: "unavailable",
-					method: "soft_compaction",
-					attemptIndex,
-					requestFingerprint: snapshot.fingerprint,
-					tokensBefore: snapshot.budget.tokens,
-					reason: "no_compactable_range",
-				};
-			}
-
-			const policy = this.settingsManager.getCompactionPolicy();
-			let compactionModel: Model<any> = this.model;
-			let compactModelWarning: string | undefined;
-			if (policy.compactModel) {
-				const resolved = this._resolveCompactModel(policy.compactModel);
-				if (resolved) {
-					compactionModel = resolved;
-				} else if (policy.strictCompactModel) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: false,
-						willRetry: false,
-						errorMessage: `compact_model "${policy.compactModel}" could not be resolved and strictCompactModel is enabled; compaction was skipped.`,
-					});
-					return {
-						outcome: "failed",
-						method: "soft_compaction",
-						attemptIndex,
-						requestFingerprint: snapshot.fingerprint,
-						tokensBefore: snapshot.budget.tokens,
-						reason: "provider_failed",
-					};
-				} else {
-					compactModelWarning = `compact_model "${policy.compactModel}" could not be resolved; fell back to the current model.`;
-				}
-			}
-
-			failureReason = "authorization_failed";
-			let apiKey: string | undefined;
-			let headers: Record<string, string> | undefined;
-			let env: Record<string, string> | undefined;
-			if (this.agent.streamFunction === streamSimple) {
-				({ apiKey, headers, env } = await this._getRequiredRequestAuth(compactionModel));
-			} else {
-				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(compactionModel));
-			}
-			failureReason = "provider_failed";
-
-			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			const sourceFingerprint = createContextMaintenanceSourceFingerprint(pathEntries);
-			if (sourceFingerprint !== snapshot.sourceFingerprint) {
-				return {
-					outcome: "superseded",
-					method: "soft_compaction",
-					attemptIndex,
-					requestFingerprint: snapshot.fingerprint,
-					currentFingerprint: sourceFingerprint,
-					tokensBefore: snapshot.budget.tokens,
-				};
-			}
-			if (!preparation) {
-				return {
-					outcome: "unavailable",
-					method: "soft_compaction",
-					attemptIndex,
-					requestFingerprint: snapshot.fingerprint,
-					tokensBefore: snapshot.budget.tokens,
-					reason: "no_compactable_range",
-				};
-			}
-
-			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
-			started = true;
-
-			let extensionCompaction: CompactionResult | undefined;
-			let fromExtension = false;
-
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				failureReason = "extension_failed";
-				const extensionResult = (await this._extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: pathEntries,
-					customInstructions: undefined,
-					reason,
-					willRetry,
-					signal: this._autoCompactionAbortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
-
-				if (extensionResult?.cancel) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: true,
-						willRetry: false,
-					});
-					return {
-						outcome: "vetoed",
-						method: "soft_compaction",
-						attemptIndex,
-						requestFingerprint: snapshot.fingerprint,
-						tokensBefore: snapshot.budget.tokens,
-						reason: "extension_veto",
-					};
-				}
-
-				if (extensionResult?.compaction) {
-					extensionCompaction = extensionResult.compaction;
-					fromExtension = true;
-				}
-				failureReason = "provider_failed";
-			}
-
-			let summary: string;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let usage: Usage | undefined;
-			let details: unknown;
-
-			if (extensionCompaction) {
-				// Extension provided compaction content
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				usage = extensionCompaction.usage;
-				details = extensionCompaction.details;
-			} else {
-				const checkpoint = policy.twoPassEnabled ? this._validPrefixCheckpoint() : undefined;
-				const incremental = checkpoint ? reusePrefixCheckpoint(pathEntries, preparation, checkpoint) : undefined;
-				const summaryPreparation = incremental ?? preparation;
-				const mode: "single-pass" | "two-pass" = incremental ? "two-pass" : "single-pass";
-				// Grok-aligned wall-clock budget (default 300s): a generation exceeding it is retried once
-				// with a fresh budget, then fails open (existing context is kept, nothing is lost).
-				let compactResult: CompactionResult | undefined;
-				for (let attempt = 0; attempt < 2; attempt++) {
-					const budget = createWallClockBudgetSignal(
-						this._autoCompactionAbortController.signal,
-						policy.wallClockBudgetSecs,
-					);
-					try {
-						compactResult = await compact(
-							summaryPreparation,
-							compactionModel,
-							apiKey,
-							headers,
-							undefined,
-							budget.signal,
-							this.thinkingLevel,
-							this.agent.streamFunction,
-							env,
-							this.settingsManager.getRetrySettings(),
-							this._summarizationRetryCallbacks({ source: "compaction", reason }),
-						);
-						break;
-					} catch (error) {
-						const budgetHit = budget.signal.aborted && !this._autoCompactionAbortController.signal.aborted;
-						if (budgetHit && attempt === 0) continue;
-						if (budgetHit) break;
-						throw error;
-					} finally {
-						budget.dispose();
-					}
-				}
-				if (!compactResult) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: false,
-						willRetry: false,
-						errorMessage: `Compaction exceeded its ${policy.wallClockBudgetSecs}s wall-clock budget twice; keeping the existing context.`,
-					});
-					return {
-						outcome: "failed",
-						method: "soft_compaction",
-						attemptIndex,
-						requestFingerprint: snapshot.fingerprint,
-						tokensBefore: snapshot.budget.tokens,
-						reason: "wall_clock_exhausted",
-					};
-				}
-				summary = compactResult.summary;
-				firstKeptEntryId = compactResult.firstKeptEntryId;
-				tokensBefore = compactResult.tokensBefore;
-				usage = compactResult.usage;
-				this._autoCompactionAbortController.signal.throwIfAborted();
-				const grokDetails: CompactionEntryDetails = { policy, mode };
-				details = {
-					...(compactResult.details as Record<string, unknown> | undefined),
-					grokCompaction: grokDetails,
-					compactModelWarning,
-				};
-			}
-
-			if (this._autoCompactionAbortController.signal.aborted) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: true,
-					willRetry: false,
-				});
-				return {
-					outcome: "cancelled",
-					method: "soft_compaction",
-					attemptIndex,
-					requestFingerprint: snapshot.fingerprint,
-					tokensBefore: snapshot.budget.tokens,
-				};
-			}
-
-			const validation = this._validateCompactionCommit(summary, firstKeptEntryId, sourceFingerprint);
-			if (validation === "superseded") {
-				return {
-					outcome: "superseded",
-					method: "soft_compaction",
-					attemptIndex,
-					requestFingerprint: snapshot.fingerprint,
-					currentFingerprint: createContextMaintenanceSourceFingerprint(this.sessionManager.getBranch()),
-					tokensBefore: snapshot.budget.tokens,
-				};
-			}
-			if (validation === "invalid") {
-				return {
-					outcome: "failed",
-					method: "soft_compaction",
-					attemptIndex,
-					requestFingerprint: snapshot.fingerprint,
-					tokensBefore: snapshot.budget.tokens,
-					reason: "invalid_summary",
-				};
-			}
-
-			// appendCompaction is the irreversible commit point. Nothing below may turn this into failed.
-			const compactionId = this.sessionManager.appendCompaction(
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				details,
-				fromExtension,
-				usage,
-			);
-			const warnings: ReductionWarning[] = [];
-			committedOutcome = {
-				outcome: "committed",
-				method: "soft_compaction",
-				attemptIndex,
-				requestFingerprint: snapshot.fingerprint,
-				tokensBefore: snapshot.budget.tokens,
-				tokensAfter: snapshot.budget.tokens,
-				budgetAfter: snapshot.budget,
-				verification:
-					snapshot.budget.decision === "fits"
-						? "fits"
-						: snapshot.budget.decision === "context_limit"
-							? "still_limited"
-							: "unknown",
-				warnings,
-			};
-			const newEntries = this.sessionManager.getEntries();
-			let estimatedTokensAfter = snapshot.budget.tokens;
-			try {
-				const sessionContext = this.sessionManager.buildSessionContext();
-				this.agent.state.messages = sessionContext.messages;
-				estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
-				const after = await this._contextMaintenanceSnapshot();
-				committedOutcome = {
-					...committedOutcome,
-					tokensAfter: after.budget.tokens,
-					budgetAfter: after.budget,
-					verification:
-						after.budget.decision === "fits"
-							? "fits"
-							: after.budget.decision === "context_limit"
-								? "still_limited"
-								: "unknown",
-				};
-			} catch {
-				warnings.push("ui_notification_failed");
-			}
-			try {
-				this._appendTraceSafely({
-					type: "compaction/summary",
-					data: {
-						turn: Math.max(0, this._nextTraceTurn - 1),
-						phase: "commit",
-						outcome: "completed",
-						compactionId,
-						sourceFingerprint,
-						firstKeptEntryId,
-						usage,
-					},
-				});
-			} catch {
-				warnings.push("ui_notification_failed");
-			}
-
-			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.id === compactionId) as
-				| CompactionEntry
-				| undefined;
-
-			if (this._extensionRunner && savedCompactionEntry) {
-				let extensionNotificationFailed = false;
-				const removeErrorListener = this._extensionRunner.onError((error) => {
-					if (error.event === "session_compact") extensionNotificationFailed = true;
-				});
-				try {
-					await this._extensionRunner.emit({
-						type: "session_compact",
-						compactionEntry: savedCompactionEntry,
-						fromExtension,
-						reason,
-						willRetry,
-					});
-				} catch {
-					extensionNotificationFailed = true;
-				} finally {
-					removeErrorListener();
-				}
-				if (extensionNotificationFailed) warnings.push("extension_notification_failed");
-			}
-
-			const result: CompactionResult = {
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				estimatedTokensAfter,
-				usage,
-				details,
-			};
-			try {
-				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
-			} catch {
-				warnings.push("ui_notification_failed");
-			}
-			if (!fromExtension && policy.memoryFlushEnabled) {
-				try {
-					const flushed = this._memoryStore.appendProject(this._cwd, [summary]);
-					this._appendTraceSafely({
-						type: "memory/archive",
-						data: {
-							turn: Math.max(0, this._nextTraceTurn - 1),
-							compactionId,
-							ran: flushed.written > 0,
-							reason: flushed.written ? "flush_written" : "flush_rejected",
-							written: flushed.written,
-							skipped: flushed.skipped,
-							reasons: flushed.reasons,
-						},
-					});
-				} catch {
-					warnings.push("memory_archive_failed");
-					this._appendTraceSafely({
-						type: "memory/archive",
-						data: {
-							turn: Math.max(0, this._nextTraceTurn - 1),
-							compactionId,
-							ran: false,
-							reason: "flush_failed",
-						},
-					});
-				}
-			}
-			if (this.settingsManager.getMemorySettings().enabled && this._writeCompactionNote(summary, compactionId)) {
-				const budget = createWallClockBudgetSignal(
-					this._autoCompactionAbortController.signal,
-					policy.wallClockBudgetSecs,
-				);
-				let archiveUsage: Usage | undefined;
-				try {
-					const maxTokens = Math.max(
-						1,
-						Math.min(Math.floor(settings.reserveTokens * 0.8), compactionModel.maxTokens),
-					);
-					const archive = await this._memoryStore.maybeConsolidate({
-						cwd: this._cwd,
-						signal: budget.signal,
-						inputFits: (notes) =>
-							calculateContextBudget(compactionModel, memoryExtractionContext(notes), {
-								outputReserveTokens: maxTokens,
-							}).decision !== "context_limit",
-						summarize: (notes, signal) =>
-							extractMemory(
-								notes,
-								compactionModel,
-								{ apiKey, headers, env, signal, maxTokens },
-								this.agent.streamFunction,
-								(usage) => {
-									archiveUsage = usage;
-								},
-							),
-					});
-					this._appendTraceSafely({
-						type: "memory/archive",
-						data: { turn: Math.max(0, this._nextTraceTurn - 1), compactionId, ...archive, usage: archiveUsage },
-					});
-					archiveUsage = undefined;
-					this._memoryStore.degradeSessionNotes(this._cwd);
-				} catch {
-					warnings.push("memory_archive_failed");
-					this._appendTraceSafely({
-						type: "memory/archive",
-						data: {
-							turn: Math.max(0, this._nextTraceTurn - 1),
-							compactionId,
-							ran: false,
-							reason: budget.signal.aborted ? "cancelled" : "memory_archive_failed",
-							usage: archiveUsage,
-						},
-					});
-				} finally {
-					budget.dispose();
-				}
-			}
-
-			return { ...committedOutcome, warnings: [...new Set(warnings)] };
-		} catch (error) {
-			if (committedOutcome) {
-				return {
-					...committedOutcome,
-					warnings: [...new Set<ReductionWarning>([...committedOutcome.warnings, "ui_notification_failed"])],
-				};
-			}
-			const errorMessage = error instanceof Error ? error.message : "compaction failed";
-			const cancelled = this._autoCompactionAbortController?.signal.aborted || this._promptAborted;
-			if (started) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: cancelled,
-					willRetry: false,
-					...(cancelled
-						? {}
-						: {
-								errorMessage:
-									reason === "overflow"
-										? `Context overflow recovery failed: ${errorMessage}`
-										: `Auto-compaction failed: ${errorMessage}`,
-							}),
-				});
-			}
-			return cancelled
-				? {
-						outcome: "cancelled",
-						method: "soft_compaction",
-						attemptIndex,
-						requestFingerprint: snapshot.fingerprint,
-						tokensBefore: snapshot.budget.tokens,
-					}
-				: {
-						outcome: "failed",
-						method: "soft_compaction",
-						attemptIndex,
-						requestFingerprint: snapshot.fingerprint,
-						tokensBefore: snapshot.budget.tokens,
-						reason: failureReason,
-					};
-		} finally {
-			this._autoCompactionAbortController = undefined;
-		}
-	}
-
 	/**
 	 * Toggle auto-compaction setting.
 	 */
@@ -4549,209 +3889,148 @@ export class AgentSession {
 	}
 
 	private async _resumePreparedContextRollover(): Promise<void> {
-		if (this._rolloverResumeInFlight) return await this._rolloverResumeInFlight;
-		const promise = this._resumePreparedContextRolloverImpl();
-		this._rolloverResumeInFlight = promise;
-		try {
-			await promise;
-		} finally {
-			if (this._rolloverResumeInFlight === promise) this._rolloverResumeInFlight = undefined;
-		}
-	}
-
-	private async _resumePreparedContextRolloverImpl(): Promise<void> {
-		const state = this.sessionManager.getContextRolloverState();
-		if (state.dispatchState === "outcome_unknown") {
-			this._extensionUIContext?.notify(
-				"Context rollover stopped: Provider or tool outcome is unknown. Nothing was replayed automatically; inspect external state before sending a new prompt.",
-				"error",
-			);
-			return;
-		}
-		if (state.dispatchState === "finished" && state.dispatchId && state.rolloverId) {
-			const finishedDispatch = [...this.sessionManager.getBranch()]
-				.reverse()
-				.find(
-					(entry): entry is ContextRolloverDispatchEntry =>
-						entry.type === "context_rollover_dispatch" && entry.dispatchId === state.dispatchId,
-				);
-			if (finishedDispatch?.outcome === "context_limit") {
-				const rollover = [...this.sessionManager.getBranch()]
-					.reverse()
-					.find(
-						(entry): entry is ContextRolloverEntry =>
-							entry.type === "context_rollover" && entry.rolloverId === state.rolloverId,
-					);
-				if (rollover) {
-					let action = await this._runTargetEpochMaintenance(rollover);
-					if (action === "continue") {
-						this._isAgentRunActive = true;
-						try {
-							while (action === "continue") {
-								await this.agent.continue();
-								action = await this._handlePostAgentRun();
-							}
-						} finally {
-							await this._emitAgentSettled();
-						}
-					}
-				}
-			}
-			return;
-		}
-		if (state.dispatchState !== "prepared" || !state.rolloverId) return;
-		const rollover = [...this.sessionManager.getBranch()]
-			.reverse()
-			.find(
-				(entry): entry is ContextRolloverEntry =>
-					entry.type === "context_rollover" && entry.rolloverId === state.rolloverId,
-			);
-		if (!rollover) return;
+		if (this._isAgentRunActive) return;
+		const state = this.contextRolloverState;
+		const resumableDispatch = this._resumableInterruptedDispatch();
+		const interrupted = state.outcome === "context_limit" || state.outcome === "context_transition";
+		const identity = this.sessionManager.ensureContextWindow();
+		const coordinates = this.sessionManager.getLatestContextCoordinates();
+		const saving = getSaveStateOperation(this.sessionManager, identity.windowId, coordinates.promptGeneration);
 		if (
-			rollover.dispatchId !==
-			createContextRolloverDispatchId(rollover.rolloverId, rollover.preparedRequestFingerprint)
-		) {
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId: rollover.dispatchId,
-				rolloverId: rollover.rolloverId,
-				state: "blocked",
-				requestFingerprint: rollover.preparedRequestFingerprint,
-				reason: "dispatch_prepare_mismatch",
-			});
+			state.dispatchState !== "prepared" &&
+			state.dispatchState !== "outcome_unknown" &&
+			!this._pendingContextTransition() &&
+			!this._deferredContextTransition &&
+			!interrupted &&
+			(saving === undefined || saving.finished)
+		)
 			return;
-		}
-		const cancelledDeliveryIds = new Set(
-			this.sessionManager
-				.getBranch()
-				.filter(
-					(entry): entry is Extract<SessionEntry, { type: "delivery_cancelled" }> =>
-						entry.type === "delivery_cancelled",
-				)
-				.map((entry) => entry.deliveryId),
-		);
-		const pendingDeliveryIds = new Set(this._pendingDeliveryStore.snapshot().items.map((item) => item.queueItemId));
-		const missingDeliveryIds = rollover.reservedDeliveryIds.filter((id) => !pendingDeliveryIds.has(id));
-		if (missingDeliveryIds.length > 0 && missingDeliveryIds.every((id) => cancelledDeliveryIds.has(id))) {
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId: rollover.dispatchId,
-				rolloverId: rollover.rolloverId,
-				state: "cancelled",
-				requestFingerprint: rollover.preparedRequestFingerprint,
-			});
-			return;
-		}
-		let preparation: PreparedContinuation;
-		try {
-			preparation = await this.agent.prepareContinuation(this.sessionManager.buildSessionContext().messages, {
-				requiredQueueItemIds: rollover.reservedDeliveryIds,
-			});
-		} catch {
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId: rollover.dispatchId,
-				rolloverId: rollover.rolloverId,
-				state: "blocked",
-				requestFingerprint: rollover.preparedRequestFingerprint,
-				reason: "dispatch_prepare_mismatch",
-			});
-			return;
-		}
-		if (
-			preparation.requestFingerprint !== rollover.preparedRequestFingerprint ||
-			preparation.baseContextFingerprint !== rollover.preparationBaseFingerprint ||
-			preparation.budget.tokens !== rollover.preparedTokens ||
-			JSON.stringify(preparation.reservedQueueItemIds) !== JSON.stringify(rollover.reservedDeliveryIds)
-		) {
-			this.agent.releasePreparedContinuation(preparation);
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId: rollover.dispatchId,
-				rolloverId: rollover.rolloverId,
-				state: "blocked",
-				requestFingerprint: preparation.requestFingerprint,
-				reason: "dispatch_prepare_mismatch",
-			});
-			return;
-		}
-		try {
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId: rollover.dispatchId,
-				rolloverId: rollover.rolloverId,
-				state: "started",
-				requestFingerprint: preparation.requestFingerprint,
-				reservedDeliveryIds: [...preparation.reservedQueueItemIds],
-			});
-		} catch {
-			this.agent.releasePreparedContinuation(preparation);
-			return;
-		}
-		this._rolloverDispatchPreparationId = preparation.preparationId;
 		this._isAgentRunActive = true;
-		let dispatchFinished = false;
+		const deferred = this._deferredContextTransition;
+		this._deferredContextTransition = false;
 		try {
-			await this.agent.dispatchPreparedContinuation(preparation);
-			const runState = this.agent.state.runState;
-			const dispatchOutcome = contextRolloverDispatchOutcome(runState, this._promptAborted);
-			this.sessionManager.appendContextRolloverDispatch({
-				dispatchId: rollover.dispatchId,
-				rolloverId: rollover.rolloverId,
-				state: "finished",
-				requestFingerprint: preparation.requestFingerprint,
-				outcome: dispatchOutcome,
-			});
-			dispatchFinished = true;
-			const operationUsage = this.sessionManager.getContextOperationUsage(
-				rollover.promptGeneration,
-				rollover.targetContextEpoch,
-			);
-			this._contextMaintenanceBudget = createContextMaintenanceBudget(
-				rollover.promptGeneration,
-				rollover.targetContextEpoch,
-				operationUsage,
-			);
-			if (dispatchOutcome === "context_limit") {
-				let action = await this._runTargetEpochMaintenance(rollover);
-				while (action === "continue") {
-					await this.agent.continue();
-					action = await this._handlePostAgentRun();
+			if (saving && !saving.finished) {
+				const usage = this._saveStateUsage(saving.businessCutoffEntryId);
+				const validation = validateContinuationState(this.sessionManager, saving);
+				if (validation.status === "valid") {
+					this._finishSaveState(saving, usage, validation);
+					this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+					if (this.agent.state.messages.at(-1)?.role === "assistant") {
+						this._appendContextControlMessage(
+							createCustomMessage(
+								"context-save-state-resumed",
+								"The persisted continuation contract was validated after restart. Prepare the saved window transition.",
+								false,
+								{ operationId: saving.operationId },
+								new Date().toISOString(),
+							),
+						);
+					}
+				} else {
+					this.sessionManager.appendContextOperation({
+						operationId: saving.operationId,
+						operationKind: "save_state",
+						transitionCause: saving.transitionCause,
+						state: "started",
+						windowId: saving.windowId,
+						promptGeneration: saving.promptGeneration,
+						contextEpoch: saving.contextEpoch,
+						sourceFingerprint: saving.sourceFingerprint,
+						businessCutoffEntryId: saving.businessCutoffEntryId,
+						startTaskNoteRevision: saving.startTaskNoteRevision,
+						controlBudgetTokens: saving.controlBudgetTokens,
+						outputBudgetTokens: saving.outputBudgetTokens,
+						samplesUsed: usage.samplesUsed,
+						consumedControlTokens: usage.controlTokens,
+						consumedOutputTokens: usage.outputTokens,
+						outcome: validation.reason,
+					});
+					const remainingControl = saving.controlBudgetTokens - usage.controlTokens;
+					const remainingOutput = saving.outputBudgetTokens - usage.outputTokens;
+					if (
+						validation.reason === "tool_transaction_incomplete" ||
+						usage.samplesUsed >= SAVE_STATE_MAX_SAMPLES ||
+						remainingControl <= 0 ||
+						remainingOutput <= 0
+					) {
+						this._appendTraceSafely({
+							type: "context/save_state",
+							data: {
+								turn: Math.max(0, this._nextTraceTurn - 1),
+								operationId: saving.operationId,
+								windowId: saving.windowId,
+								phase: "failed",
+								businessCutoffEntryId: saving.businessCutoffEntryId,
+								samplesUsed: usage.samplesUsed,
+								consumedControlTokens: usage.controlTokens,
+								consumedOutputTokens: usage.outputTokens,
+								reasonCode: validation.reason,
+							},
+						});
+						this._extensionUIContext?.notify(`Context rollover stopped: ${validation.reason}`, "error");
+						this.agent.setIdleOutcome({ type: "failed", message: validation.reason });
+						return;
+					}
+					this._controlReadTokens = Math.max(0, remainingControl);
+					if (this.agent.state.messages.at(-1)?.role === "assistant") {
+						this._appendContextControlMessage(
+							createCustomMessage(
+								"context-save-state-correction",
+								`The persisted continuation contract is incomplete (${validation.reason}). Query exact sources if needed, then update next_action/current. ${SAVE_STATE_SUPERSESSION_INSTRUCTION} ${SAVE_STATE_CONTENT_INSTRUCTION}`,
+								false,
+								{ operationId: saving.operationId, reason: validation.reason },
+								new Date().toISOString(),
+							),
+						);
+					}
+					await this.agent.continue({
+						toolNames: SAVE_STATE_TOOL_NAMES,
+						maxTokens: Math.min(Math.max(1, remainingOutput), this.agent.state.model.maxTokens),
+					});
 				}
 			}
-		} catch {
-			if (!dispatchFinished) {
-				this.sessionManager.appendContextRolloverDispatch({
-					dispatchId: rollover.dispatchId,
-					rolloverId: rollover.rolloverId,
-					state: "blocked",
-					requestFingerprint: preparation.requestFingerprint,
-					reason: "dispatch_outcome_unknown",
-				});
+			const recovering = resumableDispatch ? this._recoveringRollover() : undefined;
+			const continueRun =
+				recovering !== undefined ||
+				this._completedRecoveryAwaitingBusinessRequest() ||
+				resumableDispatch?.lastAssistant.content.some((block) => block.type === "toolCall") === true;
+			const result = resumableDispatch
+				? await this._contextRollover.resumeInterrupted(resumableDispatch.rollover, {
+						continueRun,
+						recovering: recovering !== undefined,
+					})
+				: await this._contextRollover.resume();
+			if (result?.outcome === "blocked") {
+				this._deferredContextTransition = result.reason === "operation_in_flight";
+				if (result.reason !== "operation_in_flight") {
+					this.agent.setIdleOutcome({ type: "failed", message: result.reason });
+				}
+				this._extensionUIContext?.notify(`Context rollover stopped: ${result.reason}`, "error");
+				return;
+			}
+			if (
+				saving ||
+				result?.outcome === "dispatched" ||
+				this._pendingContextTransition() ||
+				deferred ||
+				interrupted
+			) {
+				while (true) {
+					const action = await this._handlePostAgentRun();
+					if (action !== "continue" && action !== "continue_save_state") break;
+					await this.agent.continue(
+						action === "continue_save_state"
+							? {
+									toolNames: SAVE_STATE_TOOL_NAMES,
+									maxTokens: Math.min(STATE_SAVE_OUTPUT_TOKENS, this.agent.state.model.maxTokens),
+								}
+							: {},
+					);
+				}
 			}
 		} finally {
-			this._rolloverDispatchPreparationId = undefined;
 			await this._emitAgentSettled();
 		}
-	}
-
-	private async _runTargetEpochMaintenance(rollover: ContextRolloverEntry): Promise<ContextMaintenanceAction> {
-		if (
-			this._contextMaintenanceBudget.promptGeneration !== rollover.promptGeneration ||
-			this._contextMaintenanceBudget.contextEpoch !== rollover.targetContextEpoch
-		) {
-			const usage = this.sessionManager.getContextOperationUsage(
-				rollover.promptGeneration,
-				rollover.targetContextEpoch,
-			);
-			this._contextMaintenancePromptGeneration = rollover.promptGeneration;
-			this._contextMaintenanceBudget = createContextMaintenanceBudget(
-				rollover.promptGeneration,
-				rollover.targetContextEpoch,
-				usage,
-			);
-		}
-		return await this._runContextMaintenance({
-			triggerId: this._nextContextMaintenanceTriggerId(),
-			cause: "budget_limit",
-			phase: "mid_run",
-			continuation: "required",
-		});
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
@@ -5123,11 +4402,20 @@ export class AgentSession {
 			enter_plan_mode: createEnterPlanModeToolDefinition(this),
 			exit_plan_mode: createExitPlanModeToolDefinition(this),
 			web_fetch: createWebFetchToolDefinition(this._webFetchOps),
-			history_get: createHistoryGetToolDefinition(this.sessionManager),
+			history: createHistoryToolDefinition(this.sessionManager, (requestedTokens, toolCallId) =>
+				this._reserveContextReadBudget(requestedTokens, toolCallId),
+			),
+			get_context_remaining: createContextRemainingToolDefinition(() => {
+				if (!this._contextRemaining) throw new Error("No completed request measurement");
+				return this._contextRemaining;
+			}),
+			new_context: createNewContextToolDefinition(this.sessionManager),
 			context_note: createContextNoteToolDefinition({
 				sessionManager: this.sessionManager,
-				getPromptGeneration: () => this._contextMaintenanceBudget.promptGeneration,
-				getContextEpoch: () => this._contextMaintenanceBudget.contextEpoch,
+				getPromptGeneration: () => this.sessionManager.getLatestContextCoordinates().promptGeneration,
+				reserveReadBudget: (requestedTokens, toolCallId) =>
+					this._reserveContextReadBudget(requestedTokens, toolCallId),
+				getContextEpoch: () => this.sessionManager.getLatestContextCoordinates().contextEpoch,
 				getTraceTurn: () => Math.max(0, this._nextTraceTurn - 1),
 				onTrace: (event) => this._appendTraceSafely(event),
 			}),
@@ -5187,7 +4475,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", "history_get", "context_note"];
+			: ["read", "bash", "edit", "write", "history", "context_note", "get_context_remaining", "new_context"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
@@ -5658,6 +4946,12 @@ export class AgentSession {
 			}
 
 			// Update agent state
+			const branchTodos = getLatestCustomEntryData<ReturnType<TodoStateStore["toJSON"]>>(
+				this.sessionManager.getBranch(),
+				"todo-state",
+			);
+			this._todoStateStore.clear();
+			if (branchTodos) this._todoStateStore.applyReplace(branchTodos);
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 
@@ -5712,40 +5006,10 @@ export class AgentSession {
 		const usageTotals = createUsageTotals();
 
 		for (const entry of this.sessionManager.getEntries()) {
-			if (
-				entry.type === "trace" &&
-				entry.event.type === "compaction/summary" &&
-				entry.event.data.phase === "prefix" &&
-				entry.event.data.outcome === "discarded" &&
-				entry.event.data.usage
-			)
-				addUsageToTotals(usageTotals, entry.event.data.usage);
 			if (entry.type === "trace" && entry.event.type === "memory/archive" && entry.event.data.usage)
 				addUsageToTotals(usageTotals, entry.event.data.usage);
-			if (
-				entry.type === "custom" &&
-				entry.customType === "context-rollover-checkpoint" &&
-				isContextRolloverCheckpointEnvelope(entry.data) &&
-				entry.data.checkpoint.compactionPrefix.usage
-			) {
-				addUsageToTotals(usageTotals, entry.data.checkpoint.compactionPrefix.usage);
-			}
 			if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
 				addUsageToTotals(usageTotals, entry.usage);
-				if (
-					entry.type === "compaction" &&
-					entry.details &&
-					typeof entry.details === "object" &&
-					"prefixUsage" in entry.details &&
-					isCheckpointUsage(entry.details.prefixUsage)
-				) {
-					const prefix = entry.details.prefixUsage;
-					usageTotals.input -= prefix.input;
-					usageTotals.output -= prefix.output;
-					usageTotals.cacheRead -= prefix.cacheRead;
-					usageTotals.cacheWrite -= prefix.cacheWrite;
-					usageTotals.cost -= prefix.cost.total;
-				}
 			}
 			if (entry.type !== "message") continue;
 			totalMessages++;

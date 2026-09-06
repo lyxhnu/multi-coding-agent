@@ -1,10 +1,11 @@
+import { writeFileSync } from "node:fs";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_COMPACTION_POLICY } from "../../../src/core/compaction/compaction-policy.ts";
 import { checkMemoryCandidate } from "../../../src/core/memory/secret-filter.ts";
 import { SandboxManager } from "../../../src/core/sandbox/sandbox-manager.ts";
 import { resolveSandboxSettings } from "../../../src/core/sandbox/types.ts";
 import { MAX_SUBAGENT_DEPTH } from "../../../src/core/subagents/subagent-coordinator.ts";
+import { TaskManager } from "../../../src/core/tasks/task-manager.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 /**
@@ -37,7 +38,7 @@ describe("Grok-alignment hard gates (M9 eval)", () => {
 		});
 		harnesses.push(harness);
 		const filePath = `${harness.tempDir}/x.txt`;
-		(await import("node:fs")).writeFileSync(filePath, "a\n");
+		writeFileSync(filePath, "a\n");
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("edit", { path: filePath, edits: [{ oldText: "a", newText: "b" }] }), {
 				stopReason: "toolUse",
@@ -108,7 +109,6 @@ describe("Grok-alignment hard gates (M9 eval)", () => {
 	});
 
 	it("gate: background task orphan == 0 (TaskManager.cancelAll, which AgentSession.dispose() calls, leaves nothing running)", async () => {
-		const { TaskManager } = await import("../../../src/core/tasks/task-manager.ts");
 		const taskManager = new TaskManager();
 		const snapshot = taskManager.start({
 			kind: "bash",
@@ -129,12 +129,6 @@ describe("Grok-alignment hard gates (M9 eval)", () => {
 		const harness = await createHarness({ subagentDepth: MAX_SUBAGENT_DEPTH });
 		harnesses.push(harness);
 		expect(harness.session.getAllTools().map((t) => t.name)).not.toContain("task");
-	});
-
-	it("gate: compaction 超 300s 未中断 == 0 (wall-clock budget is enforced via an abortable signal, never unbounded)", () => {
-		// See compaction-policy.test.ts's createWallClockBudgetSignal coverage; re-asserted here as the
-		// concrete gate: the default budget matches spec (300s) and is a real, disposable AbortSignal.
-		expect(DEFAULT_COMPACTION_POLICY.wallClockBudgetSecs).toBe(300);
 	});
 
 	it("gate: memory secret 写入 == 0", () => {

@@ -6,7 +6,6 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
-import { type CompactionPolicy, resolveCompactionPolicy } from "./compaction/compaction-policy.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import type { MemoryEmbeddingSettings } from "./memory/embeddings.ts";
 import type { PermissionMode, PermissionRule } from "./permissions/types.ts";
@@ -17,14 +16,8 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
-	// Grok-aligned policy fields (see ./compaction/compaction-policy.ts). Additive: the
-	// legacy reserveTokens/keepRecentTokens-based flow is unaffected until a caller reads these.
+	// Work-budget threshold for automatic context window transitions.
 	autoCompactThresholdPercent?: number; // default: 85
-	compactModel?: string; // default: undefined (use the session's current model)
-	memoryFlushEnabled?: boolean; // default: false
-	wallClockBudgetSecs?: number; // default: 300
-	twoPassEnabled?: boolean; // default: false
-	strictCompactModel?: boolean; // default: false (unresolvable compactModel silently falls back to the current model)
 }
 
 export interface ContextSettings {
@@ -864,9 +857,10 @@ export class SettingsManager {
 		};
 	}
 
-	/** Grok-aligned compaction policy (threshold percent, compact model, memory flush, wall-clock budget, two-pass). */
-	getCompactionPolicy(): CompactionPolicy {
-		return resolveCompactionPolicy(this.settings.compaction);
+	getContextWorkThresholdPercent(): number {
+		const value = this.settings.compaction?.autoCompactThresholdPercent ?? 85;
+		if (!Number.isFinite(value) || value <= 0 || value > 100) throw new Error("Invalid context work threshold");
+		return value;
 	}
 
 	/** Whether the agent reuses a stable prefix + append-only message log across turns. */

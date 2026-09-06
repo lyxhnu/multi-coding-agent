@@ -54,10 +54,12 @@ function traceSummary(entry: SessionTraceEntry): string {
 			return `turn/end ${event.data.outcome?.type ?? event.data.stopReason ?? "unknown"}${event.data.willRetry ? " · retry" : ""}`;
 		case "context/budget":
 			return `context/budget ${event.data.budget.decision} · ${event.data.budget.tokens} input tokens`;
-		case "context/maintenance":
-			return `context/maintenance ${event.data.state} · ${event.data.outcome}${event.data.method ? ` · ${event.data.method}` : ""}${event.data.nextAction ? ` · ${event.data.nextAction}` : ""}`;
+		case "context/save_state":
+			return `context/save_state ${event.data.phase} · ${event.data.samplesUsed} samples · ${event.data.consumedControlTokens} control/${event.data.consumedOutputTokens} output tokens${event.data.reasonCode ? ` · ${event.data.reasonCode}` : ""}`;
+		case "context/recovery":
+			return `context/recovery ${event.data.phase} · ${event.data.coveredUnits} units · ${event.data.missingCount} missing${event.data.reasonCode ? ` · ${event.data.reasonCode}` : ""}`;
 		case "context/rollover":
-			return `context/rollover epoch ${event.data.sourceContextEpoch}${event.data.targetContextEpoch === undefined ? "" : `→${event.data.targetContextEpoch}`} · ${event.data.phase} · ${event.data.outcome}${event.data.reasonCode ? ` · ${event.data.reasonCode}` : ""}`;
+			return `context/rollover ${event.data.windowId} · ${event.data.cause} · epoch ${event.data.sourceContextEpoch}${event.data.targetContextEpoch === undefined ? "" : `→${event.data.targetContextEpoch}`} · ${event.data.phase} · ${event.data.outcome}${event.data.reasonCode ? ` · ${event.data.reasonCode}` : ""}`;
 		case "memory/archive":
 			return `memory/archive ${event.data.reason} · ${event.data.written ?? 0} written`;
 		case "compaction/summary":

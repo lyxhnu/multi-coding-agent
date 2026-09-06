@@ -1,6 +1,8 @@
 # 基于持久记忆的上下文窗口管理方案
 
-状态：设计提案，尚未实现。日期：2026-09-05。
+状态：代码实现、确定性行为验收和真实模型自动换窗验收已完成；用户排除的 provider `overloaded` 不计入功能缺陷。日期：2026-09-05。
+
+后续修订见 [上下文换窗的状态保存与续跑可靠性](context-window-continuation-reliability.md)。该 Spec 基于真实仓储案例和当前代码，修订第 3、5.3、6.3、6.4、7、9 节的保存轮次、恢复材料与检查要求；修订代码、确定性行为和真实模型验收结果记录在该文第 11 节。
 
 依据：用户提供的 Token Budget / new_context / History / Notes 架构分析，以及当前工作区实现。本文件描述目标设计，不将外部方案的服务端能力视为本项目已有能力。
 
@@ -10,7 +12,9 @@
 
 根据用户补充要求，默认不向新窗口注入完整 Handoff、最近窗口消息、全部 Note 或完整 Todo。恢复是否可靠，与恢复正文是否预先装进 prompt，是两个独立问题。
 
-用户进一步明确：新链路实施时同步删除被替换功能的代码及配套配置、类型、导出和测试，不保留僵尸代码。本轮仅完善方案；删除操作与替代实现一起交付。
+用户进一步明确：新链路实施时同步删除被替换功能的代码及配套配置、类型、导出和测试，不保留僵尸代码。删除操作与替代实现一起交付。
+
+本文件是自动窗口管理的现行契约。`context-rollover.md`、`context-maintenance-state-machine.md`、`task-note-projection.md` 和 `memory-context-integrity*.md` 中涉及旧自动压缩、Checkpoint、Handoff、History allowlist 和 credit 门禁的条款仅记录被替代设计，不再作为实现要求。手动摘要、Memory 有效视图、原始证据和交付语义仍适用；现行接口见 `../memory-context.md`、`../session-format.md` 和 `../rpc.md`。
 
 将自动上下文管理改为：
 
@@ -360,3 +364,24 @@ next-prompt 消息仍仅在下一次用户 prompt 投影；换窗不消费它。
 行为测试使用 coding-agent 的 suite harness 与 faux provider；断言实际新窗口请求、工具调用次数、检索结果及磁盘恢复结果。实现后运行被修改的定向测试和 `npm run check`。
 
 质量验收还需比较同一长任务换窗前后：目标与约束保持、重复工具执行次数、找回关键细节成功率、启动注入量、首次有效业务动作前的恢复读取量和延迟。旧历史与无关 Note 增长时，首请求必须保持稳定小；仅把大 Handoff 从首请求移到首次工具读取，不算完成本方案。
+
+## 10. 实现与回归入口
+
+| 覆盖范围 | 定向测试 |
+| --- | --- |
+| 初始窗口落盘、完整批次、固定启动内容、要求恢复、保存状态工具和预算、三类触发、八次上限 | `test/suite/context-window-memory.test.ts` |
+| 并发来源变化的一次重组、steering 保留、后台任务等待、提交失败、prepared 重启、unknown 不重放、JSONL 尾部 | 同上 |
+| History 可见性、Unicode 分页、空命中续扫、按查询位置计算游标进度、读取去重与 shake、长 Todo 分页、Note 长期更新、Todo 分支恢复 | 同上 |
+| recovering 失败后输入新目标 | 旧 rollover 不进入新 promptGeneration/window 的工具门禁，新任务可正常执行；同上 |
+| Note 更新/撤销/多 state 与证据时效 | `test/suite/task-note-projection.test.ts` |
+| 硬预算、扩展转换、队列交付、Trace | `test/suite/context-budget-integrity.test.ts`、`agent-session-queue.test.ts`、`agent-session-trace.test.ts` |
+| 手动摘要、Memory 档案、Session 重建与 shake 重放 | `test/suite/agent-session-compaction.test.ts`、`memory-*.test.ts`、`test/session-manager/*.test.ts` |
+| CLI/RPC 未完成状态 | `test/print-mode.test.ts`、`test/rpc-prompt-response-semantics.test.ts` |
+| Agent PreparedContinuation、请求与工具批次控制 | `packages/agent/test/prepared-continuation.test.ts`、`agent-loop.test.ts`、`run-state.test.ts` |
+| 仓储真实文件与生产工具续跑 | `test/suite/warehouse-continuation.test.ts`，覆盖 18/22→22/22、语法检查和跨窗首个业务动作 |
+
+这些测试使用 faux provider 或本地模拟流，不调用真实模型。它们验证结构、恢复顺序、工具执行和容量界限；不将脚本化恢复结果表述为真实模型的长期语义质量或延迟基准。进程中断恢复不包含断电持久性承诺。
+
+2026-09-05 初始本地验证为 coding-agent 23 个定向测试文件 228 项通过、2 项跳过，agent 4 个定向测试文件 80 项通过；仓储确定性验收使用生产 read/bash/edit/write 工具完成 18/22→22/22，并通过语法检查。真实验收随后发现并修复两项宿主/控制提示问题：print 模式在后台 Task 阻塞换窗时过早 dispose，导致 Task 被取消；同一任务后续保存没有明确要求用当前 eventId 执行 Note supersession，且 next_action 容易把所有剩余工作重新打包为一次全量读取。print 模式现在等待活动 Task 终态及延后换窗收敛；保存提示要求显式 supersedesEventId、一个窗口内可完成的单一即时动作、已完成 Task/Memory 读取和精确失败事实。
+
+真实 `rrver/gpt-5.4` 隔离 Session `01a07274-5660-7c92-b1d8-6f21f170bc31` 保留了全部用户消息和配置变化。36k/65% 阶段如实记录了工作集不足、重复读取和两次 subagent `overloaded` 终态；按用户要求不修改 provider 重试、`outcome_unknown` 或 overloaded 处理。改进后同一 Session 使用 48k/80%，在一个用户回合内自动保存三版具体 Note、完成三次 rollover/recovery，并依次修正 `warehouse.js`、实现 CLI、执行验证；Todo 最终全部 completed，Memory 约定经 `memory_get` 读取并落实。独立复跑得到 22/22；后续真实回合新增取消审计/重启测试，发现并修复 reasonCode 重建缺陷，最终独立得到 23/23 和 `npm run check` 成功。最终仓库回归为 coding-agent 14 个文件 152 项通过、2 项跳过，agent 3 个文件 40 项通过；根目录 `npm run check` 和 `git diff --check` 通过。真实对话、Note 版本、换窗和恢复页导出到 `rrver-warehouse-mechanisms-session.html`，未包含认证值。

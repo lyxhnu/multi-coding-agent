@@ -4,33 +4,33 @@
 
 ### Breaking Changes
 
-- Set the default active model tool set to `read`, `bash`, `edit`, `write`, and session-scoped `history_get` and `context_note`. Other built-ins must be selected explicitly; memory and LSP tools are registered only when configured.
+- Removed `history_get`, automatic-compaction policy/checkpoint exports, and `compactModel`, `strictCompactModel`, `twoPassEnabled`, `wallClockBudgetSecs`, and `memoryFlushEnabled` settings. Use `history` and the window tools; handle `context_transition` as incomplete.
+- Set the default active model tool set to `read`, `bash`, `edit`, `write`, and session-scoped `history`, `context_note`, `get_context_remaining`, and `new_context`. Other built-ins must be selected explicitly; memory and LSP tools are registered only when configured.
 - Replaced unreachable background task states with an explicit `running`/`cancelling`/terminal state machine; `TaskManager.wait()` now reports its own deadline separately from task status.
 - Changed memory notes to require a committed compaction ID and return write/rejection results. Automatic consolidation uses source-identified snapshots and a processed-ID/hash state instead of filename watermarks; old state files are not silently migrated. `memory_get` now returns the effective, non-revoked safe view, not raw Markdown.
-- Added `runState` to RPC `get_state` and `reasons` to memory-flush results. Consumers must handle `context_limit` as non-completion. Automatic memory-flush outcomes now live in trace, separately from compaction entry details.
+- Added `runState` to RPC `get_state` and `reasons` to memory-flush results. Consumers must handle `context_limit` as non-completion.
 
 ### Added
 
-- Added Context Rollover for continuing capacity-blocked work in a new context epoch using validated checkpoints, dynamic Todo projection, prepared dispatch, durable queue receipts, crash journals, trace, and RPC state.
-- Added branch-scoped Task Note events and deterministic projections, atomic Checkpoint Note batches, evidence freshness, authoritative final-Handoff validation, and Task Note trace/RPC diagnostics.
-- Added `history_get` for bounded Unicode text pages from shaken ancestors, without tool re-execution or replay of historical memory results.
-- Added source-validated incremental compaction checkpoints, source-linked body fact extraction, stable note identities and journaled idempotent archive commits.
-- Added budget, prefix/commit summary and memory-archive trace diagnostics, including persistence/export for requests stopped before the first assistant response.
+- Added stable context-window identities, bounded state saving, minimal recovery references, prepared dispatch, durable queue receipts, and crash recovery without replaying unknown outcomes.
+- Added branch-scoped Task Note updates and bounded queries with evidence freshness; cumulative audit events no longer invalidate the active projection.
+- Added `history` for bounded window/item enumeration, saved-text reads, and literal search using one visibility policy.
+- Added source-linked Memory extraction, stable note identities and journaled idempotent archive commits.
+- Added budget, window/dispatch, manual-summary and memory-archive trace diagnostics, including persistence/export for requests stopped before the first assistant response.
 - Added effect-based tool permission decisions and interactive/RPC approval for risky built-in process, network, and external-system effects.
 - Added built-in Tavily web search via `TAVILY_API_KEY`; `web_search` is registered only when a backend is configured, and SDK callers can inject `WebSearchOperations`.
 - Added `/shake`, which frees context by dropping large tool results and fenced/XML blocks without a model call.
-- Added an automatic shake attempt before threshold compaction, skipping the summary request entirely when the mechanical pass frees enough room.
-- Added a shake fallback once a prompt's mid-run compaction budget is spent. Previously the context guard gave up silently at that point and the run continued until responses were truncated.
+- Added automatic deterministic shake of eligible tool output before final request checks.
 - Added the `shake` session entry type, persisting redactions so a reduction survives a session reload, and `context.appendOnly` (default `false`) to enable the agent's append-only context mode.
 - Added an optional vector recall channel to `memory_search`: configure `memory.embedding.{baseUrl,model,apiKeyEnv}` (OpenAI-compatible `/embeddings` endpoint, key read from the named env var) and semantic hits are fused with keyword scores; unconfigured setups keep the exact keyword-only behavior. Vectors are cached in `.memory-index.json` sidecars and refreshed lazily per search.
-- Added three-tier age degradation for session notes, run best-effort during autoDream: notes older than 30 days are truncated to 800 chars, older than 180 days reduced to heading/list key signal (300 chars), with search downweighting tiers at 1/0.85/0.7. Curated MEMORY.md is never degraded.
+- Added three-tier age degradation for session notes, exposed through the Memory store: notes older than 30 days are truncated to 800 chars, older than 180 days reduced to heading/list key signal (300 chars), with search downweighting tiers at 1/0.85/0.7. Curated MEMORY.md is never degraded.
 - Added durable log-only execution traces for turn/step boundaries, final request headers, assistant stream chunks, and tool execution, plus `/trace` for inspecting them in the interactive CLI without adding trace nodes to `/tree`.
 - Added validated `submit_subagent_result` completion for built-in subagents, with structured findings, changes, verification, and blockers returned through foreground and background task results; task state transitions are recorded in the creating turn's trace.
 
 ### Changed
 
 - Changed `memory_search` ranking: term scores now decay with age (floored at 70%, half-life 90 days for curated MEMORY.md blocks and 14 days for session notes) and the top candidates are MMR-reranked so near-duplicate entries don't crowd out complementary ones.
-- Unified automatic context reduction behind a bounded, verified maintenance state machine with structured attempt outcomes and trace diagnostics.
+- Replaced automatic soft compaction, checkpoints, handoff bundles and progress credits with window transitions and on-demand retrieval. Manual `/compact` remains independent.
 
 ### Fixed
 

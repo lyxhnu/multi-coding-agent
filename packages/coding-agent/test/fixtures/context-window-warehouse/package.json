@@ -1,0 +1,12 @@
+{
+  "name": "warehouse-reservation-service",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/cli.js && node --check src/errors.js && node --check src/file-event-store.js && node --check src/warehouse.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

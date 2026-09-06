@@ -40,6 +40,8 @@ function shakeEntry(id: string, parentId: string | null, redactions: ShakeRedact
 function compactionEntry(id: string, parentId: string | null, firstKeptEntryId: string): CompactionEntry {
 	return {
 		type: "compaction",
+		windowId: "00000000-0000-4000-8000-000000000001",
+		previousWindowId: null,
 		id,
 		parentId,
 		timestamp: TS,

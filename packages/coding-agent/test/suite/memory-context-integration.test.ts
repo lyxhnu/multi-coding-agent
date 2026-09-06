@@ -1,199 +1,19 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { RESCUE_SHAKE_CONFIG } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type CompactionPreparation, compact } from "../../src/core/compaction/compaction.ts";
-import type {
-	ContextMaintenanceSnapshot,
-	ReductionAttemptResult,
-} from "../../src/core/compaction/context-maintenance.ts";
 import { projectSessionsDir } from "../../src/core/memory/memory-store.ts";
-import { createHistoryGetToolDefinition } from "../../src/core/tools/history-get.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
-type CompactionInternals = {
-	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
-	_runSoftCompaction: (
-		cause: "threshold",
-		willRetry: boolean,
-		snapshot: ContextMaintenanceSnapshot,
-		attemptIndex: number,
-	) => Promise<ReductionAttemptResult>;
-};
-
-async function compactOnce(internals: CompactionInternals): Promise<ReductionAttemptResult> {
-	return await internals._runSoftCompaction("threshold", false, await internals._contextMaintenanceSnapshot(), 1);
-}
-
 describe("memory-context-integrity: cross-module boundaries", () => {
-	it("E01/E03/K03/K04 preserves constraints through tools, shake, incremental compaction and disk restart", async () => {
-		let filePath = "";
-		let executions = 0;
-		const reader: AgentTool = {
-			name: "read",
-			label: "read",
-			description: "read fixture",
-			parameters: Type.Object({}),
-			execute: async () => {
-				executions++;
-				return { content: [{ type: "text", text: readFileSync(filePath, "utf8") }], details: {} };
-			},
-		};
-		const h = await createHarness({
-			persistSession: true,
-			tools: [reader],
-			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 2048, twoPassEnabled: true } },
-		});
-		harnesses.push(h);
-		filePath = `${h.tempDir}/source.txt`;
-		writeFileSync(filePath, "ORIGINAL SNAPSHOT\n".repeat(1600));
-		h.setResponses([
-			fauxAssistantMessage(fauxToolCall("read", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("pending work"),
-		]);
-		await h.session.prompt("Constraint: never publish without approval.");
-		expect(executions).toBe(1);
-		const source = h.sessionManager
-			.getEntries()
-			.find((entry) => entry.type === "message" && entry.message.role === "toolResult")!;
-		await h.session.shake(RESCUE_SHAKE_CONFIG, "manual");
-		writeFileSync(filePath, "CHANGED FILE");
-		const history = await createHistoryGetToolDefinition(h.sessionManager).execute(
-			"history",
-			{ entryId: source.id, limit: 17 },
-			undefined,
-			undefined,
-			h.session.extensionRunner.createContext(),
-		);
-		expect(JSON.stringify(history.content)).toContain("ORIGINAL SNAPSHOT");
-		expect(executions).toBe(1);
-		h.session.setActiveToolsByName(["read", "history_get"]);
-		h.setResponses([
-			fauxAssistantMessage(fauxToolCall("history_get", { entryId: source.id, limit: 17 }), {
-				stopReason: "toolUse",
-			}),
-			(context) => {
-				expect(JSON.stringify(context.messages)).toContain("ORIGINAL SNAPSHOT");
-				expect(JSON.stringify(context.messages)).not.toContain("CHANGED FILE");
-				return fauxAssistantMessage("saved history reviewed");
-			},
-		]);
-		await h.session.prompt("Read the saved history, then continue the review.");
-		expect(h.eventsOfType("tool_execution_end").find((event) => event.toolName === "history_get")?.isError).toBe(
-			false,
-		);
-		expect(executions).toBe(1);
-		h.setResponses([
-			(context) => {
-				const requestText = context.messages
-					.flatMap((message) =>
-						typeof message.content === "string"
-							? [message.content]
-							: message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])),
-					)
-					.join("\n");
-				const payload = JSON.parse(requestText.split("\n\n").at(-1)!) as {
-					sourceEntries: Array<{
-						id: string;
-						type: string;
-						message?: { role: string; content: string | Array<{ type: string; text?: string }> };
-					}>;
-				};
-				const users = payload.sourceEntries.filter(
-					(entry) => entry.type === "message" && entry.message?.role === "user",
-				);
-				const objective = users.at(-1);
-				const constraint = users.find((entry) => JSON.stringify(entry.message?.content).includes("never publish"));
-				if (!objective?.message || !constraint) throw new Error("missing checkpoint sources");
-				const objectiveText =
-					typeof objective.message.content === "string"
-						? objective.message.content
-						: objective.message.content.map((part) => part.text ?? "").join("\n");
-				return fauxAssistantMessage(
-					JSON.stringify({
-						checkpoint: {
-							version: 1,
-							objective: { text: objectiveText, sourceEntryIds: [objective.id] },
-							userConstraints: [
-								{
-									text: "never publish without approval.",
-									sourceEntryIds: [constraint.id],
-								},
-							],
-							acceptanceCriteria: { status: "not_specified", items: [] },
-							decisions: [],
-							completedWork: [],
-							currentState: {
-								text: "Saved history reviewed; approval required.",
-								evidenceEntryIds: [objective.id],
-							},
-							failedAttempts: [],
-							nextAction: { text: "Continue the review.", evidenceEntryIds: [] },
-							historyRefs: [],
-						},
-						noteUpdateCandidates: [],
-					}),
-				);
-			},
-		]);
-		const internals = h.session as unknown as CompactionInternals & {
-			_maybeStartTwoPassPrefire(): void;
-		};
-		internals._maybeStartTwoPassPrefire();
-		await vi.waitFor(() =>
-			expect(
-				h.sessionManager
-					.getBranch()
-					.some((entry) => entry.type === "custom" && entry.customType === "context-rollover-checkpoint"),
-			).toBe(true),
-		);
-		h.setResponses([fauxAssistantMessage("tail progress")]);
-		await h.session.prompt("Process the next step");
-		h.setResponses([
-			(context) => {
-				expect(JSON.stringify(context)).toContain("never publish without approval");
-				expect(JSON.stringify(context)).not.toContain("ORIGINAL SNAPSHOT");
-				return fauxAssistantMessage("Constraint: never publish without approval. Next: review changes.");
-			},
-			(context) => {
-				expect(JSON.stringify(context)).not.toContain("ORIGINAL SNAPSHOT");
-				return fauxAssistantMessage("Next: review changes; approval required.");
-			},
-		]);
-		await compactOnce(internals);
-		expect(h.eventsOfType("compaction_end").at(-1)).toMatchObject({
-			aborted: false,
-			result: { summary: expect.stringContaining("never publish without approval") },
-		});
-		h.setResponses([fauxAssistantMessage("review remains pending")]);
-		await h.session.prompt("Continue review");
-		h.setResponses([
-			fauxAssistantMessage("Constraint: never publish without approval. Review pending."),
-			fauxAssistantMessage("Review pending; approval required."),
-		]);
-		await h.session.compact();
-		const restored = await createHarness({ sessionFile: h.session.sessionFile!, tools: [] });
-		harnesses.push(restored);
-		restored.setResponses([
-			(context) => {
-				expect(JSON.stringify(context)).toContain("never publish without approval");
-				return fauxAssistantMessage("Awaiting approval");
-			},
-		]);
-		await restored.session.prompt("Resume");
-		expect(restored.session.state.runState).toMatchObject({ lastOutcome: { type: "completed" } });
-		expect(restored.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(2);
-		expect(executions).toBe(1);
-	});
 	const harnesses: Harness[] = [];
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		for (const h of harnesses.splice(0)) await h.cleanup();
 	});
-
 	it("C02/C03 passes inherited constraints into three consecutive normal summaries", async () => {
 		const h = await createHarness();
 		harnesses.push(h);
@@ -354,7 +174,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		expect(h.session.agent.hasQueuedMessages()).toBe(false);
 	});
 
-	it("B02 counts every parallel tool result before sending the next request", async () => {
+	it("B02 persists and bounds every parallel tool result before sending the next request", async () => {
 		const runs: string[] = [];
 		const tools: AgentTool[] = ["first", "second"].map((name) => ({
 			name,
@@ -378,8 +198,9 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		]);
 		await h.session.prompt("both");
 		expect(runs.sort()).toEqual(["first", "second"]);
-		expect(h.getPendingResponseCount()).toBe(1);
-		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "context_limit" } });
+		expect(h.getPendingResponseCount()).toBe(0);
+		expect(h.sessionManager.getBranch().filter((entry) => entry.type === "tool_result_source")).toHaveLength(2);
+		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "completed" } });
 	});
 
 	it("B10 cancels during final transform without provider work", async () => {
@@ -400,7 +221,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "aborted" } });
 	});
 
-	it("D13/E04 reports successful compaction separately when archive extraction fails", async () => {
+	it("D13/E04 reports successful compaction separately when archive persistence fails", async () => {
 		const h = await createHarness({
 			tools: [],
 			settings: { memory: { enabled: true }, compaction: { keepRecentTokens: 1 } },
@@ -419,13 +240,15 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		harnesses.push(h);
 		await h.session.prompt("first");
 		await h.session.prompt("second");
-		vi.spyOn(h.session.memoryStore, "maybeConsolidate").mockRejectedValue(new Error("simulated archive failure"));
-		await compactOnce(h.session as unknown as CompactionInternals);
+		vi.spyOn(h.session.memoryStore, "writeSessionNote").mockImplementation(() => {
+			throw new Error("simulated archive failure");
+		});
+		await h.session.compact();
 		expect(h.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			aborted: false,
 			result: { summary: "Durable project convention" },
 		});
-		expect(h.session.messages[0].role).toBe("compactionSummary");
+		expect(h.session.messages[1].role).toBe("compactionSummary");
 		expect(
 			h.sessionManager
 				.getEntries()
@@ -433,7 +256,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 					(entry) =>
 						entry.type === "trace" &&
 						entry.event.type === "memory/archive" &&
-						entry.event.data.reason === "memory_archive_failed",
+						entry.event.data.reason === "note_write_failed",
 				),
 		).toBe(true);
 	});

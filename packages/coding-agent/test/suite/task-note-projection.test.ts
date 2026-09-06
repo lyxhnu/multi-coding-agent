@@ -8,10 +8,7 @@ import {
 	fauxToolCall,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import {
-	createContextRolloverCheckpointEnvelope,
-	fingerprintContextRolloverValue,
-} from "../../src/core/context-rollover.ts";
+
 import { classifyToolEffect, decideToolPermission } from "../../src/core/permissions/policy.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import {
@@ -20,7 +17,6 @@ import {
 	buildTaskNoteProjectionFromBranch,
 	createTaskNoteEventId,
 	createTaskNoteFreshnessResolver,
-	createTaskScopeId,
 	fingerprintTaskNoteWorkspaceContent,
 	resolveTaskNoteScope,
 	type TaskNoteCandidate,
@@ -80,6 +76,61 @@ describe("TaskNoteProjection", () => {
 		]);
 	});
 
+	it("retracts only the explicitly superseded note", () => {
+		const original = event();
+		const candidate: TaskNoteCandidate = {
+			operation: "retract",
+			kind: original.kind,
+			key: original.key,
+			sourceRefs: original.sourceRefs,
+			supersedesEventId: original.eventId,
+		};
+		const retraction: TaskNoteEvent = {
+			version: 1,
+			eventId: createTaskNoteEventId(scope, { type: "model_tool", toolCallId: "call-retract" }, candidate),
+			operation: "retract",
+			scope,
+			createdInContextEpoch: 4,
+			kind: original.kind,
+			key: original.key,
+			sourceRefs: original.sourceRefs,
+			evidence: [],
+			supersedesEventId: original.eventId,
+			source: { type: "model_tool", toolCallId: "call-retract" },
+		};
+		const projection = buildTaskNoteProjection({ events: [original, retraction], scope });
+		expect(projection.status === "valid" ? projection.snapshot.items : undefined).toEqual([]);
+	});
+
+	it("keeps independent state identities active at the same time", () => {
+		const evidence = {
+			reference: { entryId: "user-1" },
+			evidenceKind: "user_confirmation" as const,
+			subjectId: "user-1",
+			inputFingerprint: "requirement-v1",
+			resultFingerprint: "confirmed",
+			observedAtEntryId: "user-1",
+			outcome: "succeeded" as const,
+		};
+		const first = event({
+			kind: "state",
+			key: "implementation.core",
+			text: "Core is complete.",
+			evidence: [evidence],
+		});
+		const second = event({
+			kind: "state",
+			key: "implementation.cli",
+			text: "CLI is complete.",
+			evidence: [evidence],
+		});
+		const projection = buildTaskNoteProjection({ events: [first, second], scope });
+		expect(projection.status === "valid" ? projection.snapshot.items.map((item) => item.key) : undefined).toEqual([
+			"implementation.core",
+			"implementation.cli",
+		]);
+	});
+
 	it("accepts a user-sourced constraint and rejects assistant-only authority", () => {
 		const user = {
 			type: "message" as const,
@@ -136,6 +187,44 @@ describe("TaskNoteProjection", () => {
 		});
 	});
 
+	it("requires and preserves the structured resume contract for next_action/current", () => {
+		const user = {
+			type: "message" as const,
+			id: "user-resume",
+			parentId: null,
+			timestamp: "2026-09-04T00:00:00.000Z",
+			message: { role: "user" as const, content: "Continue the implementation.", timestamp: 1 },
+		};
+		const empty = buildTaskNoteProjection({ events: [], scope });
+		if (empty.status !== "valid") throw new Error("Expected a valid projection");
+		const context = {
+			scope,
+			contextEpoch: 4,
+			source: { type: "model_tool" as const, toolCallId: "call-resume" },
+			branch: [user],
+			projection: empty.snapshot,
+		};
+		const base = {
+			operation: "upsert" as const,
+			kind: "next_action" as const,
+			key: "current",
+			text: "Read the requirement and continue the implementation.",
+			sourceRefs: [{ entryId: user.id }],
+			evidenceRefs: [],
+		};
+		expect(acceptTaskNoteCandidate(base, context)).toEqual({ status: "rejected", reason: "invalid_output" });
+		const resume = {
+			relatedNotes: [],
+			requiredHistoryRefs: [],
+			requirementSourceRefs: [{ entryId: user.id }],
+			todoIds: [],
+		};
+		const accepted = acceptTaskNoteCandidate({ ...base, resume }, context);
+		if (accepted.status !== "accepted") throw new Error("Expected the continuation contract to be accepted");
+		const projection = buildTaskNoteProjection({ events: [accepted.event], scope });
+		expect(projection.status === "valid" ? projection.snapshot.items[0].resume : undefined).toEqual(resume);
+	});
+
 	it("persists a context_note as session metadata without echoing its text", async () => {
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.appendCustomEntry("context-prompt-generation", { promptGeneration: 1, contextEpoch: 0 });
@@ -184,60 +273,6 @@ describe("TaskNoteProjection", () => {
 		expect(JSON.stringify(traceEvents)).not.toContain("Never preserve backward compatibility.");
 	});
 
-	it("accepts checkpoint candidates into the same atomic envelope", () => {
-		const sessionManager = SessionManager.inMemory();
-		const userEntryId = sessionManager.appendMessage({ role: "user", content: "Keep the API small.", timestamp: 1 });
-		const branch = sessionManager.getBranch();
-		const checkpointScope = { taskScopeId: createTaskScopeId(userEntryId), promptGeneration: 0 };
-		const projection = buildTaskNoteProjection({ events: [], scope: checkpointScope });
-		if (projection.status !== "valid") throw new Error("Expected a valid projection");
-
-		const envelope = createContextRolloverCheckpointEnvelope({
-			checkpointId: "checkpoint-1",
-			promptGeneration: 0,
-			contextEpoch: 2,
-			branch,
-			coveredStartEntryId: userEntryId,
-			coveredEndEntryId: userEntryId,
-			output: {
-				checkpoint: {
-					version: 1,
-					objective: { text: "Keep the API small.", sourceEntryIds: [userEntryId] },
-					userConstraints: [],
-					acceptanceCriteria: { status: "not_specified", items: [] },
-					decisions: [],
-					completedWork: [],
-					currentState: { text: "Design is pending.", evidenceEntryIds: [userEntryId] },
-					failedAttempts: [],
-					nextAction: { text: "Implement the projection.", evidenceEntryIds: [] },
-					historyRefs: [],
-				},
-				noteUpdateCandidates: [
-					{
-						operation: "upsert",
-						kind: "constraint",
-						key: "api.surface",
-						text: "Keep the API small.",
-						sourceRefs: [{ entryId: userEntryId }],
-						evidenceRefs: [],
-					},
-				],
-			},
-			taskNoteScope: checkpointScope,
-			taskNoteProjection: projection.snapshot,
-			taskNoteEvents: [],
-			todoStateEntryId: null,
-			todoStateFingerprint: fingerprintContextRolloverValue([]),
-			requestConfigFingerprint: "config",
-		});
-
-		expect(envelope.taskNoteBatch.events).toHaveLength(1);
-		expect(envelope.taskNoteBatch.events[0]).toMatchObject({
-			createdInContextEpoch: 2,
-			source: { type: "checkpoint", checkpointId: "checkpoint-1", candidateIndex: 0 },
-		});
-	});
-
 	it("marks evidence stale only when the same subject input changes", () => {
 		const sessionManager = SessionManager.inMemory();
 		const userEntryId = sessionManager.appendMessage({ role: "user", content: "Verify auth.", timestamp: 1 });
@@ -276,7 +311,6 @@ describe("TaskNoteProjection", () => {
 				source: { type: "model_tool", toolCallId: "call-state" },
 				branch,
 				projection: empty.snapshot,
-				eventCount: 0,
 			},
 		);
 		if (accepted.status !== "accepted") throw new Error("Expected an accepted note");
@@ -294,7 +328,7 @@ describe("TaskNoteProjection", () => {
 			scope,
 			resolveFreshness: createTaskNoteFreshnessResolver(currentBranch),
 		});
-		expect(projection.status === "valid" ? projection.snapshot.items[0].freshness : undefined).toBe("fresh");
+		expect(projection.status === "valid" ? projection.snapshot.items[0].freshness : undefined).toBe("unknown");
 		sessionManager.appendContextProgress({
 			evidenceId: "effect-2",
 			evidenceKind: "non_read_effect",
@@ -325,7 +359,7 @@ describe("TaskNoteProjection", () => {
 		}
 	});
 
-	it("exposes persisted entry IDs to the model without persisting the reference catalog", async () => {
+	it("keeps the reference catalog out of the default request", async () => {
 		const harness = await createHarness();
 		try {
 			let providerMessages = "";
@@ -349,8 +383,8 @@ describe("TaskNoteProjection", () => {
 			const userEntry = branch.find((entry) => entry.type === "message" && entry.message.role === "user");
 			if (userEntry === undefined) throw new Error("Expected a persisted user entry");
 
-			expect(providerMessages).toContain("Task Note reference catalog");
-			expect(providerMessages).toContain(userEntry.id);
+			expect(providerMessages).not.toContain("Task Note reference catalog");
+			expect(providerMessages).not.toContain(userEntry.id);
 			expect(
 				branch.some(
 					(entry) => entry.type === "custom_message" && entry.customType === "task-note-reference-catalog",

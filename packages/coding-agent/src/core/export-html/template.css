@@ -363,6 +363,23 @@
     .assistant-message {
       padding: 0;
       position: relative;
+      border-left: 3px solid var(--success);
+      background: color-mix(in srgb, var(--container-bg) 72%, transparent);
+      border-radius: 4px;
+    }
+
+    .message-role {
+      padding: 8px var(--line-height) 0;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    .user-role {
+      color: var(--accent);
+    }
+
+    .llm-role {
+      color: var(--success);
     }
 
     /* Copy link button - appears on hover */
@@ -388,7 +405,9 @@
 
     .user-message:hover .copy-link-btn,
     .assistant-message:hover .copy-link-btn,
-    .skill-user-entry:hover .copy-link-btn {
+    .skill-user-entry:hover .copy-link-btn,
+    .context-operation-card:hover .copy-link-btn,
+    .context-rollover-card:hover .copy-link-btn {
       opacity: 1;
     }
 
@@ -789,6 +808,79 @@
     .hook-type {
       color: var(--customMessageLabel);
       font-weight: bold;
+    }
+
+    .context-operation-card,
+    .context-rollover-card {
+      position: relative;
+      background: var(--customMessageBg);
+      color: var(--customMessageText);
+      border: 1px solid var(--dim);
+      border-radius: 4px;
+      padding: var(--line-height);
+    }
+
+    .context-rollover-card {
+      border-left: 4px solid var(--borderAccent);
+    }
+
+    .context-card-title,
+    .context-section-title,
+    .context-note-heading {
+      color: var(--customMessageLabel);
+      font-weight: bold;
+    }
+
+    .context-section-title {
+      margin-top: var(--line-height);
+      margin-bottom: 4px;
+    }
+
+    .context-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 16px;
+      color: var(--dim);
+      font-size: 11px;
+    }
+
+    .context-facts-grid > span {
+      flex: 1 1 320px;
+    }
+
+    .context-note-body,
+    .context-recovery-page {
+      background: var(--body-bg);
+      border: 1px solid var(--dim);
+      border-radius: 3px;
+      padding: 10px;
+      margin-top: 8px;
+    }
+
+    .context-note-body pre,
+    .context-read-item pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      margin-top: 8px;
+      font-family: inherit;
+    }
+
+    .context-note-refs,
+    .context-empty,
+    .context-recovery-result,
+    .context-first-business {
+      color: var(--dim);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+
+    .context-note-refs,
+    .context-first-business {
+      margin-top: 8px;
+    }
+
+    .context-read-item + .context-read-item {
+      margin-top: 8px;
     }
 
     /* Skill invocation - matches compaction style (clickable, collapsed by default) */

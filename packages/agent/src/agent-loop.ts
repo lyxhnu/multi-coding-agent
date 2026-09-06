@@ -354,6 +354,42 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
+			preparedRequest ??= await prepareAgentRequest(currentContext, config, signal);
+			const control = config.controlRequest?.(preparedRequest.budget, preparedRequest.requestFingerprint);
+			if (control?.type === "context_transition") {
+				await emit({ type: "context_budget", budget: preparedRequest.budget });
+				await emit({ type: "agent_end", messages: newMessages, outcome: { type: "context_transition" } });
+				return;
+			}
+			if (control?.type === "failed") {
+				await emit({
+					type: "agent_end",
+					messages: newMessages,
+					outcome: { type: "failed", message: control.message },
+				});
+				return;
+			}
+			if (control?.type === "save_state") {
+				await emit({ type: "message_start", message: control.message });
+				await emit({ type: "message_end", message: control.message });
+				currentContext = {
+					...currentContext,
+					messages: [...currentContext.messages, control.message],
+					tools: currentContext.tools?.filter((tool) => control.toolNames.includes(tool.name)),
+				};
+				newMessages.push(control.message);
+				config = { ...config, maxTokens: control.maxTokens };
+				preparedRequest = await prepareAgentRequest(currentContext, config, signal);
+				if (preparedRequest.budget.decision === "context_limit") {
+					await emit({ type: "context_budget", budget: preparedRequest.budget });
+					await emit({
+						type: "agent_end",
+						messages: newMessages,
+						outcome: { type: "failed", message: control.failureMessage },
+					});
+					return;
+				}
+			}
 			// Stream assistant response
 			const message = await streamAssistantResponse(
 				currentContext,
@@ -404,7 +440,7 @@ async function runLoop(
 
 			await emit({ type: "turn_end", message, toolResults });
 
-			const nextTurnContext = {
+			let nextTurnContext = {
 				message,
 				toolResults,
 				context: currentContext,
@@ -416,6 +452,7 @@ async function runLoop(
 				config = {
 					...config,
 					model: nextTurnSnapshot.model ?? config.model,
+					maxTokens: nextTurnSnapshot.maxTokens ?? config.maxTokens,
 					reasoning:
 						nextTurnSnapshot.thinkingLevel === undefined
 							? config.reasoning
@@ -428,6 +465,46 @@ async function runLoop(
 				if (truncationFloor !== undefined) {
 					config = { ...config, reasoning: lowerThinkingLevel(config.reasoning, truncationFloor) };
 				}
+			}
+
+			nextTurnContext = { ...nextTurnContext, context: currentContext };
+			const turnControl = await config.afterTurnControl?.(nextTurnContext);
+			if (turnControl?.type === "context_transition") {
+				await emit({ type: "agent_end", messages: newMessages, outcome: { type: "context_transition" } });
+				return;
+			}
+			if (turnControl?.type === "failed") {
+				await emit({
+					type: "agent_end",
+					messages: newMessages,
+					outcome: { type: "failed", message: turnControl.message },
+				});
+				return;
+			}
+			if (turnControl?.type === "continue") {
+				if (turnControl.update) {
+					currentContext = turnControl.update.context ?? currentContext;
+					config = {
+						...config,
+						model: turnControl.update.model ?? config.model,
+						maxTokens: turnControl.update.maxTokens ?? config.maxTokens,
+						reasoning:
+							turnControl.update.thinkingLevel === undefined
+								? config.reasoning
+								: turnControl.update.thinkingLevel === "off"
+									? undefined
+									: turnControl.update.thinkingLevel,
+					};
+				}
+				for (const controlMessage of turnControl.messages ?? []) {
+					await emit({ type: "message_start", message: controlMessage });
+					await emit({ type: "message_end", message: controlMessage });
+					currentContext.messages.push(controlMessage);
+					newMessages.push(controlMessage);
+				}
+				pendingMessages = (await config.getSteeringMessages?.()) || [];
+				hasMoreToolCalls = true;
+				continue;
 			}
 
 			if (

@@ -345,6 +345,17 @@
             parts.push(entry.customType);
             parts.push(typeof entry.content === 'string' ? entry.content : extractContent(entry.content));
             break;
+          case 'custom':
+            if (entry.customType === 'task-note-event') {
+              parts.push('task note', entry.data?.kind, entry.data?.key, entry.data?.text);
+            }
+            break;
+          case 'context_operation':
+            parts.push('save state', entry.state, entry.outcome);
+            break;
+          case 'context_rollover':
+            parts.push('context rollover', entry.cause, entry.windowId, entry.previousWindowId);
+            break;
           case 'compaction':
             parts.push('compaction');
             break;
@@ -385,7 +396,9 @@
           }
 
           // Apply filter mode
-          const isSettingsEntry = ['label', 'custom', 'model_change', 'thinking_level_change'].includes(entry.type);
+          const isSettingsEntry =
+            ['label', 'model_change', 'thinking_level_change', 'trace', 'tool_result_source', 'context_rollover_dispatch', 'context_window'].includes(entry.type) ||
+            (entry.type === 'custom' && entry.customType !== 'task-note-event');
           let passesFilter = true;
 
           switch (filterMode) {
@@ -649,25 +662,25 @@
               if (skillBlock) {
                 let treeHtml = labelHtml + `<span class="tree-role-skill">skill:</span> ${escapeHtml(skillBlock.name)}`;
                 if (skillBlock.userMessage) {
-                  treeHtml += ` · <span class="tree-role-user">user:</span> ${escapeHtml(truncate(normalize(skillBlock.userMessage)))}`;
+                  treeHtml += ` · <span class="tree-role-user">用户:</span> ${escapeHtml(truncate(normalize(skillBlock.userMessage)))}`;
                 }
                 return treeHtml;
               }
               const content = truncate(normalize(rawContent));
-              return labelHtml + `<span class="tree-role-user">user:</span> ${escapeHtml(content)}`;
+              return labelHtml + `<span class="tree-role-user">用户:</span> ${escapeHtml(content)}`;
             }
             if (msg.role === 'assistant') {
               const textContent = truncate(normalize(extractContent(msg.content)));
               if (textContent) {
-                return labelHtml + `<span class="tree-role-assistant">assistant:</span> ${escapeHtml(textContent)}`;
+                return labelHtml + `<span class="tree-role-assistant">LLM:</span> ${escapeHtml(textContent)}`;
               }
               if (msg.stopReason === 'aborted') {
-                return labelHtml + `<span class="tree-role-assistant">assistant:</span> <span class="tree-muted">(aborted)</span>`;
+                return labelHtml + `<span class="tree-role-assistant">LLM:</span> <span class="tree-muted">(aborted)</span>`;
               }
               if (msg.errorMessage) {
-                return labelHtml + `<span class="tree-role-assistant">assistant:</span> <span class="tree-error">${escapeHtml(truncate(msg.errorMessage))}</span>`;
+                return labelHtml + `<span class="tree-role-assistant">LLM:</span> <span class="tree-error">${escapeHtml(truncate(msg.errorMessage))}</span>`;
               }
-              return labelHtml + `<span class="tree-role-assistant">assistant:</span> <span class="tree-muted">(no text)</span>`;
+              return labelHtml + `<span class="tree-role-assistant">LLM:</span> <span class="tree-muted">(no text)</span>`;
             }
             if (msg.role === 'toolResult') {
               const toolCall = msg.toolCallId ? toolCallMap.get(msg.toolCallId) : null;
@@ -692,6 +705,15 @@
             const content = typeof entry.content === 'string' ? entry.content : extractContent(entry.content);
             return labelHtml + `<span class="tree-custom">[${escapeHtml(entry.customType)}]:</span> ${escapeHtml(truncate(normalize(content)))}`;
           }
+          case 'custom':
+            if (entry.customType === 'task-note-event') {
+              return labelHtml + `<span class="tree-custom">[note ${escapeHtml(entry.data?.operation || 'event')}]:</span> ${escapeHtml(truncate(normalize(entry.data?.text || `${entry.data?.kind || ''}/${entry.data?.key || ''}`)))}`;
+            }
+            return labelHtml + `<span class="tree-muted">[custom: ${escapeHtml(entry.customType)}]</span>`;
+          case 'context_operation':
+            return labelHtml + `<span class="tree-compaction">[save_state ${escapeHtml(entry.state)}]</span>`;
+          case 'context_rollover':
+            return labelHtml + `<span class="tree-compaction">[window switch ${escapeHtml(entry.previousWindowId || '?')} → ${escapeHtml(entry.windowId)}]</span>`;
           case 'model_change':
             return labelHtml + `<span class="tree-muted">[model: ${escapeHtml(entry.modelId)}]</span>`;
           case 'thinking_level_change':
@@ -1171,6 +1193,136 @@
         </button>`;
       }
 
+      function contextWindowAt(path, index) {
+        for (let cursor = index; cursor >= 0; cursor--) {
+          const candidate = path[cursor];
+          if (candidate.type === 'context_window' || candidate.type === 'context_rollover' || candidate.type === 'compaction') {
+            return candidate.windowId;
+          }
+        }
+        return null;
+      }
+
+      function taskNoteEvent(path, rolloverIndex, eventId) {
+        for (let cursor = rolloverIndex - 1; cursor >= 0; cursor--) {
+          const candidate = path[cursor];
+          if (candidate.type === 'custom' && candidate.customType === 'task-note-event' && candidate.data?.eventId === eventId) {
+            return { entry: candidate, sourceWindowId: contextWindowAt(path, cursor) };
+          }
+        }
+        return null;
+      }
+
+      function renderNoteBody(note, freshness) {
+        const data = note.entry.data || {};
+        const identity = `${data.kind || 'unknown'}/${data.key || 'unknown'}`;
+        const sources = Array.isArray(data.sourceRefs) ? data.sourceRefs : [];
+        return `<div class="context-note-body">
+          <div class="context-note-heading">${escapeHtml(identity)}</div>
+          <div class="context-facts">
+            <span>eventId: ${escapeHtml(data.eventId || note.entry.id)}</span>
+            <span>source window: ${escapeHtml(note.sourceWindowId || 'unknown')}</span>
+            <span>freshness at save: ${escapeHtml(freshness || 'unknown')}</span>
+            <span>supersedes: ${escapeHtml(data.supersedesEventId || 'none')}</span>
+          </div>
+          <pre>${escapeHtml(data.text || '(retraction: no body)')}</pre>
+          <div class="context-note-refs">sourceRefs: ${escapeHtml(JSON.stringify(sources))}</div>
+        </div>`;
+      }
+
+      function renderRecoveryPage(record) {
+        const page = record.page;
+        const items = Array.isArray(page.items) ? page.items : [];
+        const itemHtml = items.length === 0
+          ? '<div class="context-empty">empty page</div>'
+          : items.map(item => {
+              const target = item.eventId || item.entryId || 'unknown';
+              const selector = item.todoId ? `todo ${item.todoId}` : item.blockIndex === undefined ? '' : ` block ${item.blockIndex}`;
+              const range = [item.offset, item.end, item.total].every(value => typeof value === 'number')
+                ? `${item.offset}..${item.end} / ${item.total}`
+                : 'metadata only';
+              return `<div class="context-read-item">
+                <div><strong>${escapeHtml(target + selector)}</strong> · ${escapeHtml(range)}</div>
+                ${typeof item.text === 'string' ? `<pre>${escapeHtml(item.text)}</pre>` : ''}
+              </div>`;
+            }).join('');
+        return `<div class="context-recovery-page">
+          <div><strong>${escapeHtml(page.source)}</strong> · revision ${escapeHtml(page.revision || 'n/a')} · request turn ${escapeHtml(record.turn)} · call ${escapeHtml(record.toolCallId)}</div>
+          ${itemHtml}
+          <div class="context-note-refs">${page.exhausted ? 'complete page sequence' : `next cursor: ${escapeHtml(page.cursor || 'missing')}`}</div>
+        </div>`;
+      }
+
+      function renderContextRollover(entry, entryDomId, copyBtnHtml, tsHtml) {
+        const path = getPath(currentLeafId);
+        const index = path.findIndex(candidate => candidate.id === entry.id);
+        const recovery = entry.recovery || {};
+        const operation = path.slice(0, Math.max(0, index)).reverse().find(candidate =>
+          candidate.type === 'context_operation' && candidate.operationId === recovery.saveStateOperationId && candidate.state === 'finished'
+        );
+        const freshness = new Map((recovery.noteFreshness || []).map(item => [item.eventId, item.freshness]));
+        const noteIds = [recovery.nextActionEventId, ...(recovery.relatedNoteEventIds || [])].filter(Boolean);
+        const notes = noteIds.map(eventId => taskNoteEvent(path, index, eventId)).filter(Boolean);
+
+        let end = path.length;
+        for (let cursor = index + 1; cursor < path.length; cursor++) {
+          if (path[cursor].type === 'context_rollover') {
+            end = cursor;
+            break;
+          }
+        }
+        const recoverySegment = path.slice(index + 1, end);
+        const recoveryEvents = entries.filter(candidate =>
+          candidate.type === 'trace' &&
+          candidate.event?.type === 'context/recovery' &&
+          candidate.event.data.rolloverId === entry.rolloverId
+        );
+        const pages = recoveryEvents.flatMap(candidate =>
+          (candidate.event.data.pages || []).map(record => ({ ...record, turn: candidate.event.data.turn }))
+        );
+        const completionIndex = recoverySegment.findIndex(candidate =>
+          candidate.type === 'custom_message' &&
+          candidate.customType === 'context-recovery-complete' &&
+          candidate.details?.rolloverId === entry.rolloverId
+        );
+        const afterCompletion = completionIndex < 0 ? [] : recoverySegment.slice(completionIndex + 1);
+        const firstBusiness = afterCompletion.find(candidate => {
+          if (candidate.type !== 'message' || candidate.message.role !== 'assistant') return false;
+          return candidate.message.content.some(block =>
+            block.type === 'text' || (block.type === 'toolCall' && !['history', 'context_note', 'get_context_remaining'].includes(block.name))
+          );
+        });
+        const firstBusinessText = firstBusiness?.type === 'message'
+          ? firstBusiness.message.content.flatMap(block => block.type === 'text'
+              ? [block.text]
+              : block.type === 'toolCall' ? [`tool: ${formatToolCall(block.name, block.arguments)}`] : []).join('\n')
+          : '';
+        const readCharacters = pages.reduce((total, record) => total + (Array.isArray(record.page.items)
+          ? record.page.items.reduce((sum, item) => sum + (typeof item.end === 'number' && typeof item.offset === 'number' ? Math.max(0, item.end - item.offset) : 0), 0)
+          : 0), 0);
+
+        return `<div class="context-rollover-card" id="${entryDomId}">${copyBtnHtml}${tsHtml}
+          <div class="context-card-title">Context window switch</div>
+          <div class="context-facts context-facts-grid">
+            <span>cause: ${escapeHtml(entry.cause)}</span>
+            <span>configured window: ${escapeHtml(entry.configuredContextWindow || 'unknown')} tokens</span>
+            <span>final old request: ${escapeHtml(entry.sourceTokens)} tokens</span>
+            <span>prepared recovery request: ${escapeHtml(entry.preparedTokens)} tokens</span>
+            <span>old window: ${escapeHtml(entry.previousWindowId || 'unknown')}</span>
+            <span>new window: ${escapeHtml(entry.windowId)}</span>
+            <span>save budget: ${escapeHtml(operation ? `${operation.consumedControlTokens}/${operation.controlBudgetTokens} control, ${operation.consumedOutputTokens}/${operation.outputBudgetTokens} output, ${operation.samplesUsed} samples` : 'unavailable')}</span>
+            <span>provider-visible recovery: ${escapeHtml(`${recoveryEvents.length} requests, ${pages.length} pages, ${readCharacters} characters`)}</span>
+          </div>
+          <div class="context-section-title">Saved continuation Notes (original bodies)</div>
+          ${notes.length > 0 ? notes.map(note => renderNoteBody(note, freshness.get(note.entry.data?.eventId))).join('') : '<div class="context-empty">本次没有保存 Note</div>'}
+          <div class="context-section-title">Pages actually read in the new window</div>
+          ${pages.length > 0 ? pages.map(renderRecoveryPage).join('') : '<div class="context-empty">No provider-visible recovery page recorded.</div>'}
+          <div class="context-section-title">Recovery result</div>
+          <div class="context-recovery-result">${completionIndex >= 0 ? 'Recovery completed and business tools were unlocked.' : 'Interrupted before recovery completion.'}</div>
+          <div class="context-first-business"><strong>First business action:</strong> ${escapeHtml(firstBusinessText || 'not recorded')}</div>
+        </div>`;
+      }
+
       function renderEntry(entry) {
         const ts = formatTimestamp(entry.timestamp);
         const tsHtml = ts ? `<div class="message-timestamp">${ts}</div>` : '';
@@ -1201,7 +1353,7 @@
 
               // User message (separate block if present)
               if (hasUserContent) {
-                html += '<div class="user-message">';
+                html += '<div class="user-message"><div class="message-role user-role">用户</div>';
                 if (images.length > 0) {
                   html += '<div class="message-images">';
                   for (const img of images) {
@@ -1220,7 +1372,7 @@
             }
 
             // No skill block - normal user message
-            let html = `<div class="user-message" id="${entryDomId}">${copyBtnHtml}${tsHtml}`;
+            let html = `<div class="user-message" id="${entryDomId}">${copyBtnHtml}${tsHtml}<div class="message-role user-role">用户</div>`;
 
             if (Array.isArray(content)) {
               const images = content.filter(c => c.type === 'image');
@@ -1241,7 +1393,7 @@
           }
 
           if (msg.role === 'assistant') {
-            let html = `<div class="assistant-message" id="${entryDomId}">${copyBtnHtml}${tsHtml}`;
+            let html = `<div class="assistant-message" id="${entryDomId}">${copyBtnHtml}${tsHtml}<div class="message-role llm-role">LLM</div>`;
 
             for (const block of msg.content) {
               if (block.type === 'text' && block.text.trim()) {
@@ -1291,6 +1443,34 @@
           return `<div class="model-change" id="${entryDomId}">${tsHtml}Switched to model: <span class="model-name">${escapeHtml(entry.provider)}/${escapeHtml(entry.modelId)}</span></div>`;
         }
 
+        if (entry.type === 'custom' && entry.customType === 'task-note-event') {
+          const path = getPath(currentLeafId);
+          const index = path.findIndex(candidate => candidate.id === entry.id);
+          return `<div class="context-operation-card" id="${entryDomId}">${copyBtnHtml}${tsHtml}
+            <div class="context-card-title">Task Note ${escapeHtml(entry.data?.operation || 'event')}</div>
+            ${renderNoteBody({ entry, sourceWindowId: contextWindowAt(path, index) }, 'recorded at rollover')}
+          </div>`;
+        }
+
+        if (entry.type === 'context_operation') {
+          return `<div class="context-operation-card" id="${entryDomId}">${copyBtnHtml}${tsHtml}
+            <div class="context-card-title">save_state ${escapeHtml(entry.state)}</div>
+            <div class="context-facts context-facts-grid">
+              <span>operation: ${escapeHtml(entry.operationId)}</span>
+              <span>window: ${escapeHtml(entry.windowId)}</span>
+              <span>cutoff: ${escapeHtml(entry.businessCutoffEntryId)}</span>
+              <span>samples: ${escapeHtml(entry.samplesUsed)}</span>
+              <span>control: ${escapeHtml(`${entry.consumedControlTokens}/${entry.controlBudgetTokens}`)} tokens</span>
+              <span>output: ${escapeHtml(`${entry.consumedOutputTokens}/${entry.outputBudgetTokens}`)} tokens</span>
+              <span>result: ${escapeHtml(entry.outcome || entry.state)}</span>
+            </div>
+          </div>`;
+        }
+
+        if (entry.type === 'context_rollover') {
+          return renderContextRollover(entry, entryDomId, copyBtnHtml, tsHtml);
+        }
+
         if (entry.type === 'compaction') {
           return `<div class="compaction" id="${entryDomId}" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
             <div class="compaction-label">[compaction]</div>
@@ -1306,7 +1486,7 @@
           </div>`;
         }
 
-        if (entry.type === 'custom_message' && entry.display) {
+        if (entry.type === 'custom_message' && (entry.display || entry.customType === 'context-recovery-complete')) {
           return `<div class="hook-message" id="${entryDomId}">${tsHtml}
             <div class="hook-type">[${escapeHtml(entry.customType)}]</div>
             <div class="markdown-content">${safeMarkedParse(typeof entry.content === 'string' ? entry.content : JSON.stringify(entry.content))}</div>
@@ -1473,7 +1653,7 @@
 
       function renderEntryToNode(entry) {
         // Check cache first
-        if (entryCache.has(entry.id)) {
+        if (entry.type !== 'context_rollover' && entryCache.has(entry.id)) {
           return entryCache.get(entry.id).cloneNode(true);
         }
 
@@ -1486,7 +1666,7 @@
         const node = template.content.firstElementChild;
 
         // Cache the node
-        if (node) {
+        if (node && entry.type !== 'context_rollover') {
           entryCache.set(entry.id, node.cloneNode(true));
         }
         return node;

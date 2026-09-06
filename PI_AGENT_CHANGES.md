@@ -18,10 +18,10 @@
 ## 目录
 
 1. [Length 截断恢复](#1-length-截断恢复)
-2. [每轮上下文守卫](#2-每轮上下文守卫)
+2. [最终请求预算与自动触发](#2-最终请求预算与自动触发)
 3. [Shake 机械式缩减](#3-shake-机械式缩减)
-4. [压缩流程的两个缺陷](#4-压缩流程的两个缺陷)
-5. [两阶段提前压缩](#5-两阶段提前压缩)
+4. [完整工具结果与有界投影](#4-完整工具结果与有界投影)
+5. [状态保存、换窗与恢复](#5-状态保存换窗与恢复)
 6. [Append-Only Context 与 StablePrefix](#6-append-only-context-与-stableprefix)
 7. [记忆系统](#7-记忆系统)
 8. [安全执行](#8-安全执行)
@@ -39,10 +39,10 @@
 | # | 改造 | 性质 | 关键指标 |
 |---|---|---|---|
 | 1 | Length 截断恢复 + thinking 降档 | 缺陷修复 | 9/40 静默 0 分任务被救回 |
-| 2 | 每轮上下文守卫 | 能力新增 | 上下文破 95% 任务 3 → 1 |
+| 2 | 最终请求预算与自动触发 | 能力新增 | provider 调用前统一检查实际请求 |
 | 3 | Shake 零模型缩减 | 能力新增 | 单次释放约 2 万 token，0 模型调用 |
-| 4 | 压缩判据统一 + 缩减后续跑 | 严重回归修复 | 掐断任务 13 → 0，中途停止 10 → 0 |
-| 5 | 两阶段提前压缩 | 能力新增 | 压缩延迟摊薄 |
+| 4 | 完整工具结果与有界投影 | 可靠性修复 | 原文单次落盘，provider 批次共享空间 |
+| 5 | 状态保存、换窗与恢复 | 能力新增 | 精确引用、恢复门禁与崩溃幂等 |
 | 6 | Append-Only / StablePrefix | 能力新增 | 降低 prompt cache 失效 |
 | 7 | 记忆向量检索 + 三层降级 | 能力新增 | 语义召回 + 长期膨胀控制 |
 | 8 | 命令风险分析 + OS 沙箱 | 缺陷修复 + 能力新增 | 权限误拦截 491 → 0 |
@@ -161,82 +161,23 @@ if (truncationFloor !== undefined) {
 
 ---
 
-## 2. 每轮上下文守卫
+## 2. 最终请求预算与自动触发
 
 ### 2.1 原来的问题
 
-`_checkCompaction` 挂在 `_handlePostAgentRun`，只在 `agent.prompt()` 整体返回后执行。源码注释自陈：`// Track assistant message for auto-compaction (checked on agent_end)`。
-
-但一个 prompt 常跑几十轮工具调用。实测数据：
-
-| 任务 | 轮数 | 上下文峰值 | 压缩次数 |
-|---|---|---|---|
-| make-doom-for-mips | 82 | 127049（**97%**） | **0** |
-| chess-best-move | 34 | 126986（**97%**） | **0** |
-| gcode-to-text | 43 | 127003（**97%**） | **0** |
-
-85% 阈值不是配错，是**根本没机会被读到**。
-
-更隐蔽的是第二种撑爆方式：`torch-pipeline` 撞 `output=16386` 时 `total` 仅 18396（占窗口 14%），瓶颈纯粹是输出预算被 `maxTokens` 预留挤没了，按百分比看永远发现不了。
+只读取上一轮 usage 或在整个 prompt 结束后检查容量，无法覆盖 transform、工具 schema、队列交付、append-only 重建和本轮完整工具结果。守卫可能过早停止，也可能把实际超限请求交给 provider。
 
 ### 2.2 怎么改的
 
-**（a）暴露既有钩子** — [`packages/agent/src/agent.ts`](packages/agent/src/agent.ts)
+`packages/agent/src/agent-loop.ts` 的 `prepareAgentRequest()` 在所有上下文转换完成后计算同一份 `ContextBudget`。输入、当前请求输出预留和安全余量必须落在模型窗口内。`Agent.controlRequest` 在 provider 调用前消费该结果；`afterTurnControl` 只在完整 assistant/tool-result 批次结束后推进控制状态。
 
-`shouldStopAfterTurn` 早已在 `types.ts` 定义、`agent-loop.ts` 调用，注释原文是 *"request a graceful stop after the current turn, e.g. before context gets too full"* —— 设计意图完全对应，但 `agent.ts` 从未把它暴露出来。补齐 `AgentOptions` 字段、公共属性、构造赋值、`createLoopConfig` 传递四处。
-
-**（b）双门槛判据** — [`compaction-policy.ts`](packages/coding-agent/src/core/compaction/compaction-policy.ts)
-
-```ts
-export function needsRoomForOutput(usedTokens, contextWindow, maxTokens, policy): boolean {
-    if (contextWindow <= 0) return false;
-    if (shouldAutoCompact(usedTokens, contextWindow, policy)) return true;  // 门槛A
-    if (maxTokens <= 0) return false;
-    const free = contextWindow - usedTokens;
-    return free < outputHeadroomTokens(maxTokens) * OUTPUT_HEADROOM_FACTOR;  // 门槛B
-}
-```
-
-| 常量 | 值 | 含义 |
-|---|---|---|
-| `autoCompactThresholdPercent` | 85 | 门槛A：历史堆积比例 |
-| `OUTPUT_HEADROOM_FACTOR` | 1.2 | 预留安全系数（provider 记账与本地估算有偏差） |
-| `OUTPUT_HEADROOM_MAX_TOKENS` | 32768 | 预留上限 |
-
-**门槛 B 是本次改造的核心洞察**：真正决定能否说完话的不是「历史占了多少百分比」，而是「剩余空间够不够装下一次输出」。
-
-**（c）预留封顶的必要性**
-
-后来把 provider `maxTokens` 提到 65536 以解决截断。如果预留跟着放大：
-
-```text
-65536 × 1.2 = 78643
-131072 - 78643 = 52429
-```
-
-上下文才到约 40% 就会触发压缩，把正常任务过早打断。所以给预留封顶 32768，**把输出能力和守卫敏感度解耦**。
-
-**（d）守卫实现** — [`agent-session.ts`](packages/coding-agent/src/core/agent-session.ts) `_installContextGuard()`
-
-```text
-compaction 未启用             → false
-stopReason 为 aborted/error   → false（用量不可信，且 error 归重试路径管）
-无 usage                      → false
-未越过 needsRoomForOutput     → false
-mid-prompt 压缩预算已用尽     → 置 _pendingRescueShake，返回 true
-否则                          → _midPromptCompactions++，返回 true
-```
-
-`MAX_MID_PROMPT_COMPACTIONS = 3`，每个 prompt 开始时在 `_runAgentPrompt` 重置。
-
-**为什么不在循环内直接压缩**：压缩要调模型并重写上下文，在运行中的 turn 底下做不安全。而且循环读的是 `state.messages` 的**副本**（`Agent.createContextSnapshot`），中途改历史够不到正在飞行的轮次。改为「优雅停止 → 已有链路压缩 → continue」，完全复用跑通的路径。
+`packages/coding-agent/src/core/agent-session.ts` 将 `model_requested`、`work_budget_reached` 和 `provider_context_rejected` 收敛到同一条 save_state → rollover 链路。`compaction.enabled=false` 只关闭自动触发，不关闭硬容量检查。显式 `/compact` 继续是独立的手动摘要操作。
 
 ### 2.3 对 agent 的帮助
 
-压缩从「只在下班时才来的保洁」变成「每轮巡检」。上下文冲破 95% 的任务从 3 个降到 1 个。
+任何实际请求都在发送前得到结构化的 fits、work threshold 或 context_limit 结论。超限不再伪报完成；进入容量维护后也不会执行未获准的业务工具。
 
 ---
-
 ## 3. Shake 机械式缩减
 
 ### 3.1 原来的问题
@@ -279,123 +220,27 @@ mid-prompt 压缩预算已用尽     → 置 _pendingRescueShake，返回 true
 
 ---
 
-## 4. 压缩流程的两个缺陷
+## 4. 完整工具结果与有界投影
 
-这两个都是改造过程中**自己引入**的回归，也是最有价值的排查产出。
+工具和 result hook 完成后，`tool_result_source` 先保存完整 terminal result，再生成发给模型的有界投影。一个 assistant 批次共享投影空间，每个 `toolCallId` 都保留 terminal result；被截出的文本带原始 entryId、范围和 `history.read_item` 分页提示。History 从权威 source 读取正文及 details，重启不会把完整大结果重新注入工作上下文。
 
-### 4.1 Bug A：守卫拉了刹车，维修工说车没坏
-
-**现象**
-
-两处判据不一致：
-
-| 位置 | 判据 |
-|---|---|
-| `_installContextGuard`（决定停不停） | 门槛A **或** 门槛B |
-| `_checkCompaction`（决定压不压） | **只有**门槛A |
-
-`dna-assembly` 的实证：
-
-```text
-turn14  total=98363 (75%)  free=32709 < 39321
-  → 守卫：门槛B 成立 → return true（停循环）
-  → _checkCompaction：75% < 85% → 判定不压缩
-  → 无其他继续条件 → run 结束
-```
-
-模型末轮 `stopReason=toolUse`，还在发工具调用，被凭空掐断。
-
-**影响量化**
-
-**13 个任务死于此，通过率 1/13**（全局 48%）。这些任务的 `free` 值分布在 30969~39124，**全部紧贴 39321 边界下方**——这种聚集不可能是偶然。
-
-**为什么两轮评测才发现**：一个被掐断的任务在所有旧硬门指标上都是干净的——不超时、不报错、无权限拦截、无 length。
-
-**修法**
-
-两处统一引用 `needsRoomForOutput`（第 2564-2566 行），并确立不变量：
-
-> **凡守卫停止循环的情形，后续路径必须实际执行一次缩减（shake 或 compaction）。**
-
-同时新增硬门指标：**末轮 `stopReason=toolUse` 且全程零缩减、非超时 = 0**。这是「守卫掐断任务」的唯一信号。
-
-### 4.2 Bug B：进了维修站，修好了却不发车
-
-**现象**
-
-shake 成功后 `_checkCompaction` 返回 `false`，而在 `_handlePostAgentRun` 语义里 `false` 表示「任务结束」。**10 个任务在 shake 成功后仍以 `toolUse` 收尾**。
-
-**修法**
-
-`_checkCompaction` 新增 `continueAfterReduction` 参数，由调用点传入 `msg.stopReason === "toolUse"`：
-
-```ts
-const savedTokens = await this.shake(DEFAULT_SHAKE_CONFIG, "threshold");
-if (savedTokens > 0) {
-    const remaining = Math.max(0, contextTokens - savedTokens);
-    if (!shouldCompact(remaining, ...) && !needsRoomForOutput(remaining, ...)) {
-        return continueAfterReduction;   // 曾经无条件 return false
-    }
-}
-```
-
-**兜底路径**：`_pendingRescueShake` 由守卫在预算耗尽时置位，`_handlePostAgentRun` 消费，用 `RESCUE_SHAKE_CONFIG` 做最后一次缩减。释放为 0 则 fall through，run 按原有方式收敛。
-
-### 4.3 影响面前瞻分析
-
-修复后统计 87 任务的峰值分布：
-
-| 分布 | 数量 |
-|---|---|
-| 峰值低于守卫线（不受影响） | 74 |
-| 峰值在 70%~85%（**新触发缩减**） | **13** |
-| 峰值超过 85% | **0** |
-
-三个结论：
-
-1. 这 13 个**正是被掐断的那 13 个**，名单完全重合——作用面精确覆盖受害者，无附带影响。
-2. 每任务仅 1 轮越线，不会耗尽 `MAX_MID_PROMPT_COMPACTIONS` 预算。
-3. **门槛A（85%）在 87 个任务里从未被触发过**——压缩机制此前形同虚设，正是因为唯一触发条件是一条永远够不到的线。
+保存和恢复阶段的 History/Note 查询也共享一个阶段额度。同批读取调用在执行前获得固定份额，结束后按实际占用结算，避免同步返回让每个并行查询重复取得整份预算。
 
 ---
 
-## 5. 两阶段提前压缩
+## 5. 状态保存、换窗与恢复
 
-### 5.1 原来的问题
+达到工作预算或模型调用 `new_context` 后，当前工具批次先完整结束。一个 source window/promptGeneration 只建立一个持久化 save_state 操作；最多 3 次 sampling、2048 输出 token 和 3072 查询/结果 token，只开放 `history`、`context_note`、`get_context_remaining`、`new_context`。
 
-单次 compaction 要总结整段历史，集中在阈值那一刻做，耗时且可能撞满 300 秒预算。
+完成条件是有效的 `next_action/current`。其 `resume` 明确列出相关 Note、History、用户要求来源和 Todo ID。保存完成后仍会核对新用户事实、Todo、权限、工具配置及来源 revision；变化时在同一操作的剩余额度内重新确认。
 
-### 5.2 怎么改的
+rollover 只保存引用、版本、窗口身份和请求指纹。提交前使用实际转换链预检必读正文、分页开销、完整业务工具定义、正常输出、安全余量和后续保存空间。无法容纳时以 `recovery_workset_too_large` 保留旧窗口。
 
-```text
-上下文 75%（85% - 10% margin）→ 后台预压缩旧前缀（pass 1）
-上下文 85%                    → pass 2 复用摘要作为 customInstructions
-```
+新窗口先以固定 bootstrap 和恢复工具启动。只有当所需 Note、History 与匹配 revision 的 Todo 正文确实出现在最终 provider 请求里，下一请求才开放业务工具。同一批恢复读取后的业务调用仍被阻止；连续 3 次没有覆盖进展会返回 `recovery_no_progress`。
 
-| 符号 / 常量 | 值 | 作用 |
-|---|---|---|
-| `TWO_PASS_PREFIRE_MARGIN_PERCENT` | 10 | prefire 提前量 |
-| `shouldPrefireTwoPass()` | — | 判定处于 `[75%, 85%)` 窗口 |
-| `_maybeStartTwoPassPrefire()` | — | 后台执行 pass 1，fire-and-forget |
-| `wallClockBudgetSecs` | 300 | 单次压缩墙钟预算 |
-| `createWallClockBudgetSignal()` | — | 可组合的超时 AbortSignal，带 `dispose()` 防定时器泄漏 |
-| `compactModel` | undefined | 可指定专用压缩模型 |
-| `strictCompactModel` | false | 解析失败时跳过压缩 vs 静默回退当前模型 |
-
-**有效性校验**：pass 2 只有在 `capturedAtBranchLength === pathEntries.length` 时才复用 pass 1 摘要，否则说明分支已变化，静默降级 single-pass。
-
-**失败开放**：超时重试一次，两次都超时则保留现有上下文，不丢任何消息。
-
-### 5.3 一个曾经的自伤 Bug
-
-为满足 memory flush 而加的 `appendCustomEntry` 会自增 branch 长度，导致 pass 2 永远判定 pass 1 已过期。修法是 append 后重新读取 `getBranch().length`。
-
-### 5.4 对 agent 的帮助
-
-把压缩延迟从集中式改成摊薄式，降低长上下文压缩阻塞主流程的风险。
+保存操作、rollover proposal、队列 reservation 和 dispatch 都写入 Session。已完成的本地保存结果在重启后直接校验；不完整工具事务不重放。prepared dispatch 必须复现相同请求，started 未 finished 保持 `outcome_unknown`。
 
 ---
-
 ## 6. Append-Only Context 与 StablePrefix
 
 ### 6.1 原来的问题
@@ -861,12 +706,12 @@ $HARNESS_PY -m pytest
 
 | 文件 | 改动内容 |
 |---|---|
-| `packages/agent/src/agent-loop.ts` | length 恢复、thinking 降档、truncationFloor |
-| `packages/agent/src/agent.ts` | 暴露 `shouldStopAfterTurn` |
+| `packages/agent/src/agent-loop.ts` | 最终请求预算、完整工具批次控制、length 恢复 |
+| `packages/agent/src/agent.ts` | PreparedContinuation、预算测量、结构化运行结果 |
 | `packages/agent/src/append-only-context.ts` | StablePrefix / AppendOnlyLog / messageDigest |
 | `packages/agent/src/harness/compaction/shake.ts` | shake 算法与三档预设 |
-| `packages/coding-agent/src/core/agent-session.ts` | 上下文守卫、shake 接入、两阶段压缩、判据统一、记忆接线、Todo/Plan 恢复 |
-| `packages/coding-agent/src/core/compaction/compaction-policy.ts` | `needsRoomForOutput`、headroom 常量、prefire 判定、墙钟预算 |
+| `packages/coding-agent/src/core/agent-session.ts` | 保存/恢复控制、最终请求守卫、工具结果投影、记忆与 Todo 接线 |
+| `packages/coding-agent/src/core/context-rollover.ts` | 保存契约校验、恢复工作集预检、CAS 提交与 dispatch |
 | `packages/coding-agent/src/core/tasks/task-manager.ts` | 定时器泄漏修复 |
 | `packages/coding-agent/src/core/sdk.ts` | 默认激活工具集修复 |
 | `packages/coding-agent/src/core/memory/*` | 向量检索、三层降级、MMR、secret filter |
@@ -885,7 +730,7 @@ $HARNESS_PY -m pytest
 | `packages/agent/test/agent-loop.test.ts` | 降档链、truncationFloor、host 每轮重置下仍能下探、上限封顶、计数重置 |
 | `packages/agent/test/append-only-context.test.ts` | 指纹变化检测、消息重写后稳定前缀保留、模型切换 |
 | `packages/agent/test/shake-regions.test.ts` | 区域收集与 redaction 构建 |
-| `test/suite/grok-alignment/mid-prompt-compaction.test.ts` | 双门槛、防抖上限、端到端证明压缩在 prompt 中途发生、shake 后继续 |
+| `test/suite/context-window-memory.test.ts` | 三类触发、状态保存、恢复覆盖、并发、重启与 HTML 导出 |
 | `test/suite/grok-alignment/subagent-task-tool.test.ts` | 注册、深度门控、前后台执行、resume 错误 |
 | `test/suite/grok-alignment/subagent-depth.test.ts` | 深度不变量与物理移除 |
 | `test/suite/grok-alignment/subagent-sandbox-binding.test.ts` | 子代理沙箱边界 |

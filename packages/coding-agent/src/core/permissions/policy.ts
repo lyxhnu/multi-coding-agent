@@ -13,9 +13,10 @@ const READ_ONLY_TOOLS = new Set([
 	"memory_search",
 	"memory_get",
 	"get_task_output",
-	"history_get",
+	"history",
+	"get_context_remaining",
 ]);
-const SESSION_TOOLS = new Set(["todo_write", "context_note", "enter_plan_mode", "exit_plan_mode"]);
+const SESSION_TOOLS = new Set(["todo_write", "context_note", "new_context", "enter_plan_mode", "exit_plan_mode"]);
 
 /** Tools that write files. Gated by mode (see `decideToolPermission`). */
 const WRITE_TOOLS = new Set(["edit", "write"]);

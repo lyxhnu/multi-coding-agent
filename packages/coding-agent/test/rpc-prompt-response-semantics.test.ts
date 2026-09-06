@@ -202,6 +202,7 @@ describe("RPC prompt response semantics", () => {
 					expect.objectContaining({
 						id: "running-state",
 						data: expect.objectContaining({
+							windowId: runHost.session.contextRolloverState.windowId,
 							runState: {
 								status: "running",
 								runId: 1,

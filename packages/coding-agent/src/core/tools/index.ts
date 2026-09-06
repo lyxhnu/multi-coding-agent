@@ -15,6 +15,7 @@ export {
 	type ContextNoteToolOptions,
 	createContextNoteToolDefinition,
 } from "./context-note.ts";
+export { createContextRemainingToolDefinition, createNewContextToolDefinition } from "./context-window.ts";
 export {
 	createEditTool,
 	createEditToolDefinition,
@@ -47,12 +48,7 @@ export {
 	type GrepToolInput,
 	type GrepToolOptions,
 } from "./grep.ts";
-export {
-	createHistoryGetToolDefinition,
-	HISTORY_DEFAULT_LIMIT,
-	HISTORY_MAX_LIMIT,
-	type HistoryGetInput,
-} from "./history-get.ts";
+export { createHistoryToolDefinition } from "./history.ts";
 export { createKillTaskTool, createKillTaskToolDefinition, type KillTaskToolInput } from "./kill-task.ts";
 export {
 	createLsTool,

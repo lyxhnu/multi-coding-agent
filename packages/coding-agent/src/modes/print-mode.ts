@@ -125,6 +125,24 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		for (const message of messages) {
 			await session.prompt(message);
 		}
+
+		while (
+			session.state.runState.status === "idle" &&
+			session.state.runState.lastOutcome?.type === "context_transition"
+		) {
+			const activeTaskIds = session.taskManager
+				.list()
+				.filter((task) => task.status === "running" || task.status === "cancelling")
+				.map((task) => task.taskId);
+			if (activeTaskIds.length === 0) break;
+			await Promise.all(activeTaskIds.map((taskId) => session.taskManager.awaitSettled(taskId)));
+			// The terminal Task transition queues the deferred rollover in a microtask. Let it start before
+			// waiting for the complete session-level continuation, otherwise print mode would dispose the
+			// Session in the gap and cancel the Task/rollover it is meant to preserve.
+			await Promise.resolve();
+			await session.waitForIdle();
+		}
+
 		if (session.contextRolloverState.dispatchState === "outcome_unknown") {
 			console.error(
 				"Context rollover stopped: Provider or tool outcome is unknown. Nothing was replayed automatically; inspect external state before sending a new prompt.",
@@ -132,9 +150,13 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			return 1;
 		}
 
-		if (session.state.runState.status === "idle" && session.state.runState.lastOutcome?.type === "context_limit") {
+		if (
+			session.state.runState.status === "idle" &&
+			(session.state.runState.lastOutcome?.type === "context_limit" ||
+				session.state.runState.lastOutcome?.type === "context_transition")
+		) {
 			console.error(
-				"context_limit: context maintenance is exhausted and the task is not complete; reduce context or switch to a model with a larger context window.",
+				`${session.state.runState.lastOutcome.type}: task not completed; inspect the context/rollover trace for the blocking reason.`,
 			);
 			return 1;
 		}

@@ -2,12 +2,11 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { ContextProgressEntry, SessionEntry } from "./session-manager.ts";
 
-export const MAX_TASK_NOTE_EVENTS_PER_SCOPE = 256;
 export const MAX_ACTIVE_TASK_NOTES = 64;
-export const MAX_CHECKPOINT_NOTE_CANDIDATES = 16;
 export const MAX_TASK_NOTE_TEXT_CHARS = 2000;
 export const MAX_TASK_NOTE_SOURCE_REFS = 8;
 export const MAX_TASK_NOTE_EVIDENCE_REFS = 8;
+export const MAX_TASK_NOTE_RESUME_REFS = 8;
 
 export const TASK_NOTE_KINDS = ["constraint", "decision", "state", "next_action", "failed_attempt"] as const;
 export type TaskNoteKind = (typeof TASK_NOTE_KINDS)[number];
@@ -23,6 +22,13 @@ export interface TaskNoteReference {
 	blockIndex?: number;
 }
 
+export interface NextActionResume {
+	relatedNotes: Array<{ kind: TaskNoteKind; key: string }>;
+	requiredHistoryRefs: TaskNoteReference[];
+	requirementSourceRefs: TaskNoteReference[];
+	todoIds: string[];
+}
+
 export type TaskNoteCandidate =
 	| {
 			operation: "upsert";
@@ -31,6 +37,7 @@ export type TaskNoteCandidate =
 			text: string;
 			sourceRefs: TaskNoteReference[];
 			evidenceRefs: TaskNoteReference[];
+			resume?: NextActionResume;
 			supersedesEventId?: string;
 	  }
 	| {
@@ -51,9 +58,7 @@ export interface TaskNoteEvidenceStamp {
 	outcome: "succeeded" | "failed";
 }
 
-export type TaskNoteEventSource =
-	| { type: "model_tool"; toolCallId: string }
-	| { type: "checkpoint"; checkpointId: string; candidateIndex: number };
+export type TaskNoteEventSource = { type: "model_tool"; toolCallId: string };
 
 export interface TaskNoteEvent {
 	version: 1;
@@ -66,14 +71,9 @@ export interface TaskNoteEvent {
 	text?: string;
 	sourceRefs: TaskNoteReference[];
 	evidence: TaskNoteEvidenceStamp[];
+	resume?: NextActionResume;
 	supersedesEventId?: string;
 	source: TaskNoteEventSource;
-}
-
-export interface TaskNoteBatch {
-	version: 1;
-	batchId: string;
-	events: TaskNoteEvent[];
 }
 
 export interface TaskNoteProjectionItem {
@@ -83,6 +83,7 @@ export interface TaskNoteProjectionItem {
 	text: string;
 	sourceRefs: readonly TaskNoteReference[];
 	evidence: readonly TaskNoteEvidenceStamp[];
+	resume?: NextActionResume;
 	freshness: TaskNoteFreshness;
 }
 
@@ -113,7 +114,6 @@ export interface TaskNoteAcceptanceContext {
 	branch: readonly SessionEntry[];
 	projection: TaskNoteProjectionSnapshot;
 	allowedEntryIds?: ReadonlySet<string>;
-	eventCount: number;
 }
 
 export type TaskNoteAcceptanceFailureReason =
@@ -187,17 +187,56 @@ function validSource(value: unknown): value is TaskNoteEventSource {
 	if (source.type === "model_tool") {
 		return Object.keys(value).length === 2 && typeof source.toolCallId === "string" && source.toolCallId.length > 0;
 	}
-	if (source.type === "checkpoint") {
-		return (
-			Object.keys(value).length === 3 &&
-			typeof source.checkpointId === "string" &&
-			source.checkpointId.length > 0 &&
-			Number.isInteger(source.candidateIndex) &&
-			typeof source.candidateIndex === "number" &&
-			source.candidateIndex >= 0
-		);
-	}
+
 	return false;
+}
+
+function validResume(value: unknown, kind: TaskNoteKind, key: string): value is NextActionResume {
+	if (value === null || typeof value !== "object") return false;
+	const resume = value as Partial<NextActionResume>;
+	if (
+		!Object.keys(value).every((name) =>
+			["relatedNotes", "requiredHistoryRefs", "requirementSourceRefs", "todoIds"].includes(name),
+		) ||
+		!Array.isArray(resume.relatedNotes) ||
+		!Array.isArray(resume.requiredHistoryRefs) ||
+		!Array.isArray(resume.requirementSourceRefs) ||
+		!Array.isArray(resume.todoIds) ||
+		[
+			resume.relatedNotes.length,
+			resume.requiredHistoryRefs.length,
+			resume.requirementSourceRefs.length,
+			resume.todoIds.length,
+		].some((length) => length > MAX_TASK_NOTE_RESUME_REFS)
+	)
+		return false;
+	const related = resume.relatedNotes;
+	if (
+		!related.every(
+			(item) =>
+				item !== null &&
+				typeof item === "object" &&
+				Object.keys(item).length === 2 &&
+				isTaskNoteKind(item.kind) &&
+				typeof item.key === "string" &&
+				KEY_PATTERN.test(item.key) &&
+				(item.kind !== kind || item.key !== key),
+		) ||
+		new Set(related.map((item) => identity(item.kind, item.key))).size !== related.length
+	)
+		return false;
+	if (
+		!resume.requiredHistoryRefs.every(validReference) ||
+		new Set(resume.requiredHistoryRefs.map((reference) => canonical(reference))).size !==
+			resume.requiredHistoryRefs.length ||
+		!resume.requirementSourceRefs.every(validReference) ||
+		new Set(resume.requirementSourceRefs.map((reference) => canonical(reference))).size !==
+			resume.requirementSourceRefs.length ||
+		!resume.todoIds.every((todoId) => typeof todoId === "string" && todoId.length > 0 && todoId.length <= 128) ||
+		new Set(resume.todoIds).size !== resume.todoIds.length
+	)
+		return false;
+	return true;
 }
 
 function validEvidence(value: unknown): value is TaskNoteEvidenceStamp {
@@ -231,6 +270,7 @@ export function isTaskNoteEvent(value: unknown): value is TaskNoteEvent {
 		"text",
 		"sourceRefs",
 		"evidence",
+		"resume",
 		"supersedesEventId",
 		"source",
 	]);
@@ -267,8 +307,12 @@ export function isTaskNoteEvent(value: unknown): value is TaskNoteEvent {
 		(event.operation === "upsert"
 			? typeof event.text === "string" &&
 				event.text.trim().length > 0 &&
-				event.text.length <= MAX_TASK_NOTE_TEXT_CHARS
+				event.text.length <= MAX_TASK_NOTE_TEXT_CHARS &&
+				(event.kind === "next_action" && event.key === "current"
+					? validResume(event.resume, event.kind, event.key)
+					: event.resume === undefined)
 			: event.text === undefined &&
+				event.resume === undefined &&
 				event.evidence.length === 0 &&
 				typeof event.supersedesEventId === "string" &&
 				event.supersedesEventId.length > 0)
@@ -304,16 +348,24 @@ export function resolveTaskNoteScope(
 	return undefined;
 }
 
-function checkpointBatchEvents(value: unknown): readonly TaskNoteEvent[] | undefined {
-	if (value === null || typeof value !== "object") return undefined;
-	const envelope = value as { version?: unknown; checkpoint?: unknown; taskNoteBatch?: unknown };
-	if (envelope.version !== 1 || envelope.taskNoteBatch === null || typeof envelope.taskNoteBatch !== "object") {
-		return undefined;
+/** Resolve the historical Note scope rooted at an explicitly selected, branch-visible user entry. */
+export function resolveTaskNoteScopeByTaskSource(
+	branch: readonly SessionEntry[],
+	taskSourceEntryId: string,
+): TaskNoteScope | undefined {
+	const sourceIndex = branch.findIndex(
+		(entry) => entry.id === taskSourceEntryId && entry.type === "message" && entry.message.role === "user",
+	);
+	if (sourceIndex < 0) return undefined;
+	let promptGeneration = 0;
+	for (const entry of branch.slice(0, sourceIndex + 1)) {
+		if (entry.type !== "custom" || entry.customType !== "context-prompt-generation") continue;
+		if (entry.data === null || typeof entry.data !== "object" || !("promptGeneration" in entry.data)) continue;
+		if (typeof entry.data.promptGeneration === "number" && Number.isInteger(entry.data.promptGeneration)) {
+			promptGeneration = entry.data.promptGeneration;
+		}
 	}
-	if (envelope.checkpoint === null || typeof envelope.checkpoint !== "object") return undefined;
-	const checkpointId = (envelope.checkpoint as { checkpointId?: unknown }).checkpointId;
-	if (typeof checkpointId !== "string" || !isTaskNoteBatch(envelope.taskNoteBatch, checkpointId)) return undefined;
-	return envelope.taskNoteBatch.events;
+	return { taskScopeId: createTaskScopeId(taskSourceEntryId), promptGeneration };
 }
 
 export function buildTaskNoteProjectionFromBranch(
@@ -332,15 +384,7 @@ export function buildTaskNoteProjectionFromBranch(
 				return { status: "projection_invalid", reason: "invalid_evidence" };
 			}
 			events.push(entry.data);
-			continue;
 		}
-		if (entry.customType !== "context-rollover-checkpoint") continue;
-		const batchEvents = checkpointBatchEvents(entry.data);
-		if (batchEvents === undefined) return { status: "projection_invalid", reason: "invalid_checkpoint_batch" };
-		if (batchEvents.some((event) => !persistedEventEvidenceIsValid(event, branch, entries, allowedEntryIds))) {
-			return { status: "projection_invalid", reason: "invalid_evidence" };
-		}
-		events.push(...batchEvents);
 	}
 	return buildTaskNoteProjection({ events, scope, resolveFreshness });
 }
@@ -379,45 +423,7 @@ export function createTaskNoteEventId(
 	source: TaskNoteEventSource,
 	candidate: TaskNoteCandidate,
 ): string {
-	if (source.type === "checkpoint") {
-		return hash(
-			"task-note-checkpoint-event-v1",
-			scope.taskScopeId,
-			source.checkpointId,
-			String(source.candidateIndex),
-			canonical(candidate),
-		);
-	}
 	return hash("task-note-event-v1", scope.taskScopeId, source.type, source.toolCallId, canonical(candidate));
-}
-
-export function createTaskNoteBatchId(checkpointId: string, events: readonly TaskNoteEvent[]): string {
-	return hash("task-note-batch-v1", checkpointId, canonical(events));
-}
-
-export function isTaskNoteBatch(value: unknown, checkpointId?: string): value is TaskNoteBatch {
-	if (value === null || typeof value !== "object") return false;
-	const batch = value as Partial<TaskNoteBatch>;
-	if (
-		Object.keys(value).some((key) => key !== "version" && key !== "batchId" && key !== "events") ||
-		batch.version !== 1 ||
-		typeof batch.batchId !== "string" ||
-		!Array.isArray(batch.events) ||
-		batch.events.length > MAX_CHECKPOINT_NOTE_CANDIDATES ||
-		!batch.events.every(isTaskNoteEvent)
-	) {
-		return false;
-	}
-	return (
-		checkpointId === undefined ||
-		(batch.events.every(
-			(event, index) =>
-				event.source.type === "checkpoint" &&
-				event.source.checkpointId === checkpointId &&
-				event.source.candidateIndex === index,
-		) &&
-			batch.batchId === createTaskNoteBatchId(checkpointId, batch.events))
-	);
 }
 
 function defaultFreshness(stamp: TaskNoteEvidenceStamp): TaskNoteFreshness {
@@ -435,9 +441,11 @@ export function buildTaskNoteProjection(input: TaskNoteProjectionInput): TaskNot
 			return { status: "projection_invalid", reason: "unsafe_content" };
 		}
 		if (
-			(event.kind === "state" &&
+			(event.operation === "upsert" &&
+				event.kind === "state" &&
 				(event.evidence.length === 0 || event.evidence.some((stamp) => stamp.outcome !== "succeeded"))) ||
-			(event.kind === "failed_attempt" &&
+			(event.operation === "upsert" &&
+				event.kind === "failed_attempt" &&
 				(event.evidence.length === 0 || event.evidence.some((stamp) => stamp.outcome !== "failed")))
 		) {
 			return { status: "projection_invalid", reason: "invalid_evidence" };
@@ -473,7 +481,7 @@ export function buildTaskNoteProjection(input: TaskNoteProjectionInput): TaskNot
 		accepted.push(event);
 	}
 
-	if (accepted.length > MAX_TASK_NOTE_EVENTS_PER_SCOPE || activeByIdentity.size > MAX_ACTIVE_TASK_NOTES) {
+	if (activeByIdentity.size > MAX_ACTIVE_TASK_NOTES) {
 		return { status: "projection_invalid", reason: "note_limit" };
 	}
 
@@ -497,6 +505,7 @@ export function buildTaskNoteProjection(input: TaskNoteProjectionInput): TaskNot
 			text: event.text ?? "",
 			sourceRefs: event.sourceRefs,
 			evidence: event.evidence,
+			...(event.resume === undefined ? {} : { resume: event.resume }),
 			freshness: itemFreshness,
 		};
 	});
@@ -528,12 +537,14 @@ function eventToCandidate(event: TaskNoteEvent): TaskNoteCandidate {
 		text: event.text ?? "",
 		sourceRefs: event.sourceRefs,
 		evidenceRefs: event.evidence.map((stamp) => stamp.reference),
+		...(event.resume === undefined ? {} : { resume: event.resume }),
 		...(event.supersedesEventId === undefined ? {} : { supersedesEventId: event.supersedesEventId }),
 	};
 }
 
 function referenceBlockIsValid(entry: SessionEntry, blockIndex: number | undefined): boolean {
 	if (blockIndex === undefined) return true;
+	if (entry.type === "tool_result_source") return entry.content[blockIndex]?.type === "text";
 	if (entry.type === "message") {
 		if (!("content" in entry.message) || typeof entry.message.content === "string") return false;
 		return entry.message.content[blockIndex]?.type === "text";
@@ -557,6 +568,21 @@ function resolveReference(
 }
 
 function isClaimSource(entry: SessionEntry): boolean {
+	if (entry.type === "tool_result_source") return true;
+	if (
+		entry.type === "message" &&
+		entry.message.role === "assistant" &&
+		entry.message.content.every((block) => block.type === "thinking")
+	)
+		return false;
+	if (
+		entry.type === "message" &&
+		entry.message.role === "toolResult" &&
+		["memory_get", "memory_search", "history", "context_note"].includes(entry.message.toolName)
+	)
+		return false;
+	if (entry.type === "message" && entry.message.role === "bashExecution" && entry.message.excludeFromContext)
+		return false;
 	return (
 		entry.type === "message" ||
 		entry.type === "context_progress" ||
@@ -565,6 +591,7 @@ function isClaimSource(entry: SessionEntry): boolean {
 }
 
 function stampEvidence(reference: TaskNoteReference, entry: SessionEntry): TaskNoteEvidenceStamp | undefined {
+	if (!isClaimSource(entry)) return undefined;
 	if (entry.type === "context_progress") {
 		const evidenceKind =
 			entry.evidenceKind === "verification"
@@ -615,6 +642,17 @@ function stampEvidence(reference: TaskNoteReference, entry: SessionEntry): TaskN
 			outcome: entry.message.isError ? "failed" : "succeeded",
 		};
 	}
+	if (entry.type === "tool_result_source") {
+		return {
+			reference,
+			evidenceKind: "process_result",
+			subjectId: `${entry.toolName}:${entry.toolCallId}`,
+			inputFingerprint: "",
+			resultFingerprint: hash("task-note-tool-result-v1", canonical(entry.content)),
+			observedAtEntryId: entry.id,
+			outcome: entry.isError ? "failed" : "succeeded",
+		};
+	}
 	return undefined;
 }
 
@@ -650,6 +688,8 @@ export function createTaskNoteFreshnessResolver(
 		}
 		const current = latestInputBySubject.get(stamp.subjectId);
 		if (current === undefined || stamp.inputFingerprint.length === 0) return "unknown";
+		if (current !== stamp.inputFingerprint) return "stale";
+		if (stamp.evidenceKind === "process_result" || stamp.evidenceKind === "task_terminal") return "unknown";
 		return current === stamp.inputFingerprint ? "fresh" : "stale";
 	};
 }
@@ -674,6 +714,7 @@ function candidateShapeIsValid(candidate: TaskNoteCandidate): boolean {
 			"text",
 			"sourceRefs",
 			"evidenceRefs",
+			"resume",
 			"supersedesEventId",
 		]);
 		return (
@@ -684,6 +725,9 @@ function candidateShapeIsValid(candidate: TaskNoteCandidate): boolean {
 			Array.isArray(candidate.evidenceRefs) &&
 			candidate.evidenceRefs.length <= MAX_TASK_NOTE_EVIDENCE_REFS &&
 			candidate.evidenceRefs.every(validReference) &&
+			(candidate.kind === "next_action" && candidate.key === "current"
+				? validResume(candidate.resume, candidate.kind, candidate.key)
+				: candidate.resume === undefined) &&
 			(candidate.supersedesEventId === undefined || typeof candidate.supersedesEventId === "string")
 		);
 	}
@@ -701,7 +745,6 @@ export function acceptTaskNoteCandidate(
 	context: TaskNoteAcceptanceContext,
 ): TaskNoteAcceptanceResult {
 	if (!candidateShapeIsValid(candidate)) return { status: "rejected", reason: "invalid_output" };
-	if (context.eventCount >= MAX_TASK_NOTE_EVENTS_PER_SCOPE) return { status: "rejected", reason: "note_limit" };
 	if (candidate.operation === "upsert" && containsPotentialSecret(candidate.text)) {
 		return { status: "rejected", reason: "unsafe_content" };
 	}
@@ -750,10 +793,15 @@ export function acceptTaskNoteCandidate(
 			: [];
 	if (evidence.some((stamp) => stamp === undefined)) return { status: "rejected", reason: "invalid_evidence" };
 	const stamps = evidence.filter((stamp): stamp is TaskNoteEvidenceStamp => stamp !== undefined);
-	if (candidate.kind === "state" && (stamps.length === 0 || stamps.some((stamp) => stamp.outcome !== "succeeded"))) {
+	if (
+		candidate.operation === "upsert" &&
+		candidate.kind === "state" &&
+		(stamps.length === 0 || stamps.some((stamp) => stamp.outcome !== "succeeded"))
+	) {
 		return { status: "rejected", reason: "invalid_evidence" };
 	}
 	if (
+		candidate.operation === "upsert" &&
 		candidate.kind === "failed_attempt" &&
 		(stamps.length === 0 || stamps.some((stamp) => stamp.outcome !== "failed"))
 	) {
@@ -771,6 +819,7 @@ export function acceptTaskNoteCandidate(
 		...(candidate.operation === "upsert" ? { text: candidate.text } : {}),
 		sourceRefs: candidate.sourceRefs,
 		evidence: stamps,
+		...(candidate.operation === "upsert" && candidate.resume !== undefined ? { resume: candidate.resume } : {}),
 		...(candidate.supersedesEventId === undefined ? {} : { supersedesEventId: candidate.supersedesEventId }),
 		source: context.source,
 	};

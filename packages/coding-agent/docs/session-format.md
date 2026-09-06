@@ -24,7 +24,7 @@ Sessions have a version field in the header:
 - **Version 2**: Tree structure with `id`/`parentId` linking
 - **Version 3**: Renamed `hookMessage` role to `custom` (extensions unification)
 
-Existing sessions are automatically migrated to the current version (v3) when loaded.
+The existing v1/v2 message migrations still run on load. Window lifecycle records use the schema below; the replaced automatic checkpoint/handoff schema has no compatibility path. A complete final JSONL record without a newline is accepted, but an incomplete final record is rejected. Dispatch recovery covers process interruption; synchronous append alone does not guarantee power-loss durability.
 
 ## Source Files
 
@@ -238,16 +238,16 @@ Emitted when the user changes the thinking/reasoning level.
 
 ### CompactionEntry
 
-Created when context is compacted. Stores a summary of earlier messages.
+Created by explicit manual compaction. Stores a summary of earlier messages and required `windowId` and `previousWindowId` lifecycle fields (UUID and UUID/null).
 
 ```json
-{"type":"compaction","id":"f6g7h8i9","parentId":"e5f6g7h8","timestamp":"2024-12-03T14:10:00.000Z","summary":"User discussed X, Y, Z...","firstKeptEntryId":"c3d4e5f6","tokensBefore":50000}
+{"type":"compaction","id":"f6g7h8i9","parentId":"e5f6g7h8","timestamp":"2024-12-03T14:10:00.000Z","windowId":"00000000-0000-4000-8000-000000000002","previousWindowId":"00000000-0000-4000-8000-000000000001","summary":"User discussed X, Y, Z...","firstKeptEntryId":"c3d4e5f6","tokensBefore":50000}
 ```
 
 Newer harness-generated compactions embed the retained post-compaction context directly on the entry, instead of `firstKeptEntryId`:
 
 ```json
-{"type":"compaction","id":"f6g7h8i9","parentId":"e5f6g7h8","timestamp":"2024-12-03T14:10:00.000Z","summary":"User discussed X, Y, Z...","tokensBefore":50000,"retainedTail":[{"role":"user","content":"latest request"},{"role":"assistant","content":[{"type":"text","text":"latest reply"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{...},"stopReason":"stop"}]}
+{"type":"compaction","id":"f6g7h8i9","parentId":"e5f6g7h8","timestamp":"2024-12-03T14:10:00.000Z","windowId":"00000000-0000-4000-8000-000000000002","previousWindowId":"00000000-0000-4000-8000-000000000001","summary":"User discussed X, Y, Z...","tokensBefore":50000,"retainedTail":[{"role":"user","content":"latest request"},{"role":"assistant","content":[{"type":"text","text":"latest reply"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{...},"stopReason":"stop"}]}
 ```
 
 Optional fields:
@@ -280,18 +280,22 @@ Extension state persistence. Does NOT participate in LLM context.
 
 Use `customType` to identify your extension's entries on reload. Interactive mode can render custom entries via `pi.registerEntryRenderer(customType, renderer)`, but they still do not participate in LLM context.
 
-Built-in task continuity uses two strict custom-entry payloads:
-
-- `task-note-event`: one accepted, system-stamped semantic-index event from `context_note`.
-- `context-rollover-checkpoint`: one atomic `{ checkpoint, taskNoteBatch }` envelope from checkpoint prefire. `checkpoint.compactionPrefix` contains the reusable two-pass compaction summary and its source identity; there is no separate prefix-checkpoint entry.
-
-Task-note scope is `{ taskScopeId, promptGeneration }`. `createdInContextEpoch` records provenance only, so an active note remains visible across context epochs. The projection is rebuilt from the active branch ancestry; it is never persisted as a second snapshot. Raw Task Note or Checkpoint entries do not enter model context. On rollover, the system validates them against authoritative user, tool, Todo, queue, progress, and task state, then injects only the final Handoff.
+Built-in task continuity stores `task-note-event`: one accepted, system-stamped semantic-index event from `context_note`. Task-note scope is `{ taskScopeId, promptGeneration }`. `createdInContextEpoch` records provenance only, so an active note remains visible across context epochs. The projection is rebuilt from the active branch ancestry; it is never persisted as a second snapshot. Notes are queried explicitly and are not automatically injected into a new window.
 
 ```json
 {"type":"custom","id":"n1","parentId":"m1","timestamp":"2026-09-04T00:00:00.000Z","customType":"task-note-event","data":{"version":1,"eventId":"sha256...","scope":{"taskScopeId":"sha256...","promptGeneration":1},"createdInContextEpoch":2,"operation":"upsert","kind":"constraint","key":"compatibility","text":"Do not preserve backward compatibility.","sourceRefs":[{"entryId":"m1"}],"evidence":[],"source":{"type":"model_tool","toolCallId":"call_1"}}}
 ```
 
-Checkpoint payloads are not accepted in the former bare-checkpoint shape. The checkpoint and all Note candidates either validate and persist together, or nothing is committed.
+### Window lifecycle and dispatch
+
+- `context_window` persists a UUID `windowId`, nullable `previousWindowId`, and `reason` (`initial` or `branch`) before the first request in that window.
+- `context_transition_request` persists model intent with `requestId`, source `windowId`, `promptGeneration`, `toolCallId`, and `reason`.
+- `context_operation` records the single `save_state` operation for a source `windowId` and `promptGeneration`. Its runtime UUID, cutoff, budgets, consumed sampling/query/output amounts, final Note revision and exact recovery references are persisted; reopening resumes that same operation and never recreates its allowance.
+- `tool_result_source` stores the complete post-hook terminal result once, including `toolCallId`, `toolName`, content, details and `isError`. The ordinary `message` entry contains the bounded provider projection with its source entry ID and ranges. `history.read_item` reads the authoritative source.
+- `context_rollover` is the sole automatic window commit. It contains target and previous window UUIDs, stable `rolloverId`/`dispatchId`, cause, prompt/epoch coordinates, configured context window, recovery references with Note freshness, expected revisions, source/prepared fingerprints and token counts, and reserved delivery IDs. It contains no historical summary, suffix, Note catalog, or Todo body.
+- `context_rollover_dispatch` records `started` with reserved delivery IDs, then `finished` with the run outcome. A committed record without `started` is prepared: reopen must reproduce its exact request and queue reservation before sending. `started` without `finished` is `outcome_unknown` and cannot be automatically replayed.
+
+`history` uses branch ancestry and delivery receipts to build its readable projection. History and Note queries do not expose arbitrary custom entries, hidden reasoning, pending deliveries, or saved Memory/query results.
 
 ### CustomMessageEntry
 
@@ -343,7 +347,7 @@ Entries form a tree:
 
 ## Context Building
 
-`buildContextEntries()` walks from the current leaf to the root, producing the active entry list while honoring compaction:
+`buildContextEntries()` walks from the current leaf to the root. The latest automatic rollover removes preceding entries from the active working context; full history remains in the file. Explicit manual compaction selects retained entries as follows:
 
 1. Collects all entries on the path
 2. If a `CompactionEntry` is on the path:
@@ -355,7 +359,7 @@ Entries form a tree:
 
 `buildSessionContext()` builds on that entry list to produce the message list for the LLM:
 
-1. Extracts current model and thinking level settings from the full path
+1. Extracts current model and thinking level settings from the full path and prepends the current window identity; an automatic rollover adds its stable resume reference and fixed recovery directions
 2. Converts selected entries to messages:
    - `message` -> stored `AgentMessage`
    - `compaction` -> `compactionSummary` plus `retainedTail` when present

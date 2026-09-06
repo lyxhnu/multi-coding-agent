@@ -469,6 +469,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,
 					pendingMessageCount: session.pendingMessageCount,
+					windowId: contextRollover.windowId,
 					contextEpoch: contextRollover.contextEpoch,
 					rolloverCount: contextRollover.rolloverCount,
 					dispatchState: contextRollover.dispatchState,

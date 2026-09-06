@@ -166,13 +166,41 @@ export interface AgentLoopTurnUpdate {
 	model?: Model<any>;
 	/** Thinking level for the next provider request. */
 	thinkingLevel?: ThinkingLevel;
+	/** Output-token cap for the next provider request. */
+	maxTokens?: number;
 }
+
+/** Host-owned decision made after a complete assistant/tool-result batch has been emitted. */
+export type AgentLoopAfterTurnControl =
+	| { type: "continue"; messages?: AgentMessage[]; update?: AgentLoopTurnUpdate }
+	| { type: "context_transition" }
+	| { type: "failed"; message: string }
+	| undefined;
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 	getContextBudgetOptions?: (model: Model<Api>) => ContextBudgetOptions;
+	/** Final-request control, after all transformations and budget measurement. */
+	controlRequest?: (
+		budget: ContextBudget,
+		requestFingerprint: string,
+	) =>
+		| { type: "context_transition" }
+		| { type: "failed"; message: string }
+		| {
+				type: "save_state";
+				message: AgentMessage;
+				toolNames: readonly string[];
+				maxTokens: number;
+				failureMessage: string;
+		  }
+		| undefined;
+	/** Called only after all accepted tool results in the turn have been emitted. */
+	afterTurnControl?: (
+		context: ShouldStopAfterTurnContext,
+	) => AgentLoopAfterTurnControl | Promise<AgentLoopAfterTurnControl>;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -383,6 +411,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
 /** Why the most recently settled agent run ended. */
 export type AgentRunOutcome =
 	| { type: "completed" }
+	| { type: "context_transition" }
 	| { type: "context_limit"; budget: ContextBudget }
 	| { type: "failed"; message: string }
 	| { type: "aborted"; message?: string };

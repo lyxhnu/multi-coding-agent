@@ -13,7 +13,6 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
-	shouldCompact,
 } from "../src/core/compaction/index.ts";
 import {
 	buildSessionContext,
@@ -97,6 +96,8 @@ function createCompactionEntry(summary: string, firstKeptEntryId: string): Compa
 	const id = `test-id-${entryCounter++}`;
 	const entry: CompactionEntry = {
 		type: "compaction",
+		windowId: "00000000-0000-4000-8000-000000000001",
+		previousWindowId: null,
 		id,
 		parentId: lastId,
 		timestamp: new Date().toISOString(),
@@ -271,29 +272,6 @@ describe("estimateContextTokens", () => {
 	});
 });
 
-describe("shouldCompact", () => {
-	it("should return true when context exceeds threshold", () => {
-		const settings: CompactionSettings = {
-			enabled: true,
-			reserveTokens: 10000,
-			keepRecentTokens: 20000,
-		};
-
-		expect(shouldCompact(95000, 100000, settings)).toBe(true);
-		expect(shouldCompact(89000, 100000, settings)).toBe(false);
-	});
-
-	it("should return false when disabled", () => {
-		const settings: CompactionSettings = {
-			enabled: false,
-			reserveTokens: 10000,
-			keepRecentTokens: 20000,
-		};
-
-		expect(shouldCompact(95000, 100000, settings)).toBe(false);
-	});
-});
-
 describe("findCutPoint", () => {
 	it("should find cut point based on actual token differences", () => {
 		// Create entries with cumulative token counts
@@ -404,9 +382,9 @@ describe("buildSessionContext", () => {
 
 		const loaded = buildSessionContext(entries);
 		// summary + kept (u2, a2) + after (u3, a3) = 5
-		expect(loaded.messages.length).toBe(5);
-		expect(loaded.messages[0].role).toBe("compactionSummary");
-		expect((loaded.messages[0] as any).summary).toContain("Summary of 1,a,2,b");
+		expect(loaded.messages.length).toBe(6);
+		expect(loaded.messages[1].role).toBe("compactionSummary");
+		expect((loaded.messages[1] as any).summary).toContain("Summary of 1,a,2,b");
 	});
 
 	it("should handle multiple compactions (only latest matters)", () => {
@@ -428,8 +406,8 @@ describe("buildSessionContext", () => {
 
 		const loaded = buildSessionContext(entries);
 		// summary + kept from u3 (u3, c) + after (u4, d) = 5
-		expect(loaded.messages.length).toBe(5);
-		expect((loaded.messages[0] as any).summary).toContain("Second summary");
+		expect(loaded.messages.length).toBe(6);
+		expect((loaded.messages[1] as any).summary).toContain("Second summary");
 	});
 
 	it("should keep all messages when firstKeptEntryId is first entry", () => {
@@ -443,7 +421,7 @@ describe("buildSessionContext", () => {
 
 		const loaded = buildSessionContext(entries);
 		// summary + all messages (u1, a1, u2, b) = 5
-		expect(loaded.messages.length).toBe(5);
+		expect(loaded.messages.length).toBe(6);
 	});
 
 	it("should track model and thinking level changes", () => {
@@ -577,6 +555,8 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 		const parentId = lastEntry.id;
 		const compactionEntry: CompactionEntry = {
 			type: "compaction",
+			windowId: "00000000-0000-4000-8000-000000000001",
+			previousWindowId: null,
 			id: "compaction-test-id",
 			parentId,
 			timestamp: new Date().toISOString(),
@@ -587,8 +567,8 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 
 		// Should have summary + kept messages
 		expect(reloaded.messages.length).toBeLessThan(loaded.messages.length);
-		expect(reloaded.messages[0].role).toBe("compactionSummary");
-		expect((reloaded.messages[0] as any).summary).toContain(compactionResult.summary);
+		expect(reloaded.messages[1].role).toBe("compactionSummary");
+		expect((reloaded.messages[1] as any).summary).toContain(compactionResult.summary);
 
 		console.log("Original messages:", loaded.messages.length);
 		console.log("After compaction:", reloaded.messages.length);

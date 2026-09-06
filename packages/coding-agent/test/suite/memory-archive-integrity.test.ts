@@ -2,7 +2,6 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { fauxAssistantMessage, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createWallClockBudgetSignal } from "../../src/core/compaction/compaction-policy.ts";
 import { extractMemory } from "../../src/core/memory/consolidation.ts";
 import { validateMemoryExtraction } from "../../src/core/memory/extraction.ts";
 import { MemoryStore, projectMemoryDir, projectMemoryFile } from "../../src/core/memory/memory-store.ts";
@@ -272,11 +271,12 @@ describe("memory-context-integrity: archive transaction", () => {
 	it("D06 aborts a timed extraction and releases its lock without advancing state", async () => {
 		const { store, options, h } = await seed();
 		vi.useFakeTimers();
-		const budget = createWallClockBudgetSignal(undefined, 1);
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 1000);
 		let stopped = false;
 		const pending = store.maybeConsolidate({
 			...options,
-			signal: budget.signal,
+			signal: controller.signal,
 			summarize: (_sources, signal) =>
 				new Promise((_resolve, reject) => {
 					signal.addEventListener(
@@ -292,7 +292,7 @@ describe("memory-context-integrity: archive transaction", () => {
 		const rejected = expect(pending).rejects.toThrow("cancelled");
 		await vi.advanceTimersByTimeAsync(1000);
 		await rejected;
-		budget.dispose();
+		clearTimeout(timer);
 		expect(stopped).toBe(true);
 		expect(existsSync(join(projectMemoryDir(store.rootDir, h.tempDir), ".dream-state.json"))).toBe(false);
 		expect((await store.maybeConsolidate({ ...options, summarize: () => ({ facts: [] }) })).ran).toBe(true);

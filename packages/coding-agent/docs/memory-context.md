@@ -1,68 +1,56 @@
 # 记忆与上下文
 
-本页描述 `memory-context-integrity` 的运行行为。设计约束见 [Spec](specs/memory-context-integrity.md)，实际测试和未通过项见 [实施记录](specs/memory-context-integrity-report.md)。
+自动容量管理使用稳定窗口和按需检索。设计契约见 [窗口记忆 Spec](specs/context-window-memory-proposal.md)。手动 [/compact](compaction.md) 和确定性 /shake 保持独立。
 
-## CLI 中查看结果
+## 窗口与恢复
 
-```text
-/trace
-/trace list
-/trace 0
-/compact
-/shake
-/memory flush 只保留长期项目约定
-/memory undo mem-example
-```
+首次请求前持久化 windowId。换窗、分支和手动压缩建立新身份，并记录 previousWindowId。自动换窗后的首个请求只包含常规 system/tools 和不超过 512 个估算 token 的 bootstrap：窗口 ID、resume_ref、恢复指令。旧消息后缀、Todo 和 Note 正文不会自动注入。
 
-`/trace` 查看当前分支最近一轮，`list` 选择轮次，数字选择指定轮次；选中事件可查看只读 JSON 副本。它不是新的 bash 工具，也不要求启动 Web 界面。当前分支导出/恢复保留对应 trace，即使首次请求就在预算预检中被阻止。
+模型先用 context_note query 解析 resumeRef，再从 history 读取有效任务要求、后续用户约束、Todo 或所需证据。Note 只记录语义变化；默认 query 返回元数据，item 指定 eventId 才读取正文和 freshness。旧成功结果不会自动成为当前状态证明。单次变更和 64 条活跃笔记受限，累计审计事件不设 256 条失效门槛。
 
-重点查看以下事件：
+new_context({reason}) 仅记录意图。当前 assistant 的整批工具调用和结果完成后，AgentSession 统一处理 model_requested、work_budget_reached、provider_context_rejected。待审批交互和运行中的后台任务会推迟提交。每个来源窗口最多提交一次，每个用户 prompt 最多换窗 8 次；同一请求幂等，实际目标请求必须缩小并满足工作预算。
 
-| 事件 | 含义 |
-| --- | --- |
-| `context/budget` | 输入估算、有效 usage 锚点、输出预留、安全余量、模型窗口和判定 |
-| `compaction/summary` | `prefix` 或 `commit` 阶段、来源指纹/覆盖范围、完成或丢弃、usage |
-| `memory/archive` | 已提交压缩对应的笔记/flush/归档状态，批次与来源、数量和原因码 |
-| `turn/end` | 运行结束原因；`context_limit` 不等于任务完成 |
+## 最终请求预算
 
-交互 CLI 会报告尚未解决的 `context_limit`；文本和 JSON 单次运行返回退出码 `1`。RPC 先发送 `context_budget`、`agent_end`，可能进行有界压缩重试；收到 `agent_settled` 后，以 `get_state.data.runState.lastOutcome` 判断最终结果。`prompt` 的接受成功不能当作任务完成。完整契约见 [RPC](rpc.md#context_budget-and-context_limit) 和 [SDK](sdk.md#agent-and-agentstate)。
+get_context_remaining 返回最近一次最终请求的 inputTokens、remainingInputTokens、remainingWorkTokens、测量位置和配置修订。未知值是 null，measurement 为 unknown。工具返回本身仍消耗上下文。
 
-## 请求预算与压缩
+请求预检在 transform、消息转换和 append-only 构造之后、provider 调用之前执行。system、工具 schema、图片、整批工具结果和已交付队列都计入输入。usage 只有在模型及请求前缀指纹匹配时才作为估算锚点。
 
-最终检查在 transform、消息转换和 append-only 上下文构造之后、provider 调用之前。请求与可变消息/工具 schema 分离；首次输入、并行工具结果、steering 和 follow-up 都要经过检查。
-
-```text
-I + R + S <= W
-R = min(请求输出上限或模型最大输出, 模型最大输出, 32768)
+~~~text
+输入 I + 输出预留 R + 安全余量 S <= 模型窗口 W
+R = min(请求输出上限或模型上限, 模型上限, 32768)
 S = max(4096, ceil(R * 0.2))
-```
+remainingWork = max(0, min(W * 阈值 - I, remainingInput) - 3072)
+~~~
 
-`I` 包含 system、工具定义、消息和图片；同一安全余量供预检与底层输出裁剪共用。百分比阈值和 `reserveTokens` 是额外触发条件，不叠加成第二份安全余量。元数据不完整时，预算标记 `unknownFields`，不能据此宣称窗口安全。字符估算不是精确 tokenizer。
+阈值由 compaction.autoCompactThresholdPercent 配置，默认 85%。工作预算用尽且仍有保存空间时，每个窗口和 promptGeneration 只建立一个持久化 save_state 操作；它最多使用 3 次 sampling、2048 个输出 token 和 3072 个查询/结果控制 token。保存阶段只开放 history、context_note、get_context_remaining 和 new_context，额度与次数从日志恢复，不因重启返还。完成的 continuation contract 在提交前还会对并发到达的用户约束、Todo、工具配置和来源 revision 重新验证。
 
-只有 model/provider、system、tools 和消息前缀指纹一致，历史 usage 才能用作锚点。新增内容在锚点后累计；shake、压缩、上下文改写或换模型后重新验证。
+rollover 提交前会用实际 transform、append-only 和完整业务工具定义预检整个恢复工作集。必读 Note、任务要求、History 引用和 Todo 正文无法与正常输出、安全余量及后续保存空间共同容纳时，返回 recovery_workset_too_large 并保留旧窗口。
 
-自动缩减沿用 shake、压缩和救援 shake 的有界流程，每次都重新预检。没有进展便停止，不重放原工具、不重复写入同一用户消息。正常完成的回答不会仅为了整理上下文而再跑一轮。
+compaction.enabled=false 关闭自动容量触发，最终容量检查仍然执行。显式工具 allowlist、deny、Plan Mode、子代理可见性均生效；缺少获准的 history/context_note 时不能提交不可恢复窗口。
 
-压缩必须先得到完整非空摘要，再校验当前来源和保留边界、提交 entry、重建上下文。空输出、`length`、error、abort、过期来源和无效扩展结果不提交。split-turn 即使没有新历史轮次，也保留旧摘要。没有新增内容时，`/compact` 报告 `Already compacted`，不调用模型或新增边界。
+## history
 
-`compaction.twoPassEnabled` 默认关闭。启用后，在自动阈值前 10 个百分点预生成稳定前缀摘要，最多一个在途调用。有效 checkpoint 允许尾部增长；第二阶段只处理摘要与未覆盖部分。换分支、改前缀或换基础压缩边界使其失效。完成的 checkpoint 才能持久化，重启后再次校验。前缀 usage 在生成时计费，复用时不重复累计。
+~~~json
+{"operation":"list_windows"}
+{"operation":"list_items","windowId":"window-uuid"}
+{"operation":"read_item","entryId":"saved-id","blockIndex":0}
+{"operation":"search","text":"literal text"}
+~~~
 
-## history_get
+所有操作共享当前分支中已向模型公开的投影。搜索只匹配字面文本，返回 entry/block/offset 和短片段。隐藏推理、未交付队列、兄弟分支、内部日志及历史 memory_get/memory_search、history/context_note 结果不进入语料。Todo 仅暴露公开投影；附件返回引用元数据，不展开二进制。
 
-这是模型可调用的只读工具，不是 slash command：
+每页连同元数据和 cursor 最多 2048 估算 token，可用 budgetTokens 缩小。read_item 的 offset/end 使用 UTF-16，分页末尾不会拆开代理对。原始字符串 blockIndex=-1，多块内容需指定块。cursor 绑定会话、分支、窗口、查询和可见性版本。搜索扫描也受上限约束，零命中且 exhausted=false 时必须继续 cursor 才能判断整个范围无结果。
 
-```json
-{"entryId":"saved-entry-id","blockIndex":0,"offset":0,"limit":4000}
-```
+回读只返回 Session 保存的内容，不重跑工具、不读取源文件当前版本。当前窗口已返回的片段从工具结果推导并跳过；verify=true 可显式复核。Note 正文回读也按有效投影修订去重。
 
-- 仅接受当前分支祖先链上的合法 shake 来源；包括之后被压缩移出工作上下文的 entry。
-- 多个可读块必须指定 `blockIndex`；字符串内容的块位置为 `-1`。
-- `offset`/`limit` 以 Unicode code point 计数，默认 4000、最大 8000，不拆开代理对；超限参数明确拒绝。
-- 返回 JSON 文本页及 `details`：`entryId`、`blockIndex`、`unit`、`offset`、`end`、`total`、`nextOffset`、`savedContentOnly`。最后一页 `nextOffset` 为 `null`。
-- 只读取实际保存的文本，不重跑工具，不读取原文件的新版本；保存前截掉的部分无法恢复，图片不能伪装成文本回读。
-- 不读取兄弟分支、其他会话、trace 或任意文件路径；拒绝 `memory_get` / `memory_search` 的旧结果，必须重新查询当前记忆视图。
+## 持久化与诊断
 
-默认会话工具包含 `history_get`。显式 allowlist、denylist、`noTools`、Plan Mode 和子代理只读权限仍然生效；未提供或未获准时，新 shake 占位符不承诺可回读。回读结果仍受下一次请求预算限制，也不会解除原有 shake。
+提交前校验恢复引用和 session/Todo/queue/progress/config/Note 修订；来源变化最多重试一次。持久化 rollover 后，使用预检得到的同一个 PreparedContinuation 续发。dispatch_started 与预留队列收据在发送前写入；完成后记录 finished。
+
+已提交但未 started 的恢复必须重新得到相同请求指纹、预算和队列集合，才能发送一次。started 没有 finished 表示 outcome_unknown，禁止自动重放。完整的无末尾换行 JSONL 条目可继续追加；不完整的最后一条记录阻止自动恢复。此顺序保证针对进程崩溃；未使用 fsync，不承诺断电持久性。
+
+/trace 可检查 context/budget、context/rollover、context/task_note、compaction/summary、memory/archive 和 turn/end。未解决的 context_limit 或 context_transition 表示任务尚未完成；print/JSON 模式返回退出码 1。SDK/RPC 应在 agent_settled 后检查 runState.lastOutcome 和 contextRolloverState，而非把 prompt 接受成功当作完成。
 
 ## 记忆安全、快照和归档
 
@@ -70,11 +58,11 @@ S = max(4096, ceil(R * 0.2))
 
 读取、关键词召回、向量候选、文档 embedding 和正文提炼共享有效视图：解析 Markdown → 撤销检查 → 安全过滤。异步向量查询返回前再次检查候选。撤销 sidecar 损坏会报错，不按空撤销集合处理。构造视图不会重写原文件；撤销也不会物理擦除旧会话里的事实。
 
-`memory.enabled` 继续控制成功压缩后的笔记与 autoDream；不自动激活记忆工具，也不新增会话结束触发器。`compaction.memoryFlushEnabled` 继续单独控制自动摘要写入项目记忆，但写入移到压缩提交之后。手动 `/memory flush` 不压缩当前上下文。自动入口都不写全局记忆。
+`memory.enabled` 控制手动压缩后的会话笔记及 Memory 工具注册，不自动激活工具。手动 `/memory flush` 不压缩当前上下文。自动换窗不生成摘要、不写入跨会话 Memory，也不触发自动提炼。
 
 每份笔记的稳定 ID 来自 `(sessionId, compactionId)`，与日期和会话改名无关。文件首行记录 `id`、`sessionId`、`compactionId`、`contentHash`、`storedHash`；同日多次压缩不会覆盖。相同来源重复写入受锁保护，内容冲突明确拒绝。
 
-autoDream 沿用默认 24 小时间隔和至少 3 个不同未处理 sessionId 的门槛。只选择请求预算能容纳的完整笔记，不截断正文假装已处理。提炼无执行工具，笔记作为不可信数据输入，返回严格结构：
+MemoryStore 的显式 `maybeConsolidate` 接口使用默认 24 小时间隔和至少 3 个不同未处理 sessionId 的门槛。只选择请求预算能容纳的完整笔记，不截断正文假装已处理。提炼无执行工具，笔记作为不可信数据输入，返回严格结构：
 
 ```json
 {"facts":[{"text":"项目约定","sourceNoteIds":["note-source-id"]}]}

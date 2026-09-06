@@ -2,10 +2,6 @@ import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type {
-	ContextMaintenanceSnapshot,
-	ReductionAttemptResult,
-} from "../../src/core/compaction/context-maintenance.ts";
 import {
 	MemoryStore,
 	projectMemoryDir,
@@ -14,16 +10,6 @@ import {
 } from "../../src/core/memory/memory-store.ts";
 import { checkMemoryCandidate } from "../../src/core/memory/secret-filter.ts";
 import { createHarness, type Harness } from "./harness.ts";
-
-type CompactionInternals = {
-	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
-	_runSoftCompaction: (
-		cause: "threshold",
-		willRetry: boolean,
-		snapshot: ContextMaintenanceSnapshot,
-		attemptIndex: number,
-	) => Promise<ReductionAttemptResult>;
-};
 
 describe("memory-context-integrity: effective memory", () => {
 	const harnesses: Harness[] = [];
@@ -150,10 +136,10 @@ describe("memory-context-integrity: effective memory", () => {
 			});
 		}
 	});
-	it("M01/M03 rejects manual and automatic flush output with safe result metadata", async () => {
+	it("M01/M03 rejects manual flush and compaction output with safe result metadata", async () => {
 		const h = await createHarness({
 			tools: [],
-			settings: { memory: { enabled: true }, compaction: { keepRecentTokens: 1, memoryFlushEnabled: true } },
+			settings: { memory: { enabled: true }, compaction: { keepRecentTokens: 1 } },
 		});
 		harnesses.push(h);
 		await h.session.prompt("keep project rules");
@@ -164,13 +150,11 @@ describe("memory-context-integrity: effective memory", () => {
 		expect(result).toMatchObject({ attempted: true, written: 0, skipped: 1, reasons: ["secret_pattern"] });
 		expect(JSON.stringify(result)).not.toContain("simulated-secret");
 		h.setResponses([fauxAssistantMessage(simulatedSecret), fauxAssistantMessage("turn summary")]);
-		const internals = h.session as unknown as CompactionInternals;
-		await internals._runSoftCompaction("threshold", false, await internals._contextMaintenanceSnapshot(), 1);
+		await h.session.compact();
 		const archive = h.sessionManager
 			.getEntries()
 			.filter((entry) => entry.type === "trace" && entry.event.type === "memory/archive");
-		expect(archive).toHaveLength(2);
-		expect(JSON.stringify(archive)).toContain("flush_rejected");
+		expect(archive).toHaveLength(1);
 		expect(JSON.stringify(archive)).toContain("note_rejected");
 		expect(JSON.stringify(archive)).not.toContain("simulated-secret");
 		expect(await h.session.memoryStore.search("API_KEY", "project", h.tempDir)).toEqual([]);

@@ -42,8 +42,6 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
-	/** Previously charged checkpoint usage included in this result's aggregate usage. */
-	prefixUsage?: Usage;
 }
 
 /**
@@ -237,14 +235,6 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 		trailingTokens,
 		lastUsageIndex: usageInfo.index,
 	};
-}
-
-/**
- * Check if compaction should trigger based on context usage.
- */
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
-	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
 }
 
 // ============================================================================
@@ -730,8 +720,6 @@ export interface CompactionPreparation {
 	tokensBefore: number;
 	/** Summary from previous compaction, for iterative update */
 	previousSummary?: string;
-	/** Usage of the validated prefix checkpoint consumed by this preparation. */
-	prefixUsage?: Usage;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -742,6 +730,8 @@ export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 ): CompactionPreparation | undefined {
+	const rolloverIndex = pathEntries.map((entry) => entry.type).lastIndexOf("context_rollover");
+	if (rolloverIndex >= 0) pathEntries = pathEntries.slice(rolloverIndex);
 	pathEntries = applyRedactions(pathEntries, collectShakeRedactions(pathEntries));
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -955,11 +945,10 @@ export async function compact(
 		summary,
 		firstKeptEntryId,
 		tokensBefore,
-		usage: preparation.prefixUsage ? combineUsage(preparation.prefixUsage, summaryUsage) : summaryUsage,
+		usage: summaryUsage,
 		details: {
 			readFiles,
 			modifiedFiles,
-			...(preparation.prefixUsage ? { prefixUsage: preparation.prefixUsage } : {}),
 		} as CompactionDetails,
 	};
 }

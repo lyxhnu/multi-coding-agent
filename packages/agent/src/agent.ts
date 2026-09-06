@@ -50,6 +50,13 @@ export interface PreparedContinuation {
 export interface PrepareContinuationOptions {
 	signal?: AbortSignal;
 	requiredQueueItemIds?: readonly string[];
+	toolNames?: readonly string[];
+	maxTokens?: number;
+}
+
+export interface MeasurePreparedContinuationOptions {
+	toolNames?: readonly string[];
+	maxTokens?: number;
 }
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
@@ -108,6 +115,8 @@ function createMutableAgentState(initialState?: Partial<Omit<AgentState, "runSta
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
+	controlRequest?: AgentLoopConfig["controlRequest"];
+	afterTurnControl?: AgentLoopConfig["afterTurnControl"];
 	getContextBudgetOptions?: AgentLoopConfig["getContextBudgetOptions"];
 	initialState?: Partial<Omit<AgentState, "runState">>;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
@@ -237,6 +246,8 @@ type PreparedContinuationRecord = {
  * and exposes queueing APIs for steering and follow-up messages.
  */
 export class Agent {
+	public controlRequest?: AgentLoopConfig["controlRequest"];
+	public afterTurnControl?: AgentLoopConfig["afterTurnControl"];
 	public getContextBudgetOptions?: AgentLoopConfig["getContextBudgetOptions"];
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
@@ -297,6 +308,8 @@ export class Agent {
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
 		const runtimeOptions: Partial<AgentOptions> = options ?? {};
+		this.controlRequest = runtimeOptions.controlRequest;
+		this.afterTurnControl = runtimeOptions.afterTurnControl;
 		this._state = createMutableAgentState(runtimeOptions.initialState);
 		this.convertToLlm = runtimeOptions.convertToLlm ?? defaultConvertToLlm;
 		this.projectUsageContext = runtimeOptions.projectUsageContext;
@@ -344,6 +357,14 @@ export class Agent {
 	 */
 	get state(): AgentState {
 		return this._state;
+	}
+
+	/** Replace the outcome after caller-owned orchestration that runs only once the agent loop is idle. */
+	setIdleOutcome(outcome: AgentRunOutcome): void {
+		if (this._state.runState.status !== "idle") {
+			throw new Error("Cannot replace an agent outcome while a run is active");
+		}
+		this._state.runState = { status: "idle", lastOutcome: outcome };
 	}
 
 	/** Controls how queued steering messages are drained. */
@@ -450,7 +471,7 @@ export class Agent {
 	}
 
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */
-	async continue(): Promise<void> {
+	async continue(options: PrepareContinuationOptions = {}): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -460,7 +481,7 @@ export class Agent {
 			throw new Error("Cannot continue from message role: assistant");
 		}
 
-		const preparation = await this.prepareContinuation(this._state.messages);
+		const preparation = await this.prepareContinuation(this._state.messages, options);
 		await this.dispatchPreparedContinuation(preparation);
 	}
 
@@ -475,7 +496,10 @@ export class Agent {
 		const baseContext: AgentContext = {
 			systemPrompt: this._state.systemPrompt,
 			messages: candidateMessages.slice(),
-			tools: this._state.tools.slice(),
+			tools:
+				options.toolNames === undefined
+					? this._state.tools.slice()
+					: this._state.tools.filter((tool) => options.toolNames!.includes(tool.name)),
 		};
 		const key = fingerprintValue({
 			baseContextFingerprint: fingerprintAgentContext(baseContext),
@@ -490,6 +514,8 @@ export class Agent {
 			thinkingLevel: this._state.thinkingLevel,
 			queueRevision: this.queueRevision(),
 			requiredQueueItemIds: options.requiredQueueItemIds ?? null,
+			toolNames: options.toolNames ?? null,
+			maxTokens: options.maxTokens ?? null,
 		});
 		if (this.preparedContinuation) {
 			if (this.preparedContinuation.key === key) return this.preparedContinuation.handle;
@@ -522,7 +548,7 @@ export class Agent {
 			...baseContext,
 			messages: [...baseContext.messages, ...selectedQueueItems.map((item) => item.message)],
 		};
-		const config = this.createLoopConfig();
+		const config = this.createLoopConfig({ maxTokens: options.maxTokens });
 		let request: PreparedAgentRequest;
 		try {
 			request = { ...(await prepareAgentRequest(requestContext, config, options.signal)), preparationId };
@@ -581,6 +607,32 @@ export class Agent {
 		} finally {
 			this.preparedContinuation = undefined;
 		}
+	}
+
+	/** Measure an augmented form of a reserved continuation without changing its queue reservation. */
+	async measurePreparedContinuation(
+		preparation: PreparedContinuation,
+		additionalMessages: AgentMessage[],
+		options: MeasurePreparedContinuationOptions = {},
+	): Promise<ContextBudget> {
+		const record = this.preparedContinuation;
+		if (!record || record.handle.preparationId !== preparation.preparationId || record.state !== "prepared") {
+			throw new Error("Prepared continuation is unknown or already settled");
+		}
+		const context: AgentContext = {
+			...record.baseContext,
+			messages: [
+				...record.baseContext.messages,
+				...record.injectedItems.map((item) => item.message),
+				...additionalMessages,
+			],
+			tools:
+				options.toolNames === undefined
+					? this._state.tools.slice()
+					: this._state.tools.filter((tool) => options.toolNames!.includes(tool.name)),
+		};
+		return (await prepareAgentRequest(context, this.createLoopConfig({ maxTokens: options.maxTokens }), undefined))
+			.budget;
 	}
 
 	/** Release a prepared continuation without mutating transcript or append-only state. */
@@ -696,12 +748,15 @@ export class Agent {
 		};
 	}
 
-	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
+	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean; maxTokens?: number } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
 		// A provider switch leaves nothing of ours cached, so let the manager reset before the run.
 		this.appendOnlyContext?.noteModel(this._state.model.provider, this._state.model.id);
 		return {
 			model: this._state.model,
+			maxTokens: options.maxTokens,
+			controlRequest: this.controlRequest,
+			afterTurnControl: this.afterTurnControl,
 			getContextBudgetOptions: this.getContextBudgetOptions,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
 			sessionId: this.sessionId,

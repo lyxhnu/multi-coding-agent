@@ -8,21 +8,18 @@ import type {
 	Tool,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
-import type {
-	BudgetVerification,
-	ContextMaintenanceAction,
-	ContextMaintenanceCause,
-	ContextMaintenancePhase,
-	ContextMaintenanceReasonCode,
-	ContextMaintenanceState,
-	ContinuationIntent,
-	ReductionMethod,
-} from "./compaction/context-maintenance.ts";
-import type { ContextRolloverBlockedReason } from "./context-rollover.ts";
+import type { ContextRolloverBlockedReason, ContextTransitionCause } from "./context-rollover.ts";
 import type { TaskNoteKind } from "./task-note-projection.ts";
 import type { TaskKind, TaskStatus } from "./tasks/types.ts";
 
 export type TraceRequestTool = Pick<Tool, "name">;
+
+/** A Note/History page exactly as it appeared in a final provider request. */
+export interface ContextRecoveryReadPage {
+	toolCallId: string;
+	toolName: string;
+	page: Record<string, unknown>;
+}
 
 /** Exact, serializable request state at the low-level provider boundary. */
 export interface TraceRequestHeader {
@@ -74,50 +71,44 @@ export type SessionTraceEvent =
 	| { type: "request/header"; data: { turn: number; step: number; header: TraceRequestHeader } }
 	| { type: "context/budget"; data: { turn: number; step: number; budget: ContextBudget } }
 	| {
-			type: "context/maintenance";
+			type: "context/save_state";
 			data: {
-				maintenanceId: string;
-				triggerId?: string;
 				turn: number;
-				promptGeneration: number;
-				cause: ContextMaintenanceCause;
-				phase: ContextMaintenancePhase;
-				state: ContextMaintenanceState;
-				method?: ReductionMethod;
-				attemptIndex?: number;
-				requestFingerprint: string;
-				outcome:
-					| "entered"
-					| "committed"
-					| "unavailable"
-					| "failed"
-					| "superseded"
-					| "vetoed"
-					| "ready"
-					| "blocked"
-					| "cancelled"
-					| "dispatched";
-				tokensBefore?: number;
-				tokensAfter?: number;
-				budgetDecision?: ContextBudget["decision"];
-				verification?: BudgetVerification | "not_required";
-				continuation?: ContinuationIntent;
-				nextAction?: ContextMaintenanceAction;
-				dispatchStatus?: "executed" | "coalesced";
-				reasonCode?: ContextMaintenanceReasonCode;
+				operationId: string;
+				windowId: string;
+				phase: "started" | "progress" | "finished" | "failed";
+				businessCutoffEntryId: string;
+				samplesUsed: number;
+				consumedControlTokens: number;
+				consumedOutputTokens: number;
+				reasonCode?: string;
+			};
+	  }
+	| {
+			type: "context/recovery";
+			data: {
+				turn: number;
+				rolloverId: string;
+				phase: "reading" | "complete" | "failed";
+				coveredUnits: number;
+				missingCount: number;
+				progressFingerprint: string;
+				pages?: ContextRecoveryReadPage[];
+				reasonCode?: string;
 			};
 	  }
 	| {
 			type: "context/rollover";
 			data: {
 				rolloverId: string;
-				checkpointId?: string;
+				windowId: string;
+				cause: ContextTransitionCause;
 				dispatchId?: string;
 				turn: number;
 				promptGeneration: number;
 				sourceContextEpoch: number;
 				targetContextEpoch?: number;
-				phase: "checkpoint" | "rollover" | "preparation" | "dispatch";
+				phase: "rollover" | "dispatch";
 				outcome:
 					| "entered"
 					| "waiting"
@@ -133,8 +124,11 @@ export type SessionTraceEvent =
 				preparedRequestFingerprint?: string;
 				sourceTokens?: number;
 				preparedTokens?: number;
+				recoveryWorksetTokens?: number;
+				configuredContextWindow?: number;
+				outputReserveTokens?: number;
+				safetyTokens?: number;
 				reservedDeliveryCount?: number;
-				strongProgressCreditCount?: number;
 				reasonCode?: ContextRolloverBlockedReason;
 			};
 	  }
@@ -142,13 +136,11 @@ export type SessionTraceEvent =
 			type: "compaction/summary";
 			data: {
 				turn: number;
-				phase: "prefix" | "commit";
+				phase: "commit";
 				outcome: "completed" | "discarded";
 				compactionId?: string;
 				sourceFingerprint: string;
 				firstKeptEntryId: string;
-				coveredStartEntryId?: string;
-				coveredEndEntryId?: string;
 				usage?: Usage;
 			};
 	  }
@@ -192,7 +184,6 @@ export type SessionTraceEvent =
 			data: {
 				turn: number;
 				eventId?: string;
-				batchId?: string;
 				promptGeneration: number;
 				contextEpoch: number;
 				kind?: TaskNoteKind;

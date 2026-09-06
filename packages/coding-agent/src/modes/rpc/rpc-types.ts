@@ -121,6 +121,7 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	windowId: string | null;
 	contextEpoch: number;
 	rolloverCount: number;
 	dispatchState: "none" | "prepared" | "started" | "finished" | "blocked" | "cancelled" | "outcome_unknown";

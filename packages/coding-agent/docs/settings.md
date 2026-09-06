@@ -145,9 +145,10 @@ Risky built-in process, network, and external-system effects ask for confirmatio
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `compaction.enabled` | boolean | `true` | Enable auto-compaction |
-| `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
-| `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.enabled` | boolean | `true` | Enable automatic context-window transitions |
+| `compaction.reserveTokens` | number | `16384` | Manual-summary output budget |
+| `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained by manual compaction |
+| `compaction.autoCompactThresholdPercent` | number | `85` | Work-budget ceiling before the state-saving reserve |
 
 ```json
 {

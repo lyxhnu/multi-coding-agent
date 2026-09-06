@@ -442,8 +442,12 @@ export function formatShakePlaceholder(region: ShakeRegion, historyAvailable = f
 	const size = formatTokens(region.tokens);
 	const source = `entryId=${region.entryId}${region.kind === "block" ? ` blockIndex=${region.blockIndex}` : ""}`;
 	const readable =
-		historyAvailable && !(region.kind === "toolResult" && ["memory_get", "memory_search"].includes(region.label));
-	return `[shaken: ${size} tokens of \`${region.label}\` removed from working context; ${source}. ${readable ? "Use history_get to read the saved text; multiple text blocks require blockIndex." : "History readback is unavailable for this source."}]`;
+		historyAvailable &&
+		!(
+			region.kind === "toolResult" &&
+			["memory_get", "memory_search", "history", "context_note"].includes(region.label)
+		);
+	return `[shaken: ${size} tokens of \`${region.label}\` removed from working context; ${source}. ${readable ? "Use history operation=read_item to read the saved text; multiple text blocks require blockIndex." : "History readback is unavailable for this source."}]`;
 }
 
 /** Content of the entry's message, for the roles that have one. `bashExecution` carries none. */

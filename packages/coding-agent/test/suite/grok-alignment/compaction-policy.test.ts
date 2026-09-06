@@ -2,31 +2,8 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { type AssistantMessage, createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type {
-	ContextMaintenanceSnapshot,
-	ReductionAttemptResult,
-} from "../../../src/core/compaction/context-maintenance.ts";
 import { workspaceHash } from "../../../src/core/memory/memory-store.ts";
 import { createHarness, type Harness } from "../harness.ts";
-
-type SessionWithCompactionInternals = {
-	_contextMaintenanceSnapshot: () => Promise<ContextMaintenanceSnapshot>;
-	_runSoftCompaction: (
-		cause: "provider_overflow" | "threshold",
-		willRetry: boolean,
-		snapshot: ContextMaintenanceSnapshot,
-		attemptIndex: number,
-	) => Promise<ReductionAttemptResult>;
-	_maybeStartTwoPassPrefire: () => void;
-};
-
-async function compactOnce(
-	internals: SessionWithCompactionInternals,
-	cause: "provider_overflow" | "threshold" = "threshold",
-	willRetry = false,
-): Promise<ReductionAttemptResult> {
-	return await internals._runSoftCompaction(cause, willRetry, await internals._contextMaintenanceSnapshot(), 1);
-}
 
 function createUsage(totalTokens: number) {
 	return {
@@ -50,7 +27,7 @@ function createAssistant(harness: Harness, totalTokens: number): AssistantMessag
 	};
 }
 
-/** Seeds a session with enough history that (legacy) shouldCompact() sees it as compactable. */
+/** Seeds a session with history for an explicit manual summary. */
 function seedCompactableSession(harness: Harness): void {
 	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
 	const now = Date.now();
@@ -70,46 +47,6 @@ function useSummaryStreamFn(harness: Harness, summary: string): void {
 	harness.session.agent.streamFunction = (model, context) => {
 		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
-			const requestText = context.messages
-				.flatMap((message) =>
-					typeof message.content === "string"
-						? [message.content]
-						: message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])),
-				)
-				.join("\n");
-			let responseText = summary;
-			if (requestText.includes("ContextRolloverNote v1")) {
-				const payload = JSON.parse(requestText.split("\n\n").at(-1)!) as {
-					sourceEntries: Array<{
-						id: string;
-						type: string;
-						message?: { role: string; content: string | Array<{ type: string; text?: string }> };
-					}>;
-				};
-				const objective = [...payload.sourceEntries]
-					.reverse()
-					.find((entry) => entry.type === "message" && entry.message?.role === "user");
-				if (!objective?.message) throw new Error("missing checkpoint objective");
-				const objectiveText =
-					typeof objective.message.content === "string"
-						? objective.message.content
-						: objective.message.content.map((part) => part.text ?? "").join("\n");
-				responseText = JSON.stringify({
-					checkpoint: {
-						version: 1,
-						objective: { text: objectiveText, sourceEntryIds: [objective.id] },
-						userConstraints: [],
-						acceptanceCriteria: { status: "not_specified", items: [] },
-						decisions: [],
-						completedWork: [],
-						currentState: { text: summary, evidenceEntryIds: [objective.id] },
-						failedAttempts: [],
-						nextAction: { text: "Continue compaction.", evidenceEntryIds: [] },
-						historyRefs: [],
-					},
-					noteUpdateCandidates: [],
-				});
-			}
 			const message: AssistantMessage = {
 				...fauxAssistantMessage(
 					context.systemPrompt?.includes("Extract durable")
@@ -123,7 +60,7 @@ function useSummaryStreamFn(harness: Harness, summary: string): void {
 									},
 								],
 							})
-						: responseText,
+						: summary,
 				),
 				api: model.api,
 				provider: model.provider,
@@ -136,55 +73,10 @@ function useSummaryStreamFn(harness: Harness, summary: string): void {
 	};
 }
 
-describe("CompactionPolicy wiring (M4)", () => {
+describe("manual compaction and Memory flush", () => {
 	const harnesses: Harness[] = [];
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
-	});
-
-	it("records policy/mode/memoryFlush on the compaction entry's details (single-pass by default)", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
-		harnesses.push(harness);
-		seedCompactableSession(harness);
-		useSummaryStreamFn(harness, "auto summary");
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-
-		const compacted = await compactOnce(sessionInternals);
-
-		const compactionEntry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
-		expect(compactionEntry?.type).toBe("compaction");
-		expect(compacted.outcome).toBe("committed");
-		const details = compactionEntry?.type === "compaction" ? (compactionEntry.details as any) : undefined;
-		expect(details?.grokCompaction?.mode).toBe("single-pass");
-		expect(details?.grokCompaction?.policy?.autoCompactThresholdPercent).toBe(85);
-		expect(
-			harness.sessionManager
-				.getEntries()
-				.some((entry) => entry.type === "trace" && entry.event.type === "memory/archive"),
-		).toBe(false);
-	});
-
-	it("actually writes the compaction summary into project memory when memory_flush_enabled is set", async () => {
-		const harness = await createHarness({
-			withConfiguredAuth: false,
-			settings: { compaction: { memoryFlushEnabled: true } },
-		});
-		harnesses.push(harness);
-		seedCompactableSession(harness);
-		useSummaryStreamFn(harness, "auto summary");
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-
-		await compactOnce(sessionInternals);
-
-		const flush = harness.sessionManager
-			.getEntries()
-			.find((entry) => entry.type === "trace" && entry.event.type === "memory/archive");
-		expect(flush?.type === "trace" ? flush.event.data : undefined).toMatchObject({
-			reason: "flush_written",
-			written: 1,
-		});
-		const hits = await harness.session.memoryStore.search("auto summary", "project", harness.tempDir, 10);
-		expect(hits.length).toBeGreaterThan(0);
 	});
 
 	it('manual flush (spec 10.5 Phase 1: "手动 /memory flush"): flushMemoryNow() summarizes the whole branch and writes to project memory without dropping any messages or appending a compaction entry', async () => {
@@ -220,21 +112,19 @@ describe("CompactionPolicy wiring (M4)", () => {
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		useSummaryStreamFn(harness, "unwitnessed summary");
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await compactOnce(sessionInternals);
+		await harness.session.compact();
 
 		expect(existsSync(harness.session.memoryStore.rootDir)).toBe(false);
 	});
 
-	it("autoDream Phase 2 (spec 10.5): writes a session note on every compaction, and consolidates into *project* memory once enough have accumulated, when memory.enabled is on", async () => {
+	it("manual compaction archives a session note without automatic Memory extraction", async () => {
 		const harness = await createHarness({
 			withConfiguredAuth: false,
 			settings: { memory: { enabled: true } },
 		});
 		harnesses.push(harness);
-		// Pre-seed 2 session notes "from earlier sessions" so this compaction's own note tips the
-		// default minNewSessions=3 threshold, letting us observe consolidation from a single compaction.
+		// Existing session notes stay available without triggering extraction during manual compaction.
 		harness.session.memoryStore.writeSessionNote(
 			harness.tempDir,
 			"earlier-a",
@@ -252,9 +142,8 @@ describe("CompactionPolicy wiring (M4)", () => {
 
 		seedCompactableSession(harness);
 		useSummaryStreamFn(harness, "dreamable summary");
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await compactOnce(sessionInternals);
+		await harness.session.compact();
 
 		const sessionsDir = join(harness.session.memoryStore.rootDir, workspaceHash(harness.tempDir), "sessions");
 		const noteFiles = readdirSync(sessionsDir).filter((f) => f.endsWith(".md"));
@@ -266,91 +155,8 @@ describe("CompactionPolicy wiring (M4)", () => {
 			harness.tempDir,
 			10,
 		);
-		expect(consolidated.length).toBeGreaterThan(0);
+		expect(consolidated).toHaveLength(0);
 		const globalHits = await harness.session.memoryStore.search("Consolidated memory", "global", harness.tempDir, 10);
 		expect(globalHits).toHaveLength(0); // never auto-writes global (spec 10.5)
-	});
-
-	it("fails closed (skips compaction) when compactModel cannot be resolved and strictCompactModel is set", async () => {
-		const harness = await createHarness({
-			withConfiguredAuth: false,
-			settings: { compaction: { compactModel: "does-not-exist/does-not-exist", strictCompactModel: true } },
-		});
-		harnesses.push(harness);
-		seedCompactableSession(harness);
-		useSummaryStreamFn(harness, "should never be used");
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-
-		const compacted = await compactOnce(sessionInternals);
-		expect(compacted).toMatchObject({ outcome: "failed", reason: "provider_failed" });
-
-		const compactionEntries = harness.sessionManager.getEntries().filter((e) => e.type === "compaction");
-		expect(compactionEntries).toHaveLength(0);
-		const compactionEnd = harness.eventsOfType("compaction_end").at(-1);
-		expect(compactionEnd?.errorMessage).toContain("could not be resolved");
-		expect(compactionEnd?.errorMessage).toContain("strictCompactModel");
-	});
-
-	it("falls back to the current model (with a warning) when compactModel cannot be resolved and strictCompactModel is off", async () => {
-		const harness = await createHarness({
-			withConfiguredAuth: false,
-			settings: { compaction: { compactModel: "does-not-exist/does-not-exist" } },
-		});
-		harnesses.push(harness);
-		seedCompactableSession(harness);
-		useSummaryStreamFn(harness, "fallback summary");
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-
-		const compacted = await compactOnce(sessionInternals);
-
-		const compactionEntry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
-		expect(compactionEntry?.type === "compaction" ? compactionEntry.summary : undefined).toContain(
-			"fallback summary",
-		);
-		expect(compacted.outcome).toBe("committed");
-		const details = compactionEntry?.type === "compaction" ? (compactionEntry.details as any) : undefined;
-		expect(details?.compactModelWarning).toContain("could not be resolved");
-	});
-
-	it("two-pass compaction (spec 9.5): pass 1 is atomically persisted in the checkpoint envelope and reused by pass 2", async () => {
-		const harness = await createHarness({
-			withConfiguredAuth: false,
-			settings: { compaction: { twoPassEnabled: true } },
-		});
-		harnesses.push(harness);
-		seedCompactableSession(harness);
-		useSummaryStreamFn(harness, "prefire prefix summary");
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-
-		// Pass 1: fires speculatively (in this test, invoked directly rather than via the 75%-usage
-		// trigger check — see shouldPrefireTwoPass's own coverage in compaction-policy.test.ts at the repo
-		// root for that threshold logic). It runs as a fire-and-forget background task, so poll for its
-		// result rather than assuming it has landed synchronously.
-		sessionInternals._maybeStartTwoPassPrefire();
-		let prefireEntry: unknown;
-		for (let i = 0; i < 40 && !prefireEntry; i++) {
-			prefireEntry = harness.sessionManager
-				.getEntries()
-				.find((e) => e.type === "custom" && e.customType === "context-rollover-checkpoint");
-			if (!prefireEntry) await new Promise((resolve) => setTimeout(resolve, 25));
-		}
-		expect(prefireEntry).toBeTruthy();
-		expect(
-			(prefireEntry as { data?: { checkpoint?: { compactionPrefix?: { summary?: string } } } }).data?.checkpoint
-				?.compactionPrefix?.summary,
-		).toContain("prefire prefix summary");
-		expect(
-			harness.sessionManager
-				.getEntries()
-				.filter((entry) => entry.type === "custom" && entry.customType === "context-rollover-checkpoint"),
-		).toHaveLength(1);
-
-		// Pass 2: the real compaction should now report mode "two-pass" (it reused pass 1's prefix
-		// summary rather than summarizing cold).
-		useSummaryStreamFn(harness, "pass 2 tail summary");
-		await compactOnce(sessionInternals);
-		const compactionEntry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
-		const details = compactionEntry?.type === "compaction" ? (compactionEntry.details as any) : undefined;
-		expect(details?.grokCompaction?.mode).toBe("two-pass");
 	});
 });

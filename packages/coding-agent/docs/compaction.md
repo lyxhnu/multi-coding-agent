@@ -1,9 +1,9 @@
 # Compaction & Branch Summarization
 
-LLMs have limited context windows. When conversations grow too long, pi uses compaction to summarize older content while preserving recent work. This page covers both auto-compaction and branch summarization.
+LLMs have limited context windows. Automatic capacity management uses fresh context windows and bounded retrieval; see [memory and context](memory-context.md). This page describes explicit `/compact` and branch summarization.
 
 **Source files** ([pi-mono](https://github.com/earendil-works/pi-mono)):
-- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
+- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Manual compaction logic
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
 - [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
 - [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
@@ -17,7 +17,7 @@ Pi has two summarization mechanisms:
 
 | Mechanism | Trigger | Purpose |
 |-----------|---------|---------|
-| Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
+| Compaction | `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
 Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused.
@@ -26,17 +26,7 @@ Both use the same structured summary format and track file operations cumulative
 
 ### When It Triggers
 
-Before each main-model request, Pi checks the final transformed context, including system prompt, tool definitions, new user input, images and all returned tool results:
-
-```
-estimatedInput + outputReserve + safetyMargin <= contextWindow
-```
-
-The shared output reserve is capped by the requested limit, model capability and 32768 tokens; the safety margin is `max(4096, ceil(outputReserve * 0.2))`. The configured `reserveTokens` condition (default 16384) and percentage threshold (default 85%) can trigger earlier reduction. These are independent trigger conditions, not extra safety margins added to the formula. Historical usage is used only when the model, system prompt, tools and message-prefix fingerprint still match; otherwise the request is estimated again.
-
-If the request does not fit, the agent ends that low-level run with structured `context_limit`. With auto-compaction enabled, the session tries shake, then bounded compaction, and checks the rebuilt request again before resuming. It stops on no progress or exhausted reduction allowance and does not report task completion. Disabling auto-compaction disables reduction, not the final budget check. See [memory and context](memory-context.md) and [RPC events](rpc.md#context_budget-and-context_limit).
-
-You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
+Trigger compaction explicitly with `/compact [instructions]`. Optional instructions focus the summary. Each committed compaction creates a new window identity and preserves the selected recent messages. Automatic window transitions do not invoke this summarizer.
 
 ### How It Works
 
@@ -111,13 +101,7 @@ For split turns, pi summarizes each nonempty region and merges the results:
 
 The previous summary is retained even when there are no new complete history turns. With no new content, no model request or new boundary is committed (`/compact` reports "Already compacted"). Empty, length-truncated, failed or cancelled summaries cannot replace the current context. Extension-provided summaries must pass the same nonempty and source-boundary checks.
 
-### Incremental Prefix Checkpoints
-
-With `compaction.twoPassEnabled: true`, the session can start one background checkpoint at the configured threshold minus 10 percentage points. The single `context-rollover-checkpoint` envelope records the semantic checkpoint and its compaction prefix identity, summary, and usage atomically. It is log data, not an extra LLM message; no second prefix-checkpoint entry is written.
-
-Appending a tail preserves a valid checkpoint. The final compaction receives that summary plus only uncovered messages. Branch switches, rewritten prefix content (including shake) or a different base compaction invalidate it. Late results are checked before persistence; restored checkpoints are checked again before reuse. Session totals count prefix usage once, including when reused by a later compaction.
-
-Compaction is committed before its memory note/automatic archive is written. An archive failure is a separate `memory/archive` trace result and does not roll back successful compaction. `history_get` can still page through saved, shaken ancestors after compaction without re-executing tools.
+Compaction commits before writing an optional Memory session note. Note-write failures do not roll back compaction. `history` can read saved visible ancestors after compaction without rerunning tools.
 
 ### Cut Point Rules
 
@@ -136,6 +120,8 @@ Defined in [`session-manager.ts`](https://github.com/earendil-works/pi-mono/blob
 ```typescript
 interface CompactionEntry<T = unknown> {
   type: "compaction";
+  windowId: string;
+  previousWindowId: string | null;
   id: string;
   parentId: string;
   timestamp: number;
@@ -151,7 +137,6 @@ interface CompactionEntry<T = unknown> {
 interface CompactionDetails {
   readFiles: string[];
   modifiedFiles: string[];
-  prefixUsage?: Usage; // Already charged checkpoint usage included in entry.usage
 }
 ```
 
@@ -288,7 +273,7 @@ Extensions can intercept and customize both compaction and branch summarization.
 
 ### session_before_compact
 
-Fired before auto-compaction or `/compact`. Can cancel or provide custom summary. See `SessionBeforeCompactEvent` and `CompactionPreparation` in the types file.
+Fired before `/compact`. Can cancel or provide custom summary. See `SessionBeforeCompactEvent` and `CompactionPreparation` in the types file.
 
 ```typescript
 pi.on("session_before_compact", async (event, ctx) => {
@@ -303,8 +288,8 @@ pi.on("session_before_compact", async (event, ctx) => {
   // preparation.settings - compaction settings
 
   // branchEntries - all entries on current branch (for custom state)
-  // reason - "manual" (/compact), "threshold", or "overflow"
-  // willRetry - whether the aborted turn is retried after compaction (overflow recovery)
+  // reason - "manual" (/compact)
+  // willRetry - false for manual compaction
   // signal - AbortSignal (pass to LLM calls)
 
   // Cancel:
@@ -408,12 +393,9 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `true` | Enable auto-compaction |
-| `reserveTokens` | `16384` | Tokens to reserve for LLM response |
-| `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
-| `autoCompactThresholdPercent` | `85` | Additional input-pressure trigger |
-| `twoPassEnabled` | `false` | Generate and reuse a stable prefix checkpoint |
-| `wallClockBudgetSecs` | `300` | Per-attempt automatic-summary deadline; existing zero setting disables the timer |
-| `memoryFlushEnabled` | `false` | Archive the committed automatic summary to project memory |
+| `enabled` | `true` | Enable automatic context-window transitions |
+| `reserveTokens` | `16384` | Manual-summary output budget |
+| `keepRecentTokens` | `20000` | Recent tokens retained by manual compaction |
+| `autoCompactThresholdPercent` | `85` | Work-budget ceiling before the state-saving reserve |
 
-Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`; request preflight remains enabled.
+Disable automatic capacity-triggered transitions with `"enabled": false`. You can still compact manually with `/compact`; request preflight remains enabled.

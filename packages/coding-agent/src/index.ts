@@ -46,8 +46,9 @@ export {
 	getLastAssistantUsage,
 	prepareBranchEntries,
 	serializeConversation,
-	shouldCompact,
 } from "./core/compaction/index.ts";
+export type { ContextRemaining } from "./core/context-budget.ts";
+export type { ContextWindowIdentity } from "./core/context-window.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
 export type {
@@ -165,6 +166,7 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export { History, type HistoryItem, type HistoryPage, type HistoryQuery } from "./core/history.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
@@ -224,6 +226,9 @@ export {
 	buildContextEntries,
 	buildSessionContext,
 	type CompactionEntry,
+	type ContextRolloverDispatchEntry,
+	type ContextRolloverEntry,
+	type ContextWindowEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
@@ -274,6 +279,7 @@ export {
 	type SubagentTaskResult,
 	subagentSubmissionSchema,
 } from "./core/subagents/protocol.ts";
+export { queryTaskNotes, type TaskNoteQuery } from "./core/task-note-query.ts";
 export { TaskManager } from "./core/tasks/task-manager.ts";
 export type {
 	TaskKind,
@@ -287,6 +293,7 @@ export type {
 	TaskWaitOptions,
 	TaskWaitResult,
 } from "./core/tasks/types.ts";
+export { createContextRemainingToolDefinition, createNewContextToolDefinition } from "./core/tools/context-window.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
 // Tools
 export {
@@ -300,7 +307,7 @@ export {
 	createEditToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
-	createHistoryGetToolDefinition,
+	createHistoryToolDefinition,
 	createLocalBashOperations,
 	createLsToolDefinition,
 	createReadToolDefinition,
@@ -320,9 +327,6 @@ export {
 	type GrepToolDetails,
 	type GrepToolInput,
 	type GrepToolOptions,
-	HISTORY_DEFAULT_LIMIT,
-	HISTORY_MAX_LIMIT,
-	type HistoryGetInput,
 	type LsOperations,
 	type LsToolDetails,
 	type LsToolInput,

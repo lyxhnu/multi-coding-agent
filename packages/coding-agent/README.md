@@ -14,7 +14,7 @@
 
 Pi is a minimal terminal coding harness. Adapt pi to your workflows, not the other way around, without having to fork and modify pi internals. Extend it with TypeScript [Extensions](#extensions), [Skills](#skills), [Prompt Templates](#prompt-templates), and [Themes](#themes). Put your extensions, skills, prompt templates, and themes in [Pi Packages](#pi-packages) and share them with others via npm or git.
 
-Pi exposes `read`, `bash`, `edit`, `write`, and session-scoped `history_get` to the model by default. Additional built-in capabilities such as memory, language servers, web access, MCP, subagents, and plan mode are registered only when their dependencies are available and must be activated explicitly.
+Pi exposes `read`, `bash`, `edit`, `write`, and session-scoped `history`, `context_note`, `get_context_remaining`, `new_context` to the model by default. Additional built-in capabilities such as memory, language servers, web access, MCP, subagents, and plan mode are registered only when their dependencies are available and must be activated explicitly.
 
 Pi runs in four modes: interactive, print or JSON, RPC for process integration, and an SDK for embedding in your own apps. See [openclaw/openclaw](https://github.com/openclaw/openclaw) for a real-world SDK integration.
 
@@ -88,7 +88,7 @@ pi
 /login  # Then select provider
 ```
 
-Then just talk to pi. The default tools are `read`, `write`, `edit`, `bash`, and `history_get` for saved, shaken context. The model uses these to fulfill your requests. Add capabilities via [skills](#skills), [prompt templates](#prompt-templates), [extensions](#extensions), or [pi packages](#pi-packages).
+Then just talk to pi. The default tools are `read`, `write`, `edit`, `bash`, and `history`, `context_note`, `get_context_remaining`, `new_context` for bounded session retrieval and window management. The model uses these to fulfill your requests. Add capabilities via [skills](#skills), [prompt templates](#prompt-templates), [extensions](#extensions), or [pi packages](#pi-packages).
 
 **Platform notes:** [Windows](docs/windows.md) | [Termux (Android)](docs/termux.md) | [tmux](docs/tmux.md) | [Terminal setup](docs/terminal-setup.md) | [Shell aliases](docs/shell-aliases.md)
 
@@ -277,11 +277,11 @@ Long sessions can exhaust context windows. Compaction summarizes older messages 
 
 **Manual:** `/compact` or `/compact <custom instructions>`
 
-**Automatic:** Enabled by default. Triggers on context overflow (recovers and retries) or when approaching the limit (proactive). Configure via `/settings` or `settings.json`.
+**Automatic:** Enabled by default. Capacity pressure opens a fresh window after one bounded state-saving turn when space permits. The model can also request `new_context`. New windows start with an identity and recovery reference; requirements and notes are read on demand. Configure via `/settings` or `settings.json`.
 
 Compaction is lossy. The full history remains in the JSONL file; use `/tree` to revisit. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
 
-Every request is budget-checked after context transforms. Unresolved `context_limit` is a stopped, incomplete task, not success. `history_get` reads bounded pages from saved shake sources without rerunning tools. See [memory and context](docs/memory-context.md) for CLI diagnostics, incremental checkpoints and effective memory views.
+Every request is budget-checked after context transforms. Unresolved `context_limit` is a stopped, incomplete task, not success. `history` reads bounded pages from visible session history without rerunning tools. See [memory and context](docs/memory-context.md) for CLI diagnostics, window recovery and effective memory views.
 
 ---
 
@@ -580,7 +580,7 @@ cat README.md | pi -p "Summarize this text"
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools by default but keep extension/custom tools enabled |
 | `--no-tools`, `-nt` | Disable all tools by default |
 
-Default active tools: `read`, `bash`, `edit`, `write`, `history_get`.
+Default active tools: `read`, `bash`, `edit`, `write`, `history`, `context_note`, `get_context_remaining`, `new_context`.
 
 Other built-in tools include `grep`, `find`, `ls`, `todo_write`, task controls, plan controls, and `web_fetch`. Memory, LSP, web search, and MCP tools register only when their corresponding capability is enabled or configured.
 

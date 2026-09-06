@@ -29,18 +29,23 @@ import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import type {
+	ContextRecoveryReferences,
 	ContextRolloverBlockedReason,
-	ContextRolloverBundle,
 	ContextRolloverRevisions,
+	ContextTransitionCause,
 } from "./context-rollover.ts";
+import {
+	type ContextWindowIdentity,
+	createContextWindowIdentity,
+	currentContextWindow,
+	formatContextWindow,
+} from "./context-window.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
-	formatContextRolloverHandoff,
-	formatTodoStateProjection,
 } from "./messages.ts";
 import type { SessionTraceEvent } from "./trace.ts";
 
@@ -72,6 +77,16 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	message: AgentMessage;
 }
 
+/** Full post-hook tool result retained outside the bounded provider projection. */
+export interface ToolResultSourceEntry extends SessionEntryBase {
+	type: "tool_result_source";
+	toolCallId: string;
+	toolName: string;
+	content: (TextContent | ImageContent)[];
+	details: unknown;
+	isError: boolean;
+}
+
 export type PendingDeliveryChannel = "steering" | "follow_up" | "next_prompt";
 
 export interface PendingDeliveryEntry extends SessionEntryBase {
@@ -95,11 +110,27 @@ export interface DeliveryCancelledEntry extends SessionEntryBase {
 export interface ContextOperationEntry extends SessionEntryBase {
 	type: "context_operation";
 	operationId: string;
-	operationKind: "checkpoint" | "soft_compaction" | "overflow_retry";
+	operationKind: "save_state";
+	transitionCause: ContextTransitionCause;
 	state: "started" | "finished";
+	windowId: string;
 	promptGeneration: number;
 	contextEpoch: number;
 	sourceFingerprint: string;
+	businessCutoffEntryId: string;
+	startTaskNoteRevision: string;
+	controlBudgetTokens: number;
+	outputBudgetTokens: number;
+	samplesUsed: number;
+	consumedControlTokens: number;
+	consumedOutputTokens: number;
+	finalTaskNoteRevision?: string;
+	nextActionEventId?: string;
+	relatedNoteEventIds?: string[];
+	noteFreshness?: ContextRecoveryReferences["noteFreshness"];
+	requiredHistoryRefs?: Array<{ entryId: string; blockIndex?: number }>;
+	requirementSourceRefs?: Array<{ entryId: string; blockIndex?: number }>;
+	todoIds?: string[];
 	outcome?: string;
 }
 
@@ -116,23 +147,38 @@ export interface ContextProgressEntry extends SessionEntryBase {
 	taskId?: string;
 }
 
-export interface ContextRolloverEntry extends SessionEntryBase {
+export interface ContextWindowEntry extends SessionEntryBase, ContextWindowIdentity {
+	type: "context_window";
+	reason: "initial" | "branch";
+}
+
+export interface ContextTransitionRequestEntry extends SessionEntryBase {
+	type: "context_transition_request";
+	requestId: string;
+	windowId: string;
+	promptGeneration: number;
+	toolCallId: string;
+	reason: string;
+}
+
+export interface ContextRolloverEntry extends SessionEntryBase, ContextWindowIdentity {
 	type: "context_rollover";
 	rolloverId: string;
 	dispatchId: string;
 	promptGeneration: number;
 	sourceContextEpoch: number;
 	targetContextEpoch: number;
-	checkpointEntryId: string;
-	bundle: ContextRolloverBundle;
+	requestId: string;
+	cause: ContextTransitionCause;
+	recovery: ContextRecoveryReferences;
 	expectedRevisions: ContextRolloverRevisions;
 	sourceTokens: number;
 	preparedTokens: number;
+	configuredContextWindow: number;
 	sourceRequestFingerprint: string;
 	preparedRequestFingerprint: string;
 	preparationBaseFingerprint: string;
 	reservedDeliveryIds: string[];
-	strongProgressCreditIds: string[];
 }
 
 export interface ContextRolloverDispatchEntry extends SessionEntryBase {
@@ -142,7 +188,7 @@ export interface ContextRolloverDispatchEntry extends SessionEntryBase {
 	state: "started" | "finished" | "blocked" | "cancelled";
 	requestFingerprint: string;
 	reservedDeliveryIds?: string[];
-	outcome?: "completed" | "context_limit" | "aborted" | "failed";
+	outcome?: "completed" | "context_limit" | "context_transition" | "aborted" | "failed";
 	reason?: ContextRolloverBlockedReason;
 }
 
@@ -163,7 +209,7 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	modelId: string;
 }
 
-export interface CompactionEntry<T = unknown> extends SessionEntryBase {
+export interface CompactionEntry<T = unknown> extends SessionEntryBase, ContextWindowIdentity {
 	type: "compaction";
 	summary: string;
 	firstKeptEntryId: string;
@@ -258,12 +304,15 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
 export type SessionEntry =
 	| SessionMessageEntry
+	| ToolResultSourceEntry
 	| PendingDeliveryEntry
 	| DeliveryReceiptEntry
 	| DeliveryCancelledEntry
 	| ContextOperationEntry
 	| ContextProgressEntry
 	| ContextRolloverEntry
+	| ContextWindowEntry
+	| ContextTransitionRequestEntry
 	| ContextRolloverDispatchEntry
 	| SessionTraceEntry
 	| ThinkingLevelChangeEntry
@@ -603,10 +652,10 @@ export function buildContextEntries(
 	byId?: Map<string, SessionEntry>,
 ): SessionEntry[] {
 	const path = buildSessionPath(entries, leafId, byId);
-	let compaction: CompactionEntry | null = null;
+	let compaction: CompactionEntry | ContextRolloverEntry | null = null;
 
 	for (const entry of path) {
-		if (entry.type === "compaction") {
+		if (entry.type === "compaction" || entry.type === "context_rollover") {
 			compaction = entry;
 		}
 	}
@@ -624,6 +673,7 @@ export function buildContextEntries(
 		return applyRedactions(path, redactions);
 	}
 
+	if (compaction.type === "context_rollover") return applyRedactions(path.slice(compactionIdx), redactions);
 	const contextEntries: SessionEntry[] = [compaction];
 	let foundFirstKept = false;
 	for (let i = 0; i < compactionIdx; i++) {
@@ -669,49 +719,37 @@ export function buildSessionContext(
 		}
 		return sessionEntryToContextMessages(entry);
 	};
-	let latestRolloverIndex = -1;
-	for (let index = path.length - 1; index >= 0; index--) {
-		if (path[index].type === "context_rollover") {
-			latestRolloverIndex = index;
-			break;
-		}
-	}
-	if (latestRolloverIndex >= 0) {
-		const rollover = path[latestRolloverIndex] as ContextRolloverEntry;
-		const pathById = new Map(path.map((entry) => [entry.id, entry]));
-		const activeEntries = rollover.bundle.activeEntryIds.flatMap((id) => {
-			const entry = pathById.get(id);
-			return entry ? [entry] : [];
-		});
-		const afterBoundary = path.slice(latestRolloverIndex + 1);
-		const redactions = collectShakeRedactions(path);
-		const redactedActive = applyRedactions(activeEntries, redactions);
-		const redactedAfter = applyRedactions(afterBoundary, redactions);
-		const latestTodo = [...path]
-			.reverse()
-			.find((entry) => entry.type === "custom" && entry.customType === "todo-state");
-		const timestamp = "1970-01-01T00:00:00.000Z";
-		const handoff = createCustomMessage(
-			"context-rollover",
-			formatContextRolloverHandoff(rollover.bundle),
-			false,
-			{ rolloverId: rollover.rolloverId, historyAllowlist: rollover.bundle.historyAllowlist },
-			timestamp,
-		);
-		const todo = createCustomMessage(
-			"todo-state-projection",
-			formatTodoStateProjection(latestTodo?.type === "custom" ? latestTodo.data : undefined),
-			false,
-			undefined,
-			timestamp,
-		);
+	const active = buildContextEntries(entries, leafId, byId);
+	const rollover = active.find((entry) => entry.type === "context_rollover");
+	if (rollover?.type === "context_rollover") {
 		return {
-			messages: [handoff, ...redactedActive.flatMap(projectEntry), todo, ...redactedAfter.flatMap(projectEntry)],
+			messages: [
+				createCustomMessage(
+					"context-window",
+					formatContextWindow(currentContextWindow(path)!.windowId, rollover.rolloverId),
+					false,
+					undefined,
+					"1970-01-01T00:00:00.000Z",
+				),
+				...active.filter((entry) => entry !== rollover).flatMap(projectEntry),
+			],
 			thinkingLevel,
 			model,
 		};
 	}
+
 	const messages = buildContextEntries(entries, leafId, byId).flatMap(projectEntry);
+	const identity = currentContextWindow(path);
+	if (identity)
+		messages.unshift(
+			createCustomMessage(
+				"context-window",
+				formatContextWindow(identity.windowId),
+				false,
+				undefined,
+				"1970-01-01T00:00:00.000Z",
+			),
+		);
 	return { messages, thinkingLevel, model };
 }
 
@@ -786,6 +824,8 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 
 		pending += decoder.end();
 		const finalEntry = parseSessionEntryLine(pending);
+		if (pending.trim() && !finalEntry)
+			throw new Error("Session ends with an incomplete record; automatic recovery is unsafe");
 		if (finalEntry) entries.push(finalEntry);
 	} finally {
 		closeSync(fd);
@@ -1266,16 +1306,18 @@ export class SessionManager {
 		const mustPersist = this.fileEntries.some(
 			(e) =>
 				(e.type === "message" && e.message.role === "assistant") ||
+				e.type === "tool_result_source" ||
 				e.type === "pending_delivery" ||
 				e.type === "delivery_receipt" ||
 				e.type === "delivery_cancelled" ||
 				e.type === "context_operation" ||
 				e.type === "context_progress" ||
+				e.type === "context_window" ||
+				e.type === "context_transition_request" ||
 				e.type === "context_rollover" ||
 				e.type === "context_rollover_dispatch" ||
 				e.type === "compaction" ||
 				(e.type === "custom" && e.customType === "task-note-event") ||
-				(e.type === "custom" && e.customType === "context-rollover-checkpoint") ||
 				(e.type === "trace" &&
 					e.event.type === "context/budget" &&
 					e.event.data.budget.decision === "context_limit"),
@@ -1304,9 +1346,14 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			const fd = openSync(this.sessionFile, "a");
+			const fd = openSync(this.sessionFile, "a+");
 			const originalSize = fstatSync(fd).size;
 			try {
+				if (originalSize > 0) {
+					const lastByte = Buffer.alloc(1);
+					readSync(fd, lastByte, 0, 1, originalSize - 1);
+					if (lastByte[0] !== 10) writeFileSync(fd, "\n");
+				}
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			} catch (error) {
 				ftruncateSync(fd, originalSize);
@@ -1366,6 +1413,29 @@ export class SessionManager {
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Persist the complete post-hook result before constructing its bounded model-facing message. */
+	appendToolResultSource(
+		toolCallId: string,
+		toolName: string,
+		content: (TextContent | ImageContent)[],
+		details: unknown,
+		isError: boolean,
+	): string {
+		const entry: ToolResultSourceEntry = {
+			type: "tool_result_source",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			toolCallId,
+			toolName,
+			content: structuredClone(content),
+			details: structuredClone(details),
+			isError,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1437,6 +1507,43 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	ensureContextWindow(): ContextWindowIdentity {
+		return currentContextWindow(this.getBranch()) ?? this.startContextWindow("initial");
+	}
+
+	startContextWindow(reason: "initial" | "branch"): ContextWindowIdentity {
+		const identity = createContextWindowIdentity(this.getBranch());
+		this._appendEntry({
+			type: "context_window",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			reason,
+			...identity,
+		});
+		return identity;
+	}
+
+	requestContextTransition(toolCallId: string, reason: string): string {
+		const { windowId } = this.ensureContextWindow();
+		const requestId = `${windowId}:${toolCallId}`;
+		if (
+			!this.getBranch().some((entry) => entry.type === "context_transition_request" && entry.requestId === requestId)
+		)
+			this._appendEntry({
+				type: "context_transition_request",
+				id: generateId(this.byId),
+				parentId: this.leafId,
+				timestamp: new Date().toISOString(),
+				requestId,
+				windowId,
+				promptGeneration: this.getLatestContextCoordinates().promptGeneration,
+				toolCallId,
+				reason,
+			});
+		return requestId;
+	}
+
 	appendContextRollover(input: Omit<ContextRolloverEntry, keyof SessionEntryBase | "type">): string {
 		const entry: ContextRolloverEntry = {
 			type: "context_rollover",
@@ -1459,33 +1566,6 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
-	}
-
-	getContextOperationUsage(
-		promptGeneration: number,
-		contextEpoch: number,
-	): {
-		checkpoint: number;
-		softCompaction: number;
-		overflowRetry: number;
-	} {
-		const started = new Map<string, ContextOperationEntry>();
-		for (const entry of this.getBranch()) {
-			if (
-				entry.type === "context_operation" &&
-				entry.state === "started" &&
-				entry.promptGeneration === promptGeneration &&
-				entry.contextEpoch === contextEpoch
-			) {
-				started.set(entry.operationId, entry);
-			}
-		}
-		const operations = [...started.values()];
-		return {
-			checkpoint: operations.filter((entry) => entry.operationKind === "checkpoint").length,
-			softCompaction: operations.filter((entry) => entry.operationKind === "soft_compaction").length,
-			overflowRetry: operations.filter((entry) => entry.operationKind === "overflow_retry").length,
-		};
 	}
 
 	getLatestContextCoordinates(): { promptGeneration: number; contextEpoch: number } {
@@ -1522,11 +1602,13 @@ export class SessionManager {
 	}
 
 	getContextRolloverState(): {
+		windowId: string | null;
 		contextEpoch: number;
 		rolloverCount: number;
 		dispatchState: "none" | "prepared" | "started" | "finished" | "blocked" | "cancelled" | "outcome_unknown";
 		dispatchId?: string;
 		rolloverId?: string;
+		outcome?: ContextRolloverDispatchEntry["outcome"];
 	} {
 		const branch = this.getBranch();
 		const coordinates = this.getLatestContextCoordinates();
@@ -1564,9 +1646,11 @@ export class SessionManager {
 		if (latestDispatch?.state === "started") dispatchState = "outcome_unknown";
 		else if (latestDispatch) dispatchState = latestDispatch.state;
 		return {
+			windowId: currentContextWindow(branch)?.windowId ?? null,
 			contextEpoch: coordinates.contextEpoch,
 			rolloverCount: rollovers.length,
 			dispatchState,
+			...(latestDispatch?.state === "finished" ? { outcome: latestDispatch.outcome } : {}),
 			...(latestDispatch?.dispatchId === undefined ? {} : { dispatchId: latestDispatch.dispatchId }),
 			...(latestDispatch?.rolloverId === undefined
 				? latestRollover === undefined
@@ -1613,6 +1697,7 @@ export class SessionManager {
 		usage?: Usage,
 	): string {
 		const entry: CompactionEntry<T> = {
+			...createContextWindowIdentity(this.getBranch()),
 			type: "compaction",
 			id: generateId(this.byId),
 			parentId: this.leafId,
@@ -1921,6 +2006,7 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.startContextWindow("branch");
 	}
 
 	/**
@@ -1963,6 +2049,7 @@ export class SessionManager {
 			fromHook,
 		};
 		this._appendEntry(entry);
+		this.startContextWindow("branch");
 		return entry.id;
 	}
 
@@ -2042,12 +2129,13 @@ export class SessionManager {
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Preserve completed checkpoints and preflight-only diagnostics on branch export too.
+			// Preserve authority records and preflight-only diagnostics on branch export too.
 			const hasAssistant = this.fileEntries.some(
 				(e) =>
 					(e.type === "message" && e.message.role === "assistant") ||
 					e.type === "compaction" ||
-					(e.type === "custom" && e.customType === "context-rollover-checkpoint") ||
+					e.type === "context_rollover" ||
+					e.type === "context_window" ||
 					(e.type === "trace" &&
 						e.event.type === "context/budget" &&
 						e.event.data.budget.decision === "context_limit"),
@@ -2059,6 +2147,7 @@ export class SessionManager {
 				this.flushed = false;
 			}
 
+			this.startContextWindow("branch");
 			return newSessionFile;
 		}
 
@@ -2080,6 +2169,7 @@ export class SessionManager {
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 		this.sessionId = newSessionId;
 		this._buildIndex();
+		this.startContextWindow("branch");
 		return undefined;
 	}
 
@@ -2198,7 +2288,9 @@ export class SessionManager {
 			}
 		}
 
-		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+		const fork = new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+		fork.startContextWindow("branch");
+		return fork;
 	}
 
 	/**

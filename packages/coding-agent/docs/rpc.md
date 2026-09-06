@@ -193,7 +193,7 @@ Response:
 
 The `model` field is a full [Model](#model) object or `null`. The `sessionName` field is the display name set via `set_session_name`, or omitted if not set.
 
-`runState` is `RpcAgentRunState`, the JSON representation of agent-core's discriminated `AgentRunState`. An idle state has an optional `lastOutcome`: `completed`, `failed`, `aborted`, or `context_limit`. The latter includes `budget` and is not successful task completion. A running state includes `runId`, `turn`, and `phase`; `executing_tools.pendingToolCallIds` is an array, not a JavaScript Set. Await `agent_settled`, then call `get_state` to distinguish final completion from an intermediate stop that is followed by compaction.
+`runState` is `RpcAgentRunState`, the JSON representation of agent-core's discriminated `AgentRunState`. An idle state has an optional `lastOutcome`: `completed`, `failed`, `aborted`, `context_limit`, or `context_transition`. The last two are incomplete outcomes; `context_limit` also includes `budget`. A running state includes `runId`, `turn`, and `phase`; `executing_tools.pendingToolCallIds` is an array, not a JavaScript Set. Await `agent_settled`, then call `get_state` to distinguish final completion from an intermediate stop that is followed by a window transition. `windowId` is the current persisted UUID (null before the initial window exists); `contextEpoch`, `rolloverCount`, and `dispatchState` expose continuation state. `outcome_unknown` must not be automatically replayed.
 
 #### get_messages
 
@@ -415,7 +415,7 @@ Response:
 
 #### set_auto_compaction
 
-Enable or disable automatic compaction when context is nearly full.
+Enable or disable automatic window transitions and deterministic shake when context is nearly full. Explicit `compact` remains a separate summary operation.
 
 ```json
 {"type": "set_auto_compaction", "enabled": true}
@@ -581,7 +581,7 @@ Response:
 }
 ```
 
-`tokens` and `cost` include assistant messages, usage reported by tools, compaction/branch-summary generation, completed prefix checkpoints and traced memory extraction across the full session. Reusing a checkpoint does not count its usage twice. `contextUsage` is the footer estimate, not the authoritative next-request budget; use `context_budget` events for the final transformed request.
+`tokens` and `cost` include assistant messages, usage reported by tools, manual compaction/branch-summary generation and traced memory extraction across the full session. `contextUsage` is the footer estimate, not the authoritative next-request budget; use `context_budget` events for the final transformed request.
 
 `contextUsage` is omitted when no model or context window is available. `contextUsage.tokens` and `contextUsage.percent` are `null` immediately after compaction until a fresh post-compaction assistant response provides valid usage data.
 
@@ -852,8 +852,8 @@ Events are streamed to stdout as JSON lines during agent operation. Events do no
 | Event | Description |
 |-------|-------------|
 | `agent_start` | Agent begins processing |
-| `agent_end` | One low-level agent run completes (may still be followed by retry, compaction, or queued continuations) |
-| `agent_settled` | Agent run is fully settled; no automatic retry, compaction retry, or queued continuation remains |
+| `agent_end` | One low-level agent run completes (may still be followed by retry, window transitions, or queued continuations) |
+| `agent_settled` | Agent run is fully settled; no immediate automatic continuation remains; inspect runState for completion and pending window transitions |
 | `context_budget` | Final transformed request estimate, output reserve, safety margin and decision |
 | `turn_start` | New turn begins |
 | `turn_end` | Turn completes (includes assistant message and tool results) |
@@ -896,7 +896,7 @@ Emitted when one low-level agent run completes. Contains all messages generated 
 
 ### agent_settled
 
-Emitted after the full session-level run settles. At this point Pi will not continue automatically through retry, compaction retry, or queued follow-up messages.
+Emitted after the full session-level run settles. Inspect `get_state.runState.lastOutcome` for completion. A deferred `context_transition` can resume after its pending interaction or background task settles.
 
 ```json
 {"type": "agent_settled"}
@@ -906,9 +906,9 @@ Emitted after the full session-level run settles. At this point Pi will not cont
 
 Every main-model request is checked after message transforms, conversion and append-only context assembly, before provider dispatch. `context_budget` carries a `budget` object with `tokens`, `usageTokens`, `trailingTokens`, `lastUsageIndex`, `contextWindow`, `modelMaxOutputTokens`, `requestedMaxOutputTokens`, `outputReserveTokens`, `safetyTokens`, `availableOutputTokens`, `unknownFields`, and `decision` (`fits`, `context_limit`, or `unknown`). Unknown metadata is not evidence that the request fits.
 
-When the decision is `context_limit`, `agent_end.outcome` is `{ type: "context_limit", budget }`. No synthetic assistant response is emitted; an oversized first prompt may have no assistant message at all. The session may shake/compact and recheck within its bounded reduction budget. If that cannot make progress, it emits `agent_settled` and retains `context_limit` in `get_state`. Prompt acceptance remains a separate response and is not changed retroactively.
+A rejected hard preflight returns `{ type: "context_limit", budget }`; automatic window control or a model request returns `{ type: "context_transition" }`. No synthetic assistant response is emitted. The session prepares and validates a minimal new window after the accepted tool batch finishes, with at most eight commits per prompt. A single bounded state-saving turn may precede transition when capacity allows. A blocked transition remains incomplete in `get_state`; prompt acceptance is unchanged.
 
-Budget, prefix/commit summary and archive decisions are persisted as log-only trace entries (`context/budget`, `compaction/summary`, `memory/archive`). They are available through `get_entries` even if no provider request was sent. Do not use `get_last_assistant_text` as a completion signal.
+Budget, window transitions, manual summary and archive decisions are persisted as log-only trace entries (`context/budget`, `context/rollover`, `compaction/summary`, `memory/archive`). Window traces include window ID, cause, commit/dispatch phase and blocking reason. They are available through `get_entries` even if no provider request was sent. Do not use `get_last_assistant_text` as a completion signal.
 
 ### turn_start / turn_end
 
@@ -1050,18 +1050,18 @@ Emitted whenever the pending steering or follow-up queue changes.
 
 ### compaction_start / compaction_end
 
-Emitted when compaction runs, whether manual or automatic.
+Emitted for explicit manual compaction. Automatic window transitions use `context/rollover` traces.
 
 ```json
-{"type": "compaction_start", "reason": "threshold"}
+{"type": "compaction_start", "reason": "manual"}
 ```
 
-The `reason` field is `"manual"`, `"threshold"`, or `"overflow"`.
+The `reason` field is `"manual"`.
 
 ```json
 {
   "type": "compaction_end",
-  "reason": "threshold",
+  "reason": "manual",
   "result": {
     "summary": "Summary of conversation...",
     "firstKeptEntryId": "abc123",
@@ -1081,8 +1081,6 @@ The `reason` field is `"manual"`, `"threshold"`, or `"overflow"`.
   "willRetry": false
 }
 ```
-
-If `reason` was `"overflow"` and compaction succeeds, `willRetry` is `true` and the agent will automatically retry the prompt.
 
 If compaction was aborted, `result` is `null` and `aborted` is `true`.
 
@@ -1138,7 +1136,7 @@ Emitted when compaction or branch-summary summarization retries after a transien
 {
   "type": "summarization_retry_attempt_start",
   "source": "compaction",
-  "reason": "threshold"
+  "reason": "manual"
 }
 ```
 

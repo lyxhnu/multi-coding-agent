@@ -40,7 +40,9 @@ export const PLAN_MODE_READ_ONLY_TOOLS = [
 	"ls",
 	"todo_write",
 	"get_task_output",
-	"history_get",
+	"history",
+	"get_context_remaining",
+	"new_context",
 	"context_note",
 ];
 

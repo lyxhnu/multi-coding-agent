@@ -14,6 +14,10 @@ type FakeExtensionRunner = {
 type FakeSession = {
 	sessionManager: { getHeader: () => object | undefined };
 	agent: { waitForIdle: () => Promise<void> };
+	taskManager: {
+		list: ReturnType<typeof vi.fn>;
+		awaitSettled: ReturnType<typeof vi.fn>;
+	};
 	state: { messages: AssistantMessage[]; runState: AgentRunState };
 	contextRolloverState: { dispatchState: "none" };
 	extensionRunner: FakeExtensionRunner;
@@ -21,6 +25,7 @@ type FakeSession = {
 	subscribe: ReturnType<typeof vi.fn>;
 	prompt: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
+	waitForIdle: ReturnType<typeof vi.fn>;
 };
 
 type FakeRuntimeHost = {
@@ -68,6 +73,10 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 	const session: FakeSession = {
 		sessionManager: { getHeader: () => undefined },
 		agent: { waitForIdle: async () => {} },
+		taskManager: {
+			list: vi.fn(() => []),
+			awaitSettled: vi.fn(async () => undefined),
+		},
 		state,
 		contextRolloverState: { dispatchState: "none" },
 		extensionRunner,
@@ -75,6 +84,7 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		subscribe: vi.fn(() => () => {}),
 		prompt: vi.fn(async () => {}),
 		reload: vi.fn(async () => {}),
+		waitForIdle: vi.fn(async () => {}),
 	};
 
 	return {
@@ -94,6 +104,30 @@ afterEach(() => {
 });
 
 describe("runPrintMode", () => {
+	it("waits for a Task that deferred context rollover before deciding the print run is incomplete", async () => {
+		const host = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		host.session.state.runState = { status: "idle", lastOutcome: { type: "context_transition" } };
+		let active = true;
+		host.session.taskManager.list.mockImplementation(() => (active ? [{ taskId: "task-1", status: "running" }] : []));
+		host.session.taskManager.awaitSettled.mockImplementation(async () => {
+			active = false;
+			host.session.state.runState = { status: "idle", lastOutcome: { type: "completed" } };
+		});
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		expect(await runPrintMode(host as unknown as Parameters<typeof runPrintMode>[0], { mode: "text" })).toBe(0);
+		expect(host.session.taskManager.awaitSettled).toHaveBeenCalledWith("task-1");
+		expect(host.session.waitForIdle).toHaveBeenCalledTimes(1);
+		expect(errors).not.toHaveBeenCalled();
+	});
+
+	it.each(["text", "json"] as const)("reports an unfinished context transition in %s mode", async (mode) => {
+		const host = createRuntimeHost(createAssistantMessage());
+		host.session.state.runState = { status: "idle", lastOutcome: { type: "context_transition" } };
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		expect(await runPrintMode(host as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(1);
+		expect(errors.mock.calls.flat().join(" ")).toContain("context_transition");
+	});
 	it.each(["text", "json"] as const)("B09 reports context_limit without an assistant in %s mode", async (mode) => {
 		const host = createRuntimeHost(createAssistantMessage());
 		host.session.state.messages = [];

@@ -126,6 +126,28 @@ describe("PreparedContinuation", () => {
 		expect(second.reservedQueueItemIds).toEqual(["steer-1"]);
 	});
 
+	it("measures an augmented reserved continuation without consuming its queue item", async () => {
+		const agent = new Agent({
+			initialState: {
+				model: createModel(),
+				messages: [{ role: "user", content: "start", timestamp: 1 }, createAssistantMessage()],
+			},
+			streamFn: () => new MockAssistantStream(createAssistantMessage()),
+		});
+		agent.steer({
+			queueItemId: "steer-measure",
+			message: { role: "user", content: "preserve this steering", timestamp: 2 },
+		});
+		const preparation = await agent.prepareContinuation(agent.state.messages);
+		const measured = await agent.measurePreparedContinuation(preparation, [
+			{ role: "user", content: "recovery body ".repeat(1000), timestamp: 3 },
+		]);
+		expect(measured.tokens).toBeGreaterThan(preparation.budget.tokens);
+		agent.releasePreparedContinuation(preparation);
+		const repeated = await agent.prepareContinuation(agent.state.messages);
+		expect(repeated.reservedQueueItemIds).toEqual(["steer-measure"]);
+	});
+
 	it("PC14 routes ordinary continue through one prepared request", async () => {
 		let transformCalls = 0;
 		let convertCalls = 0;

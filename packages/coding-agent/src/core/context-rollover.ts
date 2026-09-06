@@ -1,108 +1,89 @@
-import { createHash } from "node:crypto";
-import type { PreparedContinuation } from "@earendil-works/pi-agent-core";
-import { applyRedactions } from "@earendil-works/pi-agent-core";
-import type { ContextBudget, Usage } from "@earendil-works/pi-ai";
+import { createHash, randomUUID } from "node:crypto";
+import type { Agent, PreparedContinuation } from "@earendil-works/pi-agent-core";
+import { type ContextBudget, estimateTextTokens, type Message } from "@earendil-works/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai/compat";
+import { contextRemaining } from "./context-budget.ts";
+import { createContextWindowIdentity, currentContextWindow } from "./context-window.ts";
+import { History } from "./history.ts";
 import {
-	createPrefixCheckpointFromBoundary,
-	isPrefixCheckpoint,
-	type PrefixSummaryCheckpoint,
-	validatePrefixCheckpoint,
-} from "./compaction/checkpoint.ts";
-import type {
-	ContextMaintenanceBlockedReason,
-	ContextMaintenanceCause,
-	ContextMaintenanceOutcome,
-	ContextMaintenanceSnapshot,
-	ContinuationIntent,
-} from "./compaction/context-maintenance.ts";
-import { formatContextRolloverHandoff as formatHandoff } from "./messages.ts";
-import { collectShakeRedactions, type SessionEntry } from "./session-manager.ts";
+	buildSessionContext,
+	type ContextOperationEntry,
+	type ContextRolloverEntry,
+	type SessionEntry,
+	type SessionManager,
+} from "./session-manager.ts";
 import {
-	acceptTaskNoteCandidate,
-	buildTaskNoteProjection,
-	createTaskNoteBatchId,
+	buildTaskNoteProjectionFromBranch,
+	createTaskNoteFreshnessResolver,
 	createTaskScopeId,
-	isTaskNoteBatch,
-	MAX_CHECKPOINT_NOTE_CANDIDATES,
-	type TaskNoteBatch,
-	type TaskNoteCandidate,
-	type TaskNoteEvent,
+	resolveTaskNoteScope,
+	resolveTaskNoteScopeByTaskSource,
+	type TaskNoteFreshness,
 	type TaskNoteProjectionSnapshot,
 	type TaskNoteReference,
-	type TaskNoteScope,
 } from "./task-note-projection.ts";
-import type { TodoPriority } from "./todo/todo-state.ts";
+import type { ContextRecoveryReadPage, SessionTraceEvent } from "./trace.ts";
 
-export interface ContextRolloverAcceptanceCriteria {
-	status: "specified" | "not_specified";
-	items: Array<{ text: string; sourceEntryIds: string[]; taskContractIds: string[] }>;
-}
-
-export interface ContextRolloverNote {
-	version: 1;
-	objective: { text: string; sourceEntryIds: string[] };
-	userConstraints: Array<{ text: string; sourceEntryIds: string[] }>;
-	acceptanceCriteria: ContextRolloverAcceptanceCriteria;
-	decisions: Array<{ text: string; reason: string; sourceEntryIds: string[] }>;
-	completedWork: Array<{ text: string; todoIds: string[]; evidenceEntryIds: string[] }>;
-	currentState: { text: string; evidenceEntryIds: string[] };
-	failedAttempts: Array<{ text: string; reason: string; evidenceEntryIds: string[] }>;
-	nextAction: { text: string; evidenceEntryIds: string[] };
-	historyRefs: Array<{ entryId: string; blockIndex?: number; purpose: string }>;
-}
-
-export interface ContextRolloverCheckpoint {
-	version: 1;
-	checkpointId: string;
-	promptGeneration: number;
-	contextEpoch: number;
-	coveredStartEntryId: string;
-	coveredEndEntryId: string;
-	coveredEntryIds: string[];
-	sourcePrefixFingerprint: string;
+export type ContextTransitionCause = "model_requested" | "work_budget_reached" | "provider_context_rejected";
+export interface ContextRecoveryReferences {
+	saveStateOperationId: string;
+	nextActionEventId: string;
+	relatedNoteEventIds: string[];
+	noteFreshness: Array<{ eventId: string; freshness: TaskNoteFreshness }>;
+	requiredHistoryRefs: TaskNoteReference[];
+	requirementSourceRefs: TaskNoteReference[];
+	todoIds: string[];
+	taskSourceEntryId: string;
+	requirementsStartEntryId: string;
+	historyCutoffEntryId: string;
+	historyStartEntryId: string;
 	todoStateEntryId: string | null;
 	todoStateFingerprint: string;
-	requestConfigFingerprint: string;
-	compactionPrefix: PrefixSummaryCheckpoint;
-	note: ContextRolloverNote;
-}
-
-export interface ContextRolloverCheckpointEnvelope {
-	version: 1;
-	checkpoint: ContextRolloverCheckpoint;
-	taskNoteBatch: TaskNoteBatch;
-}
-
-export interface ContextRolloverCheckpointOutput {
-	checkpoint: ContextRolloverNote;
-	noteUpdateCandidates: TaskNoteCandidate[];
-}
-
-export interface ActiveRolloverTodo {
-	id: string;
-	content: string;
-	priority: TodoPriority;
-	status: "pending" | "in_progress";
-}
-
-export interface ContextRolloverBundle {
-	version: 1;
-	checkpointId: string;
-	checkpointEntryId: string;
-	promptGeneration: number;
-	sourceContextEpoch: number;
-	targetContextEpoch: number;
-	note: ContextRolloverNote;
-	activeTodosAtCommit: ActiveRolloverTodo[];
-	todoStateEntryIdAtCommit: string | null;
-	todoStateFingerprintAtCommit: string;
-	activeEntryIds: string[];
-	historyAllowlist: Array<{ entryId: string; blockIndex?: number }>;
-	sourceFingerprint: string;
-	progressBaselineFingerprint: string;
 	taskNoteProjectionRevision: string;
+	taskScopeId: string;
 }
 
+export const SAVE_STATE_MAX_SAMPLES = 3;
+export const RECOVERY_OUTPUT_TOKENS = 2048;
+export const RECOVERY_TOOL_NAMES = ["history", "context_note", "get_context_remaining"] as const;
+
+export interface SaveStateOperationSnapshot {
+	operationId: string;
+	transitionCause: ContextTransitionCause;
+	windowId: string;
+	promptGeneration: number;
+	contextEpoch: number;
+	sourceFingerprint: string;
+	businessCutoffEntryId: string;
+	startTaskNoteRevision: string;
+	controlBudgetTokens: number;
+	outputBudgetTokens: number;
+	samplesUsed: number;
+	consumedControlTokens: number;
+	consumedOutputTokens: number;
+	finished: boolean;
+}
+
+export type ContinuationStateValidation =
+	| {
+			status: "valid";
+			finalTaskNoteRevision: string;
+			nextActionEventId: string;
+			relatedNoteEventIds: string[];
+			noteFreshness: Array<{ eventId: string; freshness: TaskNoteFreshness }>;
+			requiredHistoryRefs: TaskNoteReference[];
+			requirementSourceRefs: TaskNoteReference[];
+			todoIds: string[];
+	  }
+	| { status: "invalid"; reason: string };
+
+export interface ContextRecoveryCoverage {
+	complete: boolean;
+	progressFingerprint: string;
+	coveredUnits: number;
+	missing: string[];
+	pages: ContextRecoveryReadPage[];
+}
 export interface ContextRolloverRevisions {
 	sessionLeafId: string | null;
 	sourceFingerprint: string;
@@ -111,1026 +92,1199 @@ export interface ContextRolloverRevisions {
 	queueRevision: string;
 	progressRevision: string;
 	requestConfigFingerprint: string;
+	taskNoteProjectionRevision: string;
 }
-
-export type ContextRolloverCommitResult =
-	| { status: "committed"; entryId: string }
-	| { status: "superseded" }
-	| { status: "failed" };
-
-export type ContextRolloverCheckpointReason =
-	| "below_prefire_threshold"
-	| "operation_limit"
-	| "operation_in_flight"
-	| "no_complete_tool_transaction"
-	| "provider_failed"
-	| "authorization_failed"
-	| "wall_clock_exhausted"
-	| "invalid_output"
-	| "invalid_evidence"
-	| "unsafe_content"
-	| "note_too_large"
-	| "source_changed";
-
-export interface ContextRolloverCheckpointRequest {
-	promptGeneration: number;
-	contextEpoch: number;
-	snapshot: ContextMaintenanceSnapshot;
-	signal?: AbortSignal;
-}
-
-export type ContextRolloverCheckpointOutcome =
-	| { outcome: "committed"; checkpointId: string; checkpointEntryId: string }
-	| {
-			outcome: "not_started" | "discarded";
-			checkpointId?: string;
-			reason: ContextRolloverCheckpointReason;
-	  }
-	| { outcome: "cancelled"; checkpointId?: string };
-
-export interface ContextRolloverDependencies {
-	prepareCheckpoint: (request: ContextRolloverCheckpointRequest) => Promise<ContextRolloverCheckpointOutcome>;
-	runRollover: (request: ContextRolloverRequest) => Promise<ContextRolloverOutcome>;
-}
-
 export type ContextRolloverBlockedReason =
-	| "ineligible_maintenance_reason"
-	| "continuation_forbidden"
-	| "task_complete"
+	| "source_changed"
 	| "operation_in_flight"
 	| "rollover_already_used"
 	| "rollover_limit"
-	| "checkpoint_missing"
-	| "checkpoint_invalid"
+	| "recovery_unavailable"
 	| "tool_transaction_incomplete"
-	| "active_suffix_too_large"
-	| "handoff_invalid"
-	| "source_changed"
-	| "todo_changed"
-	| "queue_changed"
-	| "request_config_changed"
-	| "no_strong_progress"
 	| "invalid_continuation_context"
+	| "continuation_state_changed"
 	| "prepared_context_limit"
-	| "prepared_over_half_window"
+	| "recovery_workset_too_large"
 	| "unchanged_request"
 	| "post_commit_mismatch"
 	| "dispatch_prepare_mismatch"
 	| "dispatch_outcome_unknown";
-
 export interface ContextRolloverRequest {
-	sourceMaintenanceId: string;
-	promptGeneration: number;
-	contextEpoch: number;
-	maintenanceCause: Extract<ContextMaintenanceCause, "budget_limit" | "provider_overflow">;
-	maintenanceBlockedReason: Extract<
-		ContextMaintenanceBlockedReason,
-		"methods_exhausted" | "no_progress" | "attempt_limit"
-	>;
-	continuation: "required";
-	sourceRequestFingerprint: string;
-	signal?: AbortSignal;
+	cause: ContextTransitionCause;
+	requestId: string;
+	windowId: string;
+	budget: ContextBudget;
+	requestFingerprint: string;
 }
-
 export type ContextRolloverOutcome =
-	| {
-			outcome: "ready";
-			rolloverId: string;
-			entryId: string;
-			targetContextEpoch: number;
-			preparation: PreparedContinuation;
-	  }
-	| { outcome: "blocked"; rolloverId: string; committed: boolean; reason: ContextRolloverBlockedReason }
-	| { outcome: "cancelled"; rolloverId: string; committed: false };
-
-export async function prepareContextRolloverCheckpoint(
-	request: ContextRolloverCheckpointRequest,
-	dependencies: ContextRolloverDependencies,
-): Promise<ContextRolloverCheckpointOutcome> {
-	if (request.signal?.aborted) return { outcome: "cancelled" };
-	return await dependencies.prepareCheckpoint(request);
+	| { outcome: "dispatched" }
+	| { outcome: "blocked"; reason: ContextRolloverBlockedReason }
+	| { outcome: "cancelled" };
+interface ContextRolloverDependencies {
+	agent: Agent;
+	manager: SessionManager;
+	revisions: () => ContextRolloverRevisions;
+	isBusy: () => boolean;
+	isCancelled: () => boolean;
+	pendingDeliveryIds: () => readonly string[];
+	canRecover: (recovery?: ContextRecoveryReferences) => boolean;
+	workThresholdPercent: () => number;
+	measureSource: () => Promise<{ budget: ContextBudget; requestFingerprint: string }>;
+	onDispatch: (preparationId: string | undefined) => void;
+	onTrace: (data: Omit<Extract<SessionTraceEvent, { type: "context/rollover" }>["data"], "turn">) => void;
 }
-
-export async function runContextRollover(
-	request: ContextRolloverRequest,
-	dependencies: ContextRolloverDependencies,
-): Promise<ContextRolloverOutcome> {
-	return await dependencies.runRollover(request);
-}
-
-const ELIGIBLE_REASONS = new Set<ContextMaintenanceBlockedReason>([
-	"methods_exhausted",
-	"no_progress",
-	"attempt_limit",
-]);
-
-export function shouldStartContextRollover(input: {
-	maintenance: ContextMaintenanceOutcome;
-	cause: ContextMaintenanceCause;
-	continuation: ContinuationIntent;
-	taskIsIncomplete: boolean;
-}): boolean {
-	return (
-		input.maintenance.outcome === "blocked" &&
-		(input.cause === "budget_limit" || input.cause === "provider_overflow") &&
-		input.continuation === "required" &&
-		ELIGIBLE_REASONS.has(input.maintenance.reason) &&
-		input.taskIsIncomplete
-	);
-}
-
-export function collectCompleteToolTransactions(entries: readonly SessionEntry[]): string[][] {
-	const visible = entries.filter((entry) => entry.type === "message" || entry.type === "custom_message");
-	const transactions: string[][] = [];
-	for (let index = 0; index < visible.length; index++) {
-		const entry = visible[index];
-		if (entry.type !== "message" || entry.message.role !== "assistant") {
-			if (entry.type === "message" && entry.message.role === "toolResult") {
-				throw new Error("tool_transaction_incomplete");
-			}
-			transactions.push([entry.id]);
-			continue;
-		}
-		const toolCallIds = entry.message.content.filter((block) => block.type === "toolCall").map((block) => block.id);
-		if (toolCallIds.length === 0) {
-			transactions.push([entry.id]);
-			continue;
-		}
-		const expected = new Set(toolCallIds);
-		const transaction = [entry.id];
-		while (expected.size > 0) {
-			const result = visible[++index];
-			if (result?.type !== "message" || result.message.role !== "toolResult") {
-				throw new Error("tool_transaction_incomplete");
-			}
-			if (!expected.delete(result.message.toolCallId)) {
-				throw new Error("tool_transaction_incomplete");
-			}
-			transaction.push(result.id);
-		}
-		transactions.push(transaction);
-	}
-	return transactions;
-}
-
-export function validateContextRolloverNote(
-	note: ContextRolloverNote,
-	branch: readonly SessionEntry[],
-	allowedSourceEntryIds?: ReadonlySet<string>,
-): void {
-	if (!isStrictContextRolloverNote(note)) throw new Error("invalid_output");
-	const noteTexts = [
-		note.objective.text,
-		...note.userConstraints.flatMap((constraint) => [constraint.text]),
-		...note.acceptanceCriteria.items.map((criterion) => criterion.text),
-		...note.decisions.flatMap((decision) => [decision.text, decision.reason]),
-		...note.completedWork.map((work) => work.text),
-		note.currentState.text,
-		...note.failedAttempts.flatMap((attempt) => [attempt.text, attempt.reason]),
-		note.nextAction.text,
-		...note.historyRefs.map((reference) => reference.purpose),
-	];
-	if (noteTexts.some((text) => containsPotentialSecret(text))) throw new Error("unsafe_content");
-	const byId = new Map(branch.map((entry) => [entry.id, entry]));
-	const userSourceIds = [
-		...note.objective.sourceEntryIds,
-		...note.userConstraints.flatMap((constraint) => constraint.sourceEntryIds),
-		...note.acceptanceCriteria.items.flatMap((criterion) => criterion.sourceEntryIds),
-	];
-	if (
-		note.objective.sourceEntryIds.length === 0 ||
-		userSourceIds.some(
-			(id) => !isUserSource(byId.get(id)) || (allowedSourceEntryIds && !allowedSourceEntryIds.has(id)),
-		)
-	) {
-		throw new Error("invalid_evidence");
-	}
-	if (
-		(note.acceptanceCriteria.status === "specified" && note.acceptanceCriteria.items.length === 0) ||
-		(note.acceptanceCriteria.status === "not_specified" && note.acceptanceCriteria.items.length !== 0)
-	) {
-		throw new Error("invalid_evidence");
-	}
-	for (const criterion of note.acceptanceCriteria.items) {
-		if (criterion.sourceEntryIds.length === 0 && criterion.taskContractIds.length === 0) {
-			throw new Error("invalid_evidence");
-		}
-		if (
-			criterion.taskContractIds.some((id) => {
-				const source = byId.get(id);
-				return (
-					source?.type !== "custom" ||
-					source.customType !== "task-contract" ||
-					(allowedSourceEntryIds !== undefined && !allowedSourceEntryIds.has(id))
-				);
-			})
-		) {
-			throw new Error("invalid_evidence");
-		}
-	}
-	for (const work of note.completedWork) {
-		if (
-			work.evidenceEntryIds.length === 0 ||
-			work.evidenceEntryIds.some(
-				(id) => !isCompletedWorkEvidence(byId.get(id)) || (allowedSourceEntryIds && !allowedSourceEntryIds.has(id)),
-			)
-		) {
-			throw new Error("invalid_evidence");
-		}
-	}
-	for (const decision of note.decisions) {
-		if (
-			decision.sourceEntryIds.length === 0 ||
-			decision.sourceEntryIds.some((id) => {
-				const source = byId.get(id);
-				return !isDecisionSource(source) || (allowedSourceEntryIds !== undefined && !allowedSourceEntryIds.has(id));
-			})
-		) {
-			throw new Error("invalid_evidence");
-		}
-	}
-	for (const attempt of note.failedAttempts) {
-		if (
-			attempt.evidenceEntryIds.length === 0 ||
-			attempt.evidenceEntryIds.some((id) => {
-				const source = byId.get(id);
-				return (
-					!isFailedAttemptEvidence(source) ||
-					(allowedSourceEntryIds !== undefined && !allowedSourceEntryIds.has(id))
-				);
-			})
-		) {
-			throw new Error("invalid_evidence");
-		}
-	}
-	if (
-		note.currentState.evidenceEntryIds.length === 0 ||
-		note.currentState.evidenceEntryIds.some((id) => {
-			const source = byId.get(id);
-			return (
-				!isCurrentStateEvidence(source) || (allowedSourceEntryIds !== undefined && !allowedSourceEntryIds.has(id))
-			);
-		})
-	) {
-		throw new Error("invalid_evidence");
-	}
-	if (
-		note.nextAction.evidenceEntryIds.some((id) => {
-			const source = byId.get(id);
-			return !isDecisionSource(source) || (allowedSourceEntryIds !== undefined && !allowedSourceEntryIds.has(id));
-		})
-	) {
-		throw new Error("invalid_evidence");
-	}
-	for (const reference of note.historyRefs) {
-		const source = byId.get(reference.entryId);
-		if (
-			!isHistorySource(source) ||
-			!isReadableHistoryBlock(source, reference.blockIndex) ||
-			(allowedSourceEntryIds && !allowedSourceEntryIds.has(reference.entryId))
-		) {
-			throw new Error("invalid_evidence");
-		}
-	}
-	const references = new Set([
-		...userSourceIds,
-		...note.acceptanceCriteria.items.flatMap((criterion) => criterion.taskContractIds),
-		...note.decisions.flatMap((decision) => decision.sourceEntryIds),
-		...note.completedWork.flatMap((work) => work.evidenceEntryIds),
-		...note.currentState.evidenceEntryIds,
-		...note.failedAttempts.flatMap((attempt) => attempt.evidenceEntryIds),
-		...note.nextAction.evidenceEntryIds,
-		...note.historyRefs.map((reference) => reference.entryId),
-	]);
-	if (
-		references.size > 64 ||
-		note.historyRefs.length > 32 ||
-		[...references].some((id) => !byId.has(id) || (allowedSourceEntryIds && !allowedSourceEntryIds.has(id)))
-	) {
-		throw new Error("invalid_evidence");
-	}
-}
-
-function isCurrentStateEvidence(entry: SessionEntry | undefined): boolean {
-	return (
-		(entry?.type === "message" &&
-			(entry.message.role === "user" || (entry.message.role === "toolResult" && entry.message.isError !== true))) ||
-		(entry?.type === "context_progress" && entry.outcome === "succeeded")
-	);
-}
-
-function isDecisionSource(entry: SessionEntry | undefined): boolean {
-	return (
-		entry?.type === "message" ||
-		entry?.type === "context_progress" ||
-		(entry?.type === "custom_message" && entry.customType === "user-provenance")
-	);
-}
-
-function isFailedAttemptEvidence(entry: SessionEntry | undefined): boolean {
-	return (
-		(entry?.type === "message" && entry.message.role === "toolResult" && entry.message.isError === true) ||
-		(entry?.type === "context_progress" && entry.outcome === "failed")
-	);
-}
-
-function isStrictContextRolloverNote(value: unknown): value is ContextRolloverNote {
-	if (
-		!isRecord(value) ||
-		!hasExactlyKeys(value, [
-			"version",
-			"objective",
-			"userConstraints",
-			"acceptanceCriteria",
-			"decisions",
-			"completedWork",
-			"currentState",
-			"failedAttempts",
-			"nextAction",
-			"historyRefs",
-		])
-	)
-		return false;
-	const objective = value.objective;
-	const acceptanceCriteria = value.acceptanceCriteria;
-	const currentState = value.currentState;
-	const nextAction = value.nextAction;
-	return (
-		value.version === 1 &&
-		isEvidenceText(objective, ["text", "sourceEntryIds"]) &&
-		isRecord(acceptanceCriteria) &&
-		hasExactlyKeys(acceptanceCriteria, ["status", "items"]) &&
-		(acceptanceCriteria.status === "specified" || acceptanceCriteria.status === "not_specified") &&
-		Array.isArray(acceptanceCriteria.items) &&
-		acceptanceCriteria.items.every((item) => isEvidenceText(item, ["text", "sourceEntryIds", "taskContractIds"])) &&
-		isEvidenceText(currentState, ["text", "evidenceEntryIds"]) &&
-		isEvidenceText(nextAction, ["text", "evidenceEntryIds"]) &&
-		Array.isArray(value.userConstraints) &&
-		value.userConstraints.every((item) => isEvidenceText(item, ["text", "sourceEntryIds"])) &&
-		Array.isArray(value.decisions) &&
-		value.decisions.every((item) => isEvidenceText(item, ["text", "reason", "sourceEntryIds"])) &&
-		Array.isArray(value.completedWork) &&
-		value.completedWork.every((item) => isEvidenceText(item, ["text", "todoIds", "evidenceEntryIds"])) &&
-		Array.isArray(value.failedAttempts) &&
-		value.failedAttempts.every((item) => isEvidenceText(item, ["text", "reason", "evidenceEntryIds"])) &&
-		Array.isArray(value.historyRefs) &&
-		value.historyRefs.every((item) => {
-			if (!isRecord(item) || !hasExactlyKeys(item, ["entryId", "purpose"], ["blockIndex"])) {
-				return false;
-			}
-			return (
-				typeof item.entryId === "string" &&
-				item.entryId.length > 0 &&
-				typeof item.purpose === "string" &&
-				item.purpose.trim().length > 0 &&
-				(item.blockIndex === undefined ||
-					(typeof item.blockIndex === "number" && Number.isInteger(item.blockIndex) && item.blockIndex >= -1))
-			);
-		})
-	);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactlyKeys(
-	value: Record<string, unknown>,
-	required: readonly string[],
-	optional: readonly string[] = [],
-): boolean {
-	const allowed = new Set([...required, ...optional]);
-	return required.every((key) => key in value) && Object.keys(value).every((key) => allowed.has(key));
-}
-
-function isEvidenceText(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-	if (!isRecord(value) || !hasExactlyKeys(value, keys)) return false;
-	if (typeof value.text !== "string" || value.text.trim().length === 0) return false;
-	if ("reason" in value && (typeof value.reason !== "string" || value.reason.trim().length === 0)) return false;
-	for (const key of ["sourceEntryIds", "taskContractIds", "todoIds", "evidenceEntryIds"]) {
-		if (key in value && !isNonEmptyOrEmptyStringArray(value[key])) return false;
-	}
-	return true;
-}
-
-function isNonEmptyOrEmptyStringArray(value: unknown): value is string[] {
-	return Array.isArray(value) && value.every((item) => typeof item === "string" && item.length > 0);
-}
-
-function isCompletedWorkEvidence(entry: SessionEntry | undefined): boolean {
-	if (!entry) return false;
-	if (
-		entry.type === "compaction" ||
-		entry.type === "branch_summary" ||
-		entry.type === "context_rollover" ||
-		entry.type === "context_rollover_dispatch" ||
-		entry.type === "context_operation" ||
-		entry.type === "trace" ||
-		entry.type === "pending_delivery" ||
-		entry.type === "delivery_receipt" ||
-		entry.type === "delivery_cancelled" ||
-		(entry.type === "custom" && entry.customType === "context-rollover-checkpoint")
-	) {
-		return false;
-	}
-	if (entry.type === "message" && entry.message.role === "toolResult") return entry.message.isError !== true;
-	return (
-		(entry.type === "message" && entry.message.role === "user") ||
-		(entry.type === "custom_message" && entry.customType === "user-provenance") ||
-		(entry.type === "context_progress" &&
-			entry.outcome === "succeeded" &&
-			(entry.evidenceKind === "verification" || entry.evidenceKind === "task_completed"))
-	);
-}
-
-function isHistorySource(
-	entry: SessionEntry | undefined,
-): entry is Extract<SessionEntry, { type: "message" | "custom_message" }> {
-	return entry?.type === "message" || entry?.type === "custom_message";
-}
-
-function isReadableHistoryBlock(
-	entry: Extract<SessionEntry, { type: "message" | "custom_message" }>,
-	blockIndex: number | undefined,
-): boolean {
-	let content: unknown;
-	if (entry.type === "custom_message") {
-		content = entry.content;
-	} else if (isRecord(entry.message) && "content" in entry.message) {
-		content = entry.message.content;
-	} else {
-		return false;
-	}
-	if (typeof content === "string") return blockIndex === undefined || blockIndex === -1;
-	if (!Array.isArray(content)) return false;
-	const textIndexes = content.flatMap((block: unknown, index: number) =>
-		isRecord(block) && block.type === "text" && typeof block.text === "string" ? [index] : [],
-	);
-	if (blockIndex === undefined) return textIndexes.length === 1;
-	return blockIndex >= 0 && textIndexes.includes(blockIndex);
-}
-
-export function selectLatestContextRolloverCheckpoint(
-	branch: readonly SessionEntry[],
-	promptGeneration: number,
-	contextEpoch: number,
-): { entryId: string; checkpoint: ContextRolloverCheckpoint; envelope: ContextRolloverCheckpointEnvelope } | undefined {
-	const sourceBranch = branch.filter(
-		(entry) => !(entry.type === "custom" && entry.customType === "context-rollover-checkpoint"),
-	);
-	const sourceEntries = applyRedactions(sourceBranch, collectShakeRedactions(sourceBranch));
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (entry.type !== "custom" || entry.customType !== "context-rollover-checkpoint") continue;
-		if (!isContextRolloverCheckpointEnvelope(entry.data)) continue;
-		const envelope = entry.data;
-		const checkpoint = envelope.checkpoint;
-		if (checkpoint.promptGeneration !== promptGeneration || checkpoint.contextEpoch !== contextEpoch) continue;
-		const coveredEndBranchIndex = branch.findIndex((candidate) => candidate.id === checkpoint.coveredEndEntryId);
-		if (coveredEndBranchIndex < 0 || coveredEndBranchIndex >= index) continue;
-		const coveredStartIndex = sourceEntries.findIndex((candidate) => candidate.id === checkpoint.coveredStartEntryId);
-		const coveredEndIndex = sourceEntries.findIndex((candidate) => candidate.id === checkpoint.coveredEndEntryId);
-		const covered = checkpoint.coveredEntryIds.flatMap((id) => {
-			const source = sourceEntries.find((candidate) => candidate.id === id);
-			return source ? [source] : [];
-		});
-		const contiguousCovered =
-			coveredStartIndex >= 0 &&
-			coveredEndIndex >= coveredStartIndex &&
-			sourceEntries
-				.slice(coveredStartIndex, coveredEndIndex + 1)
-				.filter((candidate) => candidate.type === "message" || candidate.type === "custom_message")
-				.map((candidate) => candidate.id);
-		if (
-			covered.length !== checkpoint.coveredEntryIds.length ||
-			covered[0]?.id !== checkpoint.coveredStartEntryId ||
-			covered.at(-1)?.id !== checkpoint.coveredEndEntryId ||
-			JSON.stringify(contiguousCovered) !== JSON.stringify(checkpoint.coveredEntryIds) ||
-			fingerprintContextRolloverValue(covered) !== checkpoint.sourcePrefixFingerprint
-		) {
-			continue;
-		}
-		try {
-			if (!validatePrefixCheckpoint(sourceEntries, checkpoint.compactionPrefix)) {
-				throw new Error("invalid_compaction_prefix");
-			}
-			const allowedSourceEntryIds = new Set(
-				sourceEntries
-					.slice(coveredStartIndex, coveredEndIndex + 1)
-					.filter(
-						(candidate) =>
-							candidate.type === "message" ||
-							candidate.type === "custom_message" ||
-							candidate.type === "context_progress" ||
-							(candidate.type === "custom" && candidate.customType === "task-contract"),
-					)
-					.map((candidate) => candidate.id),
-			);
-			if (contextEpoch > 0) {
-				const previousRollover = sourceEntries
-					.slice(0, index)
-					.reverse()
-					.find(
-						(candidate): candidate is Extract<SessionEntry, { type: "context_rollover" }> =>
-							candidate.type === "context_rollover" && candidate.targetContextEpoch === contextEpoch,
-					);
-				if (previousRollover) {
-					for (const id of collectNoteReferenceIds(previousRollover.bundle.note)) allowedSourceEntryIds.add(id);
-				}
-			}
-			validateContextRolloverNote(checkpoint.note, sourceEntries, allowedSourceEntryIds);
-			const coveredIds = new Set(checkpoint.coveredEntryIds);
-			for (const transaction of collectCompleteToolTransactions(sourceEntries)) {
-				const count = transaction.filter((id) => coveredIds.has(id)).length;
-				if (count > 0 && count !== transaction.length) throw new Error("tool_transaction_incomplete");
-			}
-		} catch {
-			continue;
-		}
-		return { entryId: entry.id, checkpoint, envelope };
-	}
-	return undefined;
-}
-
-function collectNoteReferenceIds(note: ContextRolloverNote): string[] {
-	return [...collectNoteClaimReferenceIds(note), ...note.historyRefs.map((reference) => reference.entryId)];
-}
-
-function collectNoteClaimReferenceIds(note: ContextRolloverNote): string[] {
-	return [
-		...note.objective.sourceEntryIds,
-		...note.userConstraints.flatMap((constraint) => constraint.sourceEntryIds),
-		...note.acceptanceCriteria.items.flatMap((criterion) => criterion.sourceEntryIds),
-		...note.acceptanceCriteria.items.flatMap((criterion) => criterion.taskContractIds),
-		...note.decisions.flatMap((decision) => decision.sourceEntryIds),
-		...note.completedWork.flatMap((work) => work.evidenceEntryIds),
-		...note.currentState.evidenceEntryIds,
-		...note.failedAttempts.flatMap((attempt) => attempt.evidenceEntryIds),
-		...note.nextAction.evidenceEntryIds,
-	];
-}
-
-function isContextRolloverCheckpoint(value: unknown): value is ContextRolloverCheckpoint {
-	if (
-		!isRecord(value) ||
-		!hasExactlyKeys(value, [
-			"version",
-			"checkpointId",
-			"promptGeneration",
-			"contextEpoch",
-			"coveredStartEntryId",
-			"coveredEndEntryId",
-			"coveredEntryIds",
-			"sourcePrefixFingerprint",
-			"todoStateEntryId",
-			"todoStateFingerprint",
-			"requestConfigFingerprint",
-			"compactionPrefix",
-			"note",
-		])
-	) {
-		return false;
-	}
-	const checkpoint = value as Partial<ContextRolloverCheckpoint>;
-	return (
-		checkpoint.version === 1 &&
-		typeof checkpoint.checkpointId === "string" &&
-		checkpoint.checkpointId.length > 0 &&
-		Number.isInteger(checkpoint.promptGeneration) &&
-		(checkpoint.promptGeneration ?? -1) >= 0 &&
-		Number.isInteger(checkpoint.contextEpoch) &&
-		(checkpoint.contextEpoch ?? -1) >= 0 &&
-		typeof checkpoint.coveredStartEntryId === "string" &&
-		checkpoint.coveredStartEntryId.length > 0 &&
-		typeof checkpoint.coveredEndEntryId === "string" &&
-		checkpoint.coveredEndEntryId.length > 0 &&
-		Array.isArray(checkpoint.coveredEntryIds) &&
-		checkpoint.coveredEntryIds.length > 0 &&
-		checkpoint.coveredEntryIds.every((id) => typeof id === "string" && id.length > 0) &&
-		typeof checkpoint.sourcePrefixFingerprint === "string" &&
-		checkpoint.sourcePrefixFingerprint.length > 0 &&
-		(checkpoint.todoStateEntryId === null || typeof checkpoint.todoStateEntryId === "string") &&
-		typeof checkpoint.todoStateFingerprint === "string" &&
-		checkpoint.todoStateFingerprint.length > 0 &&
-		typeof checkpoint.requestConfigFingerprint === "string" &&
-		checkpoint.requestConfigFingerprint.length > 0 &&
-		isPrefixCheckpoint(checkpoint.compactionPrefix) &&
-		checkpoint.compactionPrefix.coveredEndEntryId === checkpoint.coveredEndEntryId &&
-		isStrictContextRolloverNote(checkpoint.note)
-	);
-}
-
-export function isContextRolloverCheckpointEnvelope(value: unknown): value is ContextRolloverCheckpointEnvelope {
-	if (!isRecord(value) || !hasExactlyKeys(value, ["version", "checkpoint", "taskNoteBatch"])) return false;
-	return (
-		value.version === 1 &&
-		isContextRolloverCheckpoint(value.checkpoint) &&
-		isTaskNoteBatch(value.taskNoteBatch, value.checkpoint.checkpointId)
-	);
-}
-
-export function assembleContextRolloverBundle(input: {
-	checkpoint: ContextRolloverCheckpoint;
-	checkpointEntryId: string;
-	contextEntries: readonly SessionEntry[];
-	taskNoteProjection: TaskNoteProjectionSnapshot;
-	targetContextEpoch: number;
-	activeTodos: ActiveRolloverTodo[];
-	todoStateEntryId: string | null;
-	todoStateFingerprint: string;
-	progressBaselineFingerprint: string;
-}): ContextRolloverBundle {
-	const coveredIds = new Set(input.checkpoint.coveredEntryIds);
-	const coveredEndIndex = input.contextEntries.findIndex((entry) => entry.id === input.checkpoint.coveredEndEntryId);
-	if (coveredEndIndex < 0) throw new Error("checkpoint_invalid");
-	const transactions = collectCompleteToolTransactions(input.contextEntries);
-	for (const transaction of transactions) {
-		const count = transaction.filter((id) => coveredIds.has(id)).length;
-		if (count > 0 && count !== transaction.length) throw new Error("tool_transaction_incomplete");
-	}
-	const activeEntryIds = transactions
-		.filter((transaction) => {
-			const firstIndex = input.contextEntries.findIndex((entry) => entry.id === transaction[0]);
-			return firstIndex > coveredEndIndex;
-		})
-		.flat();
-	const note = mergeTaskNoteProjection(input.checkpoint.note, input.taskNoteProjection, input.activeTodos);
-	validateContextRolloverNote(note, input.contextEntries);
-	const usedProjectionItems = input.taskNoteProjection.items.filter((item) => {
-		if (item.kind === "constraint") return note.userConstraints.some((constraint) => constraint.text === item.text);
-		if (item.kind === "decision") return note.decisions.some((decision) => decision.text === item.text);
-		if (item.kind === "state") return note.currentState.text.includes(item.text);
-		if (item.kind === "failed_attempt") return note.failedAttempts.some((attempt) => attempt.text === item.text);
-		return note.nextAction.text.includes(item.text);
-	});
-	const historyReferences: TaskNoteReference[] = [
-		...collectNoteClaimReferenceIds(note).map((entryId) => ({ entryId })),
-		...note.historyRefs,
-		...usedProjectionItems.flatMap((item) => item.sourceRefs),
-		...usedProjectionItems.flatMap((item) => item.evidence.map((stamp) => stamp.reference)),
-	];
-	const entriesById = new Map(input.contextEntries.map((entry) => [entry.id, entry]));
-	const activeEntryIdSet = new Set(activeEntryIds);
-	const historyAllowlist = [
-		...new Map(
-			historyReferences.flatMap((reference) => {
-				const entry = entriesById.get(reference.entryId);
-				if (!isHistorySource(entry) || activeEntryIdSet.has(reference.entryId)) return [];
-				const normalized = {
-					entryId: reference.entryId,
-					...(reference.blockIndex === undefined ? {} : { blockIndex: reference.blockIndex }),
-				};
-				return [[`${normalized.entryId}\u0000${normalized.blockIndex ?? ""}`, normalized] as const];
-			}),
-		).values(),
-	];
-	return {
-		version: 1,
-		checkpointId: input.checkpoint.checkpointId,
-		checkpointEntryId: input.checkpointEntryId,
-		promptGeneration: input.checkpoint.promptGeneration,
-		sourceContextEpoch: input.checkpoint.contextEpoch,
-		targetContextEpoch: input.targetContextEpoch,
-		note,
-		activeTodosAtCommit: structuredClone(input.activeTodos),
-		todoStateEntryIdAtCommit: input.todoStateEntryId,
-		todoStateFingerprintAtCommit: input.todoStateFingerprint,
-		activeEntryIds,
-		historyAllowlist,
-		sourceFingerprint: fingerprintContextRolloverValue(input.contextEntries),
-		progressBaselineFingerprint: input.progressBaselineFingerprint,
-		taskNoteProjectionRevision: input.taskNoteProjection.revision,
-	};
-}
-
-function mergeTaskNoteProjection(
-	checkpoint: ContextRolloverNote,
-	projection: TaskNoteProjectionSnapshot,
-	activeTodos: readonly ActiveRolloverTodo[],
-): ContextRolloverNote {
-	const note = structuredClone(checkpoint);
-	for (const item of projection.items) {
-		const sourceEntryIds = item.sourceRefs.map((reference) => reference.entryId);
-		const evidenceEntryIds = item.evidence.map((evidence) => evidence.observedAtEntryId);
-		if (item.kind === "constraint") {
-			if (!note.userConstraints.some((constraint) => constraint.text === item.text)) {
-				note.userConstraints.push({ text: item.text, sourceEntryIds });
-			}
-		} else if (item.kind === "decision") {
-			if (!note.decisions.some((decision) => decision.text === item.text)) {
-				note.decisions.push({ text: item.text, reason: "Current Task Note decision.", sourceEntryIds });
-			}
-		} else if (item.kind === "state") {
-			note.currentState = {
-				text:
-					item.freshness === "fresh"
-						? item.text
-						: `${item.text} This was previously observed, but its current validity is ${item.freshness}; revalidation is required.`,
-				evidenceEntryIds,
-			};
-		} else if (item.kind === "failed_attempt") {
-			if (!note.failedAttempts.some((attempt) => attempt.text === item.text)) {
-				note.failedAttempts.push({
-					text: item.text,
-					reason: "Recorded failed attempt with system-stamped evidence.",
-					evidenceEntryIds,
-				});
-			}
-		} else if (activeTodos.length === 0) {
-			note.nextAction = {
-				text:
-					item.freshness === "stale" || item.freshness === "unknown"
-						? `${item.text} Revalidate its prerequisites before continuing.`
-						: item.text,
-				evidenceEntryIds,
-			};
-		}
-	}
-	if (activeTodos.length > 0) {
-		note.nextAction = { text: activeTodos[0].content, evidenceEntryIds: [] };
-	}
-	return note;
-}
-
-export function validateFinalHandoff(input: {
-	bundle: ContextRolloverBundle;
-	branch: readonly SessionEntry[];
-	projection: TaskNoteProjectionSnapshot;
-	activeTodos: readonly ActiveRolloverTodo[];
-	contextWindow: number;
-}): void {
-	validateContextRolloverNote(input.bundle.note, input.branch);
-	if (
-		!input.bundle.note.objective.sourceEntryIds.some(
-			(entryId) => createTaskScopeId(entryId) === input.projection.scope.taskScopeId,
-		)
-	) {
-		throw new Error("handoff_invalid");
-	}
-	if (input.bundle.taskNoteProjectionRevision !== input.projection.revision) throw new Error("handoff_invalid");
-	if (JSON.stringify(input.bundle.activeTodosAtCommit) !== JSON.stringify(input.activeTodos)) {
-		throw new Error("handoff_invalid");
-	}
-	for (const item of input.projection.items) {
-		if (
-			item.kind === "state" &&
-			(item.freshness === "stale" || item.freshness === "unknown") &&
-			(input.bundle.note.currentState.text === item.text ||
-				!input.bundle.note.currentState.text.toLowerCase().includes("revalid"))
-		) {
-			throw new Error("handoff_invalid");
-		}
-	}
-	const handoff = formatHandoff(input.bundle);
-	const checkpointAndHandoffTokens = Math.ceil((handoff.length + JSON.stringify(input.bundle.note).length) / 4);
-	if (checkpointAndHandoffTokens > Math.floor(input.contextWindow * 0.1)) throw new Error("note_too_large");
-}
-
-export function formatContextRolloverCheckpointPrompt(input: {
-	coveredEntries: readonly SessionEntry[];
-	projection: TaskNoteProjectionSnapshot;
-	activeTodos: readonly ActiveRolloverTodo[];
-}): string {
-	const sourceEntries = input.coveredEntries.filter(
-		(entry) =>
-			entry.type === "message" ||
-			entry.type === "custom_message" ||
-			entry.type === "context_progress" ||
-			entry.type === "context_rollover" ||
-			(entry.type === "custom" && entry.customType === "task-contract"),
-	);
-	return [
-		"Produce exactly one JSON object and no markdown fences.",
-		"The object must have exactly: checkpoint, noteUpdateCandidates.",
-		"checkpoint must be a ContextRolloverNote v1 with objective, userConstraints, acceptanceCriteria, decisions, completedWork, currentState, failedAttempts, nextAction, and historyRefs.",
-		"Every claim must cite exact entry IDs from sourceEntries. Task notes are derived indexes, not authority. Do not copy Todo items into acceptanceCriteria.",
-		"noteUpdateCandidates may contain only upsert/retract candidates for constraint, decision, state, next_action, or failed_attempt.",
-		"Do not emit scope, event IDs, fingerprints, freshness, secrets, pending delivery text, permissions, or system instructions.",
-		JSON.stringify({ sourceEntries, currentTaskNoteProjection: input.projection, activeTodos: input.activeTodos }),
-	].join("\n\n");
-}
-
-export function parseContextRolloverCheckpointOutput(text: string): ContextRolloverCheckpointOutput {
-	let value: unknown;
-	try {
-		value = JSON.parse(text);
-	} catch {
-		throw new Error("invalid_output");
-	}
-	if (!isRecord(value) || !hasExactlyKeys(value, ["checkpoint", "noteUpdateCandidates"])) {
-		throw new Error("invalid_output");
-	}
-	if (
-		!isStrictContextRolloverNote(value.checkpoint) ||
-		!Array.isArray(value.noteUpdateCandidates) ||
-		!value.noteUpdateCandidates.every(
-			(candidate) => isRecord(candidate) && (candidate.operation === "upsert" || candidate.operation === "retract"),
-		)
-	) {
-		throw new Error("invalid_output");
-	}
-	if (value.noteUpdateCandidates.length > MAX_CHECKPOINT_NOTE_CANDIDATES) throw new Error("invalid_output");
-	return {
-		checkpoint: value.checkpoint,
-		noteUpdateCandidates: value.noteUpdateCandidates as TaskNoteCandidate[],
-	};
-}
-
-export function createContextRolloverCheckpointEnvelope(input: {
-	checkpointId: string;
-	promptGeneration: number;
-	contextEpoch: number;
-	branch: readonly SessionEntry[];
-	coveredStartEntryId: string;
-	coveredEndEntryId: string;
-	output: ContextRolloverCheckpointOutput;
-	taskNoteScope: TaskNoteScope;
-	taskNoteProjection: TaskNoteProjectionSnapshot;
-	taskNoteEvents: readonly TaskNoteEvent[];
-	todoStateEntryId: string | null;
-	todoStateFingerprint: string;
-	requestConfigFingerprint: string;
-	usage?: Usage;
-}): ContextRolloverCheckpointEnvelope {
-	const start = input.branch.findIndex((entry) => entry.id === input.coveredStartEntryId);
-	const end = input.branch.findIndex((entry) => entry.id === input.coveredEndEntryId);
-	if (start < 0 || end < start) throw new Error("invalid_output");
-	const covered = input.branch
-		.slice(start, end + 1)
-		.filter((entry) => entry.type === "message" || entry.type === "custom_message");
-	if (covered.length === 0) throw new Error("invalid_output");
-	const transactions = collectCompleteToolTransactions(covered);
-	if (transactions.flat().length !== covered.length) throw new Error("tool_transaction_incomplete");
-	const allowedSourceEntryIds = new Set(input.branch.slice(start, end + 1).map((entry) => entry.id));
-	if (input.contextEpoch > 0) {
-		const previousRollover = [...input.branch]
-			.reverse()
-			.find(
-				(entry): entry is Extract<SessionEntry, { type: "context_rollover" }> =>
-					entry.type === "context_rollover" && entry.targetContextEpoch === input.contextEpoch,
-			);
-		if (previousRollover) {
-			for (const id of collectNoteReferenceIds(previousRollover.bundle.note)) allowedSourceEntryIds.add(id);
-		}
-	}
-	validateContextRolloverNote(input.output.checkpoint, input.branch, allowedSourceEntryIds);
-	if (
-		!input.output.checkpoint.objective.sourceEntryIds.some(
-			(entryId) => createTaskScopeId(entryId) === input.taskNoteScope.taskScopeId,
-		)
-	) {
-		throw new Error("invalid_evidence");
-	}
-
-	const events: TaskNoteEvent[] = [];
-	let projection = input.taskNoteProjection;
-	for (let candidateIndex = 0; candidateIndex < input.output.noteUpdateCandidates.length; candidateIndex++) {
-		const candidate = input.output.noteUpdateCandidates[candidateIndex];
-		const accepted = acceptTaskNoteCandidate(candidate, {
-			scope: input.taskNoteScope,
-			contextEpoch: input.contextEpoch,
-			source: { type: "checkpoint", checkpointId: input.checkpointId, candidateIndex },
-			branch: input.branch,
-			projection,
-			allowedEntryIds: allowedSourceEntryIds,
-			eventCount: input.taskNoteEvents.length + events.length,
-		});
-		if (accepted.status !== "accepted") throw new Error(accepted.reason);
-		events.push(accepted.event);
-		const rebuilt = buildTaskNoteProjection({
-			events: [...input.taskNoteEvents, ...events],
-			scope: input.taskNoteScope,
-		});
-		if (rebuilt.status !== "valid") throw new Error(rebuilt.reason);
-		projection = rebuilt.snapshot;
-	}
-
-	const checkpoint: ContextRolloverCheckpoint = {
-		version: 1,
-		checkpointId: input.checkpointId,
-		promptGeneration: input.promptGeneration,
-		contextEpoch: input.contextEpoch,
-		coveredStartEntryId: covered[0].id,
-		coveredEndEntryId: covered.at(-1)?.id ?? covered[0].id,
-		coveredEntryIds: covered.map((entry) => entry.id),
-		sourcePrefixFingerprint: fingerprintContextRolloverValue(covered),
-		todoStateEntryId: input.todoStateEntryId,
-		todoStateFingerprint: input.todoStateFingerprint,
-		requestConfigFingerprint: input.requestConfigFingerprint,
-		compactionPrefix: createPrefixCheckpointFromBoundary(
-			[...input.branch],
-			covered.at(-1)?.id ?? covered[0].id,
-			JSON.stringify(input.output.checkpoint),
-			input.usage,
-		),
-		note: structuredClone(input.output.checkpoint),
-	};
-	return {
-		version: 1,
-		checkpoint,
-		taskNoteBatch: {
-			version: 1,
-			batchId: createTaskNoteBatchId(input.checkpointId, events),
-			events,
-		},
-	};
-}
-
-function containsPotentialSecret(text: string): boolean {
-	return (
-		/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(text) ||
-		/\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b/.test(text) ||
-		/\bAKIA[0-9A-Z]{16}\b/.test(text) ||
-		/\b(?:xoxb|xoxp)-[A-Za-z0-9-]{20,}\b/.test(text) ||
-		/\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/i.test(text) ||
-		/\b(?:password|secret|token|api[_-]?key)\s*[:=]\s*[^\s]{8,}/i.test(text)
-	);
-}
-
-function isUserSource(entry: SessionEntry | undefined): boolean {
-	return (
-		(entry?.type === "message" && entry.message.role === "user") ||
-		(entry?.type === "custom_message" && entry.customType === "user-provenance")
-	);
-}
-
 export function fingerprintContextRolloverValue(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
-
-export function createContextRolloverDispatchId(rolloverId: string, preparedRequestFingerprint: string): string {
-	return createHash("sha256")
-		.update(`context-rollover-dispatch-v1${rolloverId}${preparedRequestFingerprint}`)
-		.digest("hex");
+export function createContextRolloverDispatchId(rolloverId: string, fingerprint: string): string {
+	return fingerprintContextRolloverValue(["context-rollover-dispatch", rolloverId, fingerprint]);
 }
-
-export function formatContextRolloverHandoff(bundle: ContextRolloverBundle): string {
-	return formatHandoff(bundle);
-}
-
-export function validatePreparedRolloverBudget(
-	preparation: PreparedContinuation,
-	sourceBudget: ContextBudget,
-	sourceRequestFingerprint: string,
-): ContextRolloverBlockedReason | undefined {
-	if (preparation.budget.decision !== "fits") return "prepared_context_limit";
-	if (preparation.budget.tokens > Math.floor(preparation.budget.contextWindow * 0.5)) {
-		return "prepared_over_half_window";
-	}
-	if (preparation.requestFingerprint === sourceRequestFingerprint) return "unchanged_request";
-	if (preparation.budget.tokens >= sourceBudget.tokens) return "prepared_context_limit";
-	return undefined;
-}
-
-/**
- * Derive the Strong Progress credits available after a sequence of persisted evidence.
- * A verification only credits the effect immediately preceding it when that result was
- * not already observed before the effect. This keeps a write/read-back pair useful while
- * preventing an x -> y -> x rollback from minting a second credit for the old state.
- */
-export function collectStrongProgressCreditIds(
-	entries: readonly SessionEntry[],
-	consumedCreditIds: ReadonlySet<string> = new Set(),
-): string[] {
-	const progressEntries = entries.filter(
-		(entry): entry is Extract<SessionEntry, { type: "context_progress" }> =>
-			entry.type === "context_progress" && entry.outcome === "succeeded",
-	);
-	const credits: string[] = [];
-	for (let index = 0; index < progressEntries.length; index++) {
-		const entry = progressEntries[index];
-		if (entry.evidenceKind === "task_completed") {
-			if (!consumedCreditIds.has(entry.evidenceId)) credits.push(entry.evidenceId);
+export function collectCompleteToolTransactions(entries: readonly SessionEntry[]): string[][] {
+	const transactions: string[][] = [];
+	let expected = new Set<string>();
+	let current: string[] = [];
+	for (const entry of entries) {
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message.role === "toolResult") {
+			if (!expected.delete(message.toolCallId)) throw new Error("tool_transaction_incomplete");
+			current.push(entry.id);
+			if (expected.size === 0) transactions.push(current);
 			continue;
 		}
-		if (entry.evidenceKind !== "verification") continue;
+		if (expected.size > 0) throw new Error("tool_transaction_incomplete");
+		current = [entry.id];
+		if (message.role === "assistant")
+			expected = new Set(message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])));
+		if (expected.size === 0) transactions.push(current);
+	}
+	if (expected.size > 0) throw new Error("tool_transaction_incomplete");
+	return transactions;
+}
 
-		let effectIndex = -1;
-		for (let candidateIndex = index - 1; candidateIndex >= 0; candidateIndex--) {
-			const candidate = progressEntries[candidateIndex];
-			if (candidate.evidenceKind === "non_read_effect" && candidate.targetFingerprint === entry.targetFingerprint) {
-				effectIndex = candidateIndex;
-				break;
+function dedupeReferences(references: readonly TaskNoteReference[]): TaskNoteReference[] {
+	const seen = new Set<string>();
+	return references.filter((reference) => {
+		const key = `${reference.entryId}:${reference.blockIndex ?? ""}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+function referenceBlock(
+	historyById: ReadonlyMap<string, ReturnType<History["getItems"]>[number]>,
+	reference: TaskNoteReference,
+) {
+	const item = historyById.get(reference.entryId);
+	if (reference.blockIndex === undefined) return item?.blocks.length === 1 ? item.blocks[0] : undefined;
+	return item?.blocks.find((block) => block.blockIndex === reference.blockIndex);
+}
+
+/** Resolve the current effective continuation contract while retaining the committed task authority. */
+export function currentContextRecoveryReferences(
+	manager: SessionManager,
+	recovery: ContextRecoveryReferences,
+): ContextRecoveryReferences {
+	const branch = manager.getBranch();
+	const scope = resolveTaskNoteScopeByTaskSource(branch, recovery.taskSourceEntryId);
+	if (!scope || scope.taskScopeId !== recovery.taskScopeId) throw new Error("recovery_reference_invalid");
+	const projection = buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch));
+	if (projection.status !== "valid") throw new Error("recovery_reference_invalid");
+	const nextAction = projection.snapshot.items.find((item) => item.kind === "next_action" && item.key === "current");
+	if (!nextAction?.resume) throw new Error("recovery_reference_invalid");
+	const related = nextAction.resume.relatedNotes.map((reference) =>
+		projection.snapshot.items.find((item) => item.kind === reference.kind && item.key === reference.key),
+	);
+	if (related.some((item) => item === undefined)) throw new Error("recovery_reference_invalid");
+
+	const cutoffIndex = branch.findIndex((entry) => entry.id === recovery.historyCutoffEntryId);
+	if (cutoffIndex < 0) throw new Error("recovery_reference_invalid");
+	const branchIndex = new Map(branch.map((entry, index) => [entry.id, index]));
+	const deliveredRequirements = new History(manager)
+		.getItems()
+		.filter((item) => item.role === "user" && (branchIndex.get(item.entryId) ?? -1) > cutoffIndex)
+		.flatMap((item) =>
+			item.blocks.flatMap((block) =>
+				block.text === undefined ? [] : [{ entryId: item.entryId, blockIndex: block.blockIndex }],
+			),
+		);
+	const history = new History(manager).getItems();
+	const historyById = new Map(history.map((item) => [item.entryId, item]));
+	const requiredHistoryRefs = dedupeReferences(nextAction.resume.requiredHistoryRefs);
+	const requirementSourceRefs = dedupeReferences([
+		...recovery.requirementSourceRefs,
+		...nextAction.resume.requirementSourceRefs,
+		...deliveredRequirements,
+	]);
+	if (![...requiredHistoryRefs, ...requirementSourceRefs].every((reference) => referenceBlock(historyById, reference)))
+		throw new Error("recovery_reference_invalid");
+	const todoEntry = [...branch]
+		.reverse()
+		.find((entry) => entry.type === "custom" && entry.customType === "todo-state");
+	const todoItems = todoEntry?.type === "custom" && Array.isArray(todoEntry.data) ? todoEntry.data : [];
+	if (
+		!nextAction.resume.todoIds.every((todoId) =>
+			todoItems.some((item) => item !== null && typeof item === "object" && "id" in item && item.id === todoId),
+		)
+	)
+		throw new Error("recovery_reference_invalid");
+	return {
+		...recovery,
+		nextActionEventId: nextAction.eventId,
+		relatedNoteEventIds: related.flatMap((item) => (item === undefined ? [] : [item.eventId])),
+		noteFreshness: [nextAction, ...related].flatMap((item) =>
+			item === undefined ? [] : [{ eventId: item.eventId, freshness: item.freshness }],
+		),
+		requiredHistoryRefs,
+		requirementSourceRefs,
+		todoIds: [...nextAction.resume.todoIds],
+		todoStateEntryId: todoEntry?.id ?? null,
+		todoStateFingerprint: fingerprintContextRolloverValue(todoEntry?.type === "custom" ? todoEntry.data : []),
+		taskNoteProjectionRevision: projection.snapshot.revision,
+	};
+}
+
+function recoveryWorkset(
+	manager: SessionManager,
+	recovery: ContextRecoveryReferences,
+	promptGeneration: number,
+): unknown {
+	const branch = manager.getBranch();
+	const scope = resolveTaskNoteScope(branch, promptGeneration);
+	const projection =
+		scope?.taskScopeId === recovery.taskScopeId
+			? buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch))
+			: undefined;
+	const noteIds = new Set([recovery.nextActionEventId, ...recovery.relatedNoteEventIds]);
+	const history = new History(manager).getItems();
+	const historyById = new Map(history.map((item) => [item.entryId, item]));
+	const historyReferences = dedupeReferences([...recovery.requirementSourceRefs, ...recovery.requiredHistoryRefs]);
+	return {
+		resume: {
+			nextActionEventId: recovery.nextActionEventId,
+			taskNoteProjectionRevision: recovery.taskNoteProjectionRevision,
+			todoStateFingerprint: recovery.todoStateFingerprint,
+		},
+		notes:
+			projection?.status === "valid" ? projection.snapshot.items.filter((item) => noteIds.has(item.eventId)) : [],
+		history: historyReferences.map((reference) => {
+			const item = historyById.get(reference.entryId);
+			const block =
+				reference.blockIndex === undefined
+					? item?.blocks.length === 1
+						? item.blocks[0]
+						: undefined
+					: item?.blocks.find((candidate) => candidate.blockIndex === reference.blockIndex);
+			return { ...reference, text: block?.text ?? "" };
+		}),
+		todos: recovery.todoIds.map((todoId) => {
+			const item = recovery.todoStateEntryId ? historyById.get(recovery.todoStateEntryId) : undefined;
+			return {
+				todoId,
+				revision: item?.todoRevision,
+				text: JSON.stringify(item?.todoItems?.find((todo) => todo.id === todoId) ?? null),
+			};
+		}),
+	};
+}
+
+function latestSaveEntry(
+	manager: SessionManager,
+	windowId: string,
+	promptGeneration: number,
+): ContextOperationEntry | undefined {
+	return [...manager.getBranch()]
+		.reverse()
+		.find(
+			(entry): entry is ContextOperationEntry =>
+				entry.type === "context_operation" &&
+				entry.operationKind === "save_state" &&
+				entry.windowId === windowId &&
+				entry.promptGeneration === promptGeneration,
+		);
+}
+
+export function getSaveStateOperation(
+	manager: SessionManager,
+	windowId: string,
+	promptGeneration: number,
+): SaveStateOperationSnapshot | undefined {
+	const entry = latestSaveEntry(manager, windowId, promptGeneration);
+	if (!entry) return undefined;
+	return {
+		operationId: entry.operationId,
+		transitionCause: entry.transitionCause,
+		windowId: entry.windowId,
+		promptGeneration: entry.promptGeneration,
+		contextEpoch: entry.contextEpoch,
+		sourceFingerprint: entry.sourceFingerprint,
+		businessCutoffEntryId: entry.businessCutoffEntryId,
+		startTaskNoteRevision: entry.startTaskNoteRevision,
+		controlBudgetTokens: entry.controlBudgetTokens,
+		outputBudgetTokens: entry.outputBudgetTokens,
+		samplesUsed: entry.samplesUsed,
+		consumedControlTokens: entry.consumedControlTokens,
+		consumedOutputTokens: entry.consumedOutputTokens,
+		finished: entry.state === "finished",
+	};
+}
+
+function branchTaskNoteProjection(
+	manager: SessionManager,
+	promptGeneration: number,
+): { snapshot: TaskNoteProjectionSnapshot; branch: SessionEntry[] } | undefined {
+	const branch = manager.getBranch();
+	const scope = resolveTaskNoteScope(branch, promptGeneration);
+	if (!scope) return undefined;
+	const projection = buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch));
+	return projection.status === "valid" ? { snapshot: projection.snapshot, branch } : undefined;
+}
+
+function isBusinessFact(entry: SessionEntry): boolean {
+	if (entry.type === "custom" && entry.customType === "todo-state") return true;
+	if (entry.type !== "message") return false;
+	if (entry.message.role === "user") return true;
+	return (
+		entry.message.role === "toolResult" &&
+		!["context_note", "history", "get_context_remaining", "new_context"].includes(entry.message.toolName)
+	);
+}
+
+/** Validate the single continuation contract that permits a save-state operation to finish. */
+export function validateContinuationState(
+	manager: SessionManager,
+	operation: SaveStateOperationSnapshot,
+): ContinuationStateValidation {
+	const projected = branchTaskNoteProjection(manager, operation.promptGeneration);
+	if (!projected) return { status: "invalid", reason: "continuation_projection_invalid" };
+	const { branch, snapshot } = projected;
+	const cutoffIndex = branch.findIndex((entry) => entry.id === operation.businessCutoffEntryId);
+	if (cutoffIndex < 0) return { status: "invalid", reason: "business_cutoff_unavailable" };
+	const nextAction = snapshot.items.find((item) => item.kind === "next_action" && item.key === "current");
+	if (!nextAction?.resume) return { status: "invalid", reason: "continuation_state_missing" };
+	const noteEntryIndex = branch.findIndex(
+		(entry) =>
+			entry.type === "custom" &&
+			entry.customType === "task-note-event" &&
+			typeof entry.data === "object" &&
+			entry.data !== null &&
+			"eventId" in entry.data &&
+			entry.data.eventId === nextAction.eventId,
+	);
+	if (noteEntryIndex < 0) return { status: "invalid", reason: "continuation_reference_invalid" };
+	if (branch.slice(noteEntryIndex + 1).some(isBusinessFact)) {
+		return { status: "invalid", reason: "continuation_state_stale" };
+	}
+	try {
+		collectCompleteToolTransactions(branch.slice(cutoffIndex + 1));
+	} catch {
+		return { status: "invalid", reason: "tool_transaction_incomplete" };
+	}
+
+	const related = nextAction.resume.relatedNotes.map((reference) =>
+		snapshot.items.find((item) => item.kind === reference.kind && item.key === reference.key),
+	);
+	if (related.some((item) => item === undefined))
+		return { status: "invalid", reason: "continuation_reference_invalid" };
+	const history = new History(manager).getItems();
+	const readable = new Map(history.map((item) => [item.entryId, item]));
+	const refIsReadable = (reference: TaskNoteReference) => {
+		const item = readable.get(reference.entryId);
+		if (item === undefined) return false;
+		const block =
+			reference.blockIndex === undefined
+				? item.blocks.length === 1
+					? item.blocks[0]
+					: undefined
+				: item.blocks.find((candidate) => candidate.blockIndex === reference.blockIndex);
+		return block?.text !== undefined;
+	};
+	if (!nextAction.resume.requiredHistoryRefs.every(refIsReadable))
+		return { status: "invalid", reason: "continuation_history_reference_invalid" };
+	const scopeTask = history.find((item) => createTaskScopeId(item.entryId) === snapshot.scope.taskScopeId);
+	if (!scopeTask) return { status: "invalid", reason: "task_source_unavailable" };
+	const requiredUserRefs = history
+		.filter((item) => item.role === "user")
+		.filter((item) => {
+			const index = branch.findIndex((entry) => entry.id === item.entryId);
+			const start = branch.findIndex((entry) => entry.id === scopeTask.entryId);
+			return index >= start && index <= noteEntryIndex;
+		})
+		.flatMap((item) =>
+			item.blocks
+				.filter((block) => block.type === "text")
+				.map((block) => ({ entryId: item.entryId, blockIndex: block.blockIndex })),
+		);
+	const requirementSourceRefs = dedupeReferences([...requiredUserRefs, ...nextAction.resume.requirementSourceRefs]);
+	if (
+		!requirementSourceRefs.every((reference) => {
+			const entry = branch.find((candidate) => candidate.id === reference.entryId);
+			return entry?.type === "message" && entry.message.role === "user" && refIsReadable(reference);
+		})
+	)
+		return { status: "invalid", reason: "requirement_source_invalid" };
+
+	const todoEntry = [...branch]
+		.reverse()
+		.find((entry) => entry.type === "custom" && entry.customType === "todo-state");
+	const todoItems = todoEntry?.type === "custom" && Array.isArray(todoEntry.data) ? todoEntry.data : [];
+	if (
+		!nextAction.resume.todoIds.every((todoId) =>
+			todoItems.some((item) => item !== null && typeof item === "object" && "id" in item && item.id === todoId),
+		)
+	)
+		return { status: "invalid", reason: "todo_reference_invalid" };
+
+	return {
+		status: "valid",
+		finalTaskNoteRevision: snapshot.revision,
+		nextActionEventId: nextAction.eventId,
+		relatedNoteEventIds: related.flatMap((item) => (item === undefined ? [] : [item.eventId])),
+		noteFreshness: [nextAction, ...related].flatMap((item) =>
+			item === undefined ? [] : [{ eventId: item.eventId, freshness: item.freshness }],
+		),
+		requiredHistoryRefs: dedupeReferences(nextAction.resume.requiredHistoryRefs),
+		requirementSourceRefs,
+		todoIds: [...nextAction.resume.todoIds],
+	};
+}
+
+function parseVisibleToolPages(messages: readonly Message[]): ContextRecoveryReadPage[] {
+	return messages.flatMap((message) => {
+		if (message.role !== "toolResult" || message.isError) return [];
+		return message.content.flatMap((block): ContextRecoveryReadPage[] => {
+			if (block.type !== "text") return [];
+			try {
+				const value: unknown = JSON.parse(block.text);
+				return value !== null &&
+					typeof value === "object" &&
+					"source" in value &&
+					(value.source === "task_notes" || value.source === "session_history")
+					? [
+							{
+								toolCallId: message.toolCallId,
+								toolName: message.toolName,
+								page: value as Record<string, unknown>,
+							},
+						]
+					: [];
+			} catch {
+				return [];
+			}
+		});
+	});
+}
+
+function visibleToolInputs(messages: readonly Message[]): ReadonlyMap<string, Record<string, unknown>> {
+	const inputs = new Map<string, Record<string, unknown>>();
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		for (const block of message.content) {
+			if (block.type === "toolCall") inputs.set(block.id, block.arguments);
+		}
+	}
+	return inputs;
+}
+
+function normalizedRecoveryCursor(source: "task_notes" | "session_history", encoded: unknown): string | undefined {
+	if (typeof encoded !== "string") return undefined;
+	try {
+		const value: unknown = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+		if (
+			value === null ||
+			typeof value !== "object" ||
+			!("query" in value) ||
+			typeof value.query !== "string" ||
+			!("index" in value) ||
+			typeof value.index !== "number" ||
+			!("offset" in value) ||
+			typeof value.offset !== "number" ||
+			![value.index, value.offset].every((position) => Number.isSafeInteger(position) && position >= 0)
+		)
+			return undefined;
+		if (source === "task_notes")
+			return JSON.stringify({ source, query: value.query, index: value.index, offset: value.offset });
+		if (
+			!("version" in value) ||
+			typeof value.version !== "number" ||
+			!("sessionId" in value) ||
+			typeof value.sessionId !== "string" ||
+			!("windowId" in value) ||
+			(value.windowId !== null && typeof value.windowId !== "string") ||
+			!("block" in value) ||
+			typeof value.block !== "number" ||
+			!Number.isSafeInteger(value.block) ||
+			value.block < 0
+		)
+			return undefined;
+		return JSON.stringify({
+			source,
+			version: value.version,
+			query: value.query,
+			sessionId: value.sessionId,
+			windowId: value.windowId,
+			index: value.index,
+			block: value.block,
+			offset: value.offset,
+		});
+	} catch {
+		return undefined;
+	}
+}
+
+interface RecoveryInterval {
+	offset: number;
+	end: number;
+	total: number;
+}
+
+function normalizedIntervals(intervals: RecoveryInterval[]): RecoveryInterval[] {
+	const totals = new Set(intervals.map((interval) => interval.total));
+	if (totals.size !== 1) return [];
+	const merged: RecoveryInterval[] = [];
+	for (const interval of [...intervals].sort((left, right) => left.offset - right.offset || left.end - right.end)) {
+		const previous = merged.at(-1);
+		if (previous && interval.offset <= previous.end) previous.end = Math.max(previous.end, interval.end);
+		else merged.push({ ...interval });
+	}
+	return merged;
+}
+
+function intervalsCoverTotal(intervals: RecoveryInterval[]): boolean {
+	if (intervals.length === 0) return false;
+	const normalized = normalizedIntervals(intervals);
+	if (normalized.length === 0) return false;
+	const total = normalized[0].total;
+	let covered = 0;
+	for (const interval of normalized) {
+		if (interval.offset > covered) return false;
+		covered = Math.max(covered, interval.end);
+	}
+	return covered >= total;
+}
+
+function pageItems(page: Record<string, unknown>): Record<string, unknown>[] {
+	return Array.isArray(page.items)
+		? page.items.filter((item): item is Record<string, unknown> => item !== null && typeof item === "object")
+		: [];
+}
+
+function intervalMatchesText(
+	item: Record<string, unknown>,
+	expected: string,
+): item is Record<string, unknown> & RecoveryInterval {
+	if (
+		typeof item.offset !== "number" ||
+		typeof item.end !== "number" ||
+		typeof item.total !== "number" ||
+		typeof item.text !== "string" ||
+		![item.offset, item.end, item.total].every(Number.isSafeInteger) ||
+		item.offset < 0 ||
+		item.end < item.offset ||
+		item.total < item.end ||
+		item.text.length !== item.end - item.offset
+	)
+		return false;
+	return expected.length === item.total && expected.slice(item.offset, item.end) === item.text;
+}
+
+function referenceKey(
+	reference: TaskNoteReference,
+	historyById: ReadonlyMap<string, ReturnType<History["getItems"]>[number]>,
+): string {
+	const block = referenceBlock(historyById, reference);
+	return `${reference.entryId}:${block?.blockIndex ?? reference.blockIndex ?? ""}`;
+}
+
+/** Derive recovery coverage exclusively from sourced text present in the final provider request. */
+export function contextRecoveryCoverage(
+	manager: SessionManager,
+	messages: readonly Message[],
+	recovery: ContextRecoveryReferences,
+): ContextRecoveryCoverage {
+	const pages = parseVisibleToolPages(messages);
+	const toolInputs = visibleToolInputs(messages);
+	const notePages = pages.filter(
+		(record) => record.page.source === "task_notes" && record.page.revision === recovery.taskNoteProjectionRevision,
+	);
+	const historyPages = pages.filter((record) => record.page.source === "session_history");
+	const branch = manager.getBranch();
+	const scope = resolveTaskNoteScopeByTaskSource(branch, recovery.taskSourceEntryId);
+	const projection = scope
+		? buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch))
+		: undefined;
+	const expectedNotes = new Map(
+		projection?.status === "valid" && projection.snapshot.revision === recovery.taskNoteProjectionRevision
+			? projection.snapshot.items.map((item) => [item.eventId, item.text] as const)
+			: [],
+	);
+	const history = new History(manager).getItems();
+	const historyById = new Map(history.map((item) => [item.entryId, item]));
+	const requiredHistory = dedupeReferences([...recovery.requirementSourceRefs, ...recovery.requiredHistoryRefs]);
+	const requiredHistoryKeys = new Set(requiredHistory.map((reference) => referenceKey(reference, historyById)));
+	const requiredTodoKeys = new Set(recovery.todoIds.map((todoId) => `${recovery.todoStateEntryId ?? ""}:${todoId}`));
+	const requiredNoteIds = new Set([recovery.nextActionEventId, ...recovery.relatedNoteEventIds]);
+	const resumeResolved = notePages.some((record) =>
+		pageItems(record.page).some((item) => item.type === "next_action" && item.eventId === recovery.nextActionEventId),
+	);
+	const noteIntervals = new Map<string, RecoveryInterval[]>();
+	const historyIntervals = new Map<string, RecoveryInterval[]>();
+	const todoIntervals = new Map<string, RecoveryInterval[]>();
+	const discoveries = new Set<string>();
+	const relevantCursors = new Set<string>();
+	for (const record of notePages) {
+		let relevantPage = false;
+		for (const item of pageItems(record.page)) {
+			if (typeof item.eventId === "string" && requiredNoteIds.has(item.eventId)) {
+				discoveries.add(`note:${item.eventId}`);
+				relevantPage = true;
+			}
+			if (
+				(item.type === "requirement_source" || item.type === "required_history") &&
+				typeof item.entryId === "string"
+			) {
+				const key = `${item.entryId}:${typeof item.blockIndex === "number" ? item.blockIndex : ""}`;
+				const matching = [...requiredHistoryKeys].find(
+					(required) =>
+						required === key || (item.blockIndex === undefined && required.startsWith(`${item.entryId}:`)),
+				);
+				if (matching) {
+					discoveries.add(`history:${matching}`);
+					relevantPage = true;
+				}
+			}
+			if (item.type === "todo" && typeof item.todoId === "string" && recovery.todoIds.includes(item.todoId)) {
+				discoveries.add(`todo:${item.todoId}`);
+				relevantPage = true;
+			}
+			if (typeof item.eventId !== "string" || !requiredNoteIds.has(item.eventId)) continue;
+			const expected = expectedNotes.get(item.eventId);
+			if (expected === undefined || !intervalMatchesText(item, expected)) continue;
+			const intervals = noteIntervals.get(item.eventId) ?? [];
+			intervals.push({ offset: item.offset, end: item.end, total: item.total });
+			noteIntervals.set(item.eventId, intervals);
+		}
+		const cursor = normalizedRecoveryCursor("task_notes", record.page.cursor);
+		if (relevantPage && cursor) relevantCursors.add(cursor);
+	}
+	for (const record of historyPages) {
+		let relevantPage = false;
+		for (const item of pageItems(record.page)) {
+			if (
+				typeof item.entryId === "string" &&
+				Array.isArray(item.blocks) &&
+				[...requiredHistoryKeys].some((key) => key.startsWith(`${item.entryId}:`))
+			) {
+				discoveries.add(`history-location:${item.entryId}`);
+				relevantPage = true;
+			}
+			if (
+				typeof item.entryId !== "string" ||
+				(typeof item.blockIndex !== "number" && typeof item.todoId !== "string")
+			)
+				continue;
+			if (typeof item.todoId === "string") {
+				const key = `${item.entryId}:${item.todoId}`;
+				if (!requiredTodoKeys.has(key)) continue;
+				discoveries.add(`todo:${item.todoId}`);
+				relevantPage = true;
+				const source = historyById.get(item.entryId);
+				const todo = source?.todoItems?.find((candidate) => candidate.id === item.todoId);
+				const expected = todo === undefined ? undefined : JSON.stringify(todo);
+				if (
+					item.revision !== recovery.todoStateFingerprint ||
+					expected === undefined ||
+					!intervalMatchesText(item, expected)
+				)
+					continue;
+				const intervals = todoIntervals.get(key) ?? [];
+				intervals.push({ offset: item.offset, end: item.end, total: item.total });
+				todoIntervals.set(key, intervals);
+			} else {
+				const key = `${item.entryId}:${item.blockIndex}`;
+				if (!requiredHistoryKeys.has(key)) continue;
+				discoveries.add(`history:${key}`);
+				relevantPage = true;
+				const source = historyById
+					.get(item.entryId)
+					?.blocks.find((block) => block.blockIndex === item.blockIndex)?.text;
+				if (source === undefined || !intervalMatchesText(item, source)) continue;
+				const intervals = historyIntervals.get(key) ?? [];
+				intervals.push({ offset: item.offset, end: item.end, total: item.total });
+				historyIntervals.set(key, intervals);
 			}
 		}
-		if (effectIndex < 0) continue;
-		const effect = progressEntries[effectIndex];
-		if (effect.resultFingerprint !== entry.resultFingerprint) continue;
-		const stateWasObservedBefore = progressEntries
-			.slice(0, effectIndex)
-			.some(
-				(candidate) =>
-					candidate.evidenceKind === "non_read_effect" &&
-					candidate.targetFingerprint === effect.targetFingerprint &&
-					candidate.resultFingerprint === effect.resultFingerprint,
-			);
-		if (stateWasObservedBefore) continue;
-		const creditId = fingerprintContextRolloverValue({
-			kind: "verified_effect",
-			effect: effect.evidenceId,
-			verification: entry.evidenceId,
-		});
-		if (!consumedCreditIds.has(creditId)) credits.push(creditId);
+		const input = toolInputs.get(record.toolCallId);
+		const directoryAdvanced =
+			record.toolName === "history" &&
+			input !== undefined &&
+			"operation" in input &&
+			["list_windows", "list_items", "search"].includes(String(input.operation));
+		const cursor = normalizedRecoveryCursor("session_history", record.page.cursor);
+		if ((relevantPage || directoryAdvanced) && cursor) relevantCursors.add(cursor);
 	}
-	return credits;
+
+	const missing: string[] = [];
+	if (!resumeResolved) missing.push(`resume:${recovery.nextActionEventId}`);
+	for (const eventId of [recovery.nextActionEventId, ...recovery.relatedNoteEventIds]) {
+		if (!intervalsCoverTotal(noteIntervals.get(eventId) ?? [])) missing.push(`note:${eventId}`);
+	}
+	for (const reference of requiredHistory) {
+		const key = referenceKey(reference, historyById);
+		if (!intervalsCoverTotal(historyIntervals.get(key) ?? [])) missing.push(`history:${key}`);
+	}
+	for (const todoId of recovery.todoIds) {
+		const key = `${recovery.todoStateEntryId ?? ""}:${todoId}`;
+		if (!intervalsCoverTotal(todoIntervals.get(key) ?? [])) missing.push(`todo:${todoId}`);
+	}
+	const progress = {
+		resumeResolved,
+		discoveries: [...discoveries].sort(),
+		cursors: [...relevantCursors].sort(),
+		notes: [...noteIntervals.entries()].map(([key, intervals]) => [key, normalizedIntervals(intervals)]),
+		history: [...historyIntervals.entries()].map(([key, intervals]) => [key, normalizedIntervals(intervals)]),
+		todos: [...todoIntervals.entries()].map(([key, intervals]) => [key, normalizedIntervals(intervals)]),
+	};
+	const coveredCharacters = [...noteIntervals.values(), ...historyIntervals.values(), ...todoIntervals.values()]
+		.flatMap(normalizedIntervals)
+		.reduce((total, interval) => total + interval.end - interval.offset, 0);
+	return {
+		complete: missing.length === 0,
+		progressFingerprint: fingerprintContextRolloverValue(progress),
+		coveredUnits: discoveries.size + relevantCursors.size + coveredCharacters,
+		missing,
+		pages,
+	};
+}
+
+/** Validate the immutable commit proof, then require a resolvable current effective contract. */
+export function validateCommittedRecovery(manager: SessionManager, rollover: ContextRolloverEntry): boolean {
+	const branch = manager.getBranch();
+	const rolloverIndex = branch.findIndex((entry) => entry.id === rollover.id);
+	if (rolloverIndex < 0) return false;
+	const committedBranch = branch.slice(0, rolloverIndex);
+	const scope = resolveTaskNoteScope(committedBranch, rollover.promptGeneration);
+	if (!scope || scope.taskScopeId !== rollover.recovery.taskScopeId) return false;
+	const projection = buildTaskNoteProjectionFromBranch(committedBranch, scope);
+	if (projection.status !== "valid") return false;
+	const expectedNotes = [rollover.recovery.nextActionEventId, ...rollover.recovery.relatedNoteEventIds];
+	if (!expectedNotes.every((eventId) => projection.snapshot.items.some((item) => item.eventId === eventId)))
+		return false;
+	const history = new History(manager).getItems();
+	const readable = new Set(history.map((item) => item.entryId));
+	if (
+		![...rollover.recovery.requiredHistoryRefs, ...rollover.recovery.requirementSourceRefs].every((reference) =>
+			readable.has(reference.entryId),
+		)
+	)
+		return false;
+	const todo = [...committedBranch]
+		.reverse()
+		.find((entry) => entry.type === "custom" && entry.customType === "todo-state");
+	if (
+		rollover.recovery.todoStateEntryId === (todo?.id ?? null) &&
+		rollover.recovery.todoStateFingerprint ===
+			fingerprintContextRolloverValue(todo?.type === "custom" ? todo.data : [])
+	) {
+		try {
+			currentContextRecoveryReferences(manager, rollover.recovery);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+	return false;
+}
+export function validateContextRecovery(
+	manager: SessionManager,
+	revisions: ContextRolloverRevisions,
+): ContextRecoveryReferences {
+	const branch = manager.getBranch();
+	const scope = resolveTaskNoteScope(branch, manager.getLatestContextCoordinates().promptGeneration);
+	if (!scope) throw new Error("recovery_unavailable");
+	const currentWindow = currentContextWindow(branch)?.windowId;
+	if (!currentWindow) throw new Error("recovery_unavailable");
+	const operationEntry = latestSaveEntry(manager, currentWindow, scope.promptGeneration);
+	if (!operationEntry || operationEntry.state !== "finished") throw new Error("continuation_state_missing");
+	const operation = getSaveStateOperation(manager, currentWindow, scope.promptGeneration);
+	if (!operation) throw new Error("continuation_state_missing");
+	const continuation = validateContinuationState(manager, operation);
+	if (continuation.status !== "valid") throw new Error(continuation.reason);
+	if (
+		operationEntry.finalTaskNoteRevision !== continuation.finalTaskNoteRevision ||
+		operationEntry.nextActionEventId !== continuation.nextActionEventId ||
+		JSON.stringify(operationEntry.relatedNoteEventIds ?? []) !== JSON.stringify(continuation.relatedNoteEventIds) ||
+		JSON.stringify(operationEntry.noteFreshness ?? []) !== JSON.stringify(continuation.noteFreshness) ||
+		JSON.stringify(operationEntry.requiredHistoryRefs ?? []) !== JSON.stringify(continuation.requiredHistoryRefs) ||
+		JSON.stringify(operationEntry.requirementSourceRefs ?? []) !==
+			JSON.stringify(continuation.requirementSourceRefs) ||
+		JSON.stringify(operationEntry.todoIds ?? []) !== JSON.stringify(continuation.todoIds)
+	)
+		throw new Error("recovery_reference_invalid");
+	const projection = buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch));
+	if (projection.status !== "valid" || projection.snapshot.revision !== revisions.taskNoteProjectionRevision)
+		throw new Error("recovery_unavailable");
+	const readable = new History(manager).getItems();
+	const task = readable.find((item) => item.role === "user" && createTaskScopeId(item.entryId) === scope.taskScopeId);
+	if (
+		!task ||
+		!branch.at(-1) ||
+		(revisions.todoStateEntryId !== null && !readable.some((item) => item.entryId === revisions.todoStateEntryId))
+	)
+		throw new Error("recovery_unavailable");
+	const windowEntry = [...branch]
+		.reverse()
+		.find(
+			(entry) => entry.type === "context_window" || entry.type === "context_rollover" || entry.type === "compaction",
+		);
+	const windowIndex = windowEntry ? branch.indexOf(windowEntry) : -1;
+	collectCompleteToolTransactions(branch.slice(Math.max(0, windowIndex + 1)));
+	return {
+		saveStateOperationId: operation.operationId,
+		nextActionEventId: continuation.nextActionEventId,
+		relatedNoteEventIds: continuation.relatedNoteEventIds,
+		noteFreshness: continuation.noteFreshness,
+		requiredHistoryRefs: continuation.requiredHistoryRefs,
+		requirementSourceRefs: continuation.requirementSourceRefs,
+		todoIds: continuation.todoIds,
+		taskSourceEntryId: task.entryId,
+		requirementsStartEntryId: task.entryId,
+		historyCutoffEntryId: branch.at(-1)!.id,
+		historyStartEntryId: [...readable].reverse().find((item) => item.role === "toolResult")?.entryId ?? task.entryId,
+		todoStateEntryId: revisions.todoStateEntryId,
+		todoStateFingerprint: revisions.todoStateFingerprint,
+		taskNoteProjectionRevision: projection.snapshot.revision,
+		taskScopeId: scope.taskScopeId,
+	};
+}
+
+/** Owns preparation, commit and dispatch ordering, including restart recovery. */
+export class ContextRollover {
+	private dependencies: ContextRolloverDependencies;
+	private inFlight: Promise<ContextRolloverOutcome> | undefined;
+	private inFlightRequestId: string | undefined;
+	constructor(dependencies: ContextRolloverDependencies) {
+		this.dependencies = dependencies;
+	}
+	async run(request: ContextRolloverRequest): Promise<ContextRolloverOutcome> {
+		while (this.inFlight) {
+			const sameRequest = this.inFlightRequestId === request.requestId;
+			const outcome = await this.inFlight;
+			if (sameRequest) return outcome;
+		}
+		const promise = this.execute(request);
+		this.inFlight = promise;
+		this.inFlightRequestId = request.requestId;
+		try {
+			return await promise;
+		} finally {
+			this.inFlight = undefined;
+			this.inFlightRequestId = undefined;
+		}
+	}
+	private async execute(request: ContextRolloverRequest): Promise<ContextRolloverOutcome> {
+		const { agent, manager, revisions, isBusy, isCancelled, onTrace } = this.dependencies;
+		const rolloverId = randomUUID();
+		const identity = createContextWindowIdentity(manager.getBranch());
+		const coordinates = manager.getLatestContextCoordinates();
+		const base = {
+			rolloverId,
+			windowId: identity.windowId,
+			cause: request.cause,
+			promptGeneration: coordinates.promptGeneration,
+			sourceContextEpoch: coordinates.contextEpoch,
+		};
+		const block = (
+			reason: ContextRolloverBlockedReason,
+			diagnostics: {
+				recoveryWorksetTokens?: number;
+				configuredContextWindow?: number;
+				outputReserveTokens?: number;
+				safetyTokens?: number;
+			} = {},
+		): ContextRolloverOutcome => {
+			onTrace({ ...base, ...diagnostics, phase: "rollover", outcome: "blocked", reasonCode: reason });
+			return { outcome: "blocked", reason };
+		};
+		for (let attempt = 0; attempt < 2; attempt++) {
+			if (isCancelled()) return { outcome: "cancelled" };
+			if (isBusy()) return block("operation_in_flight");
+			if (!this.dependencies.canRecover()) return block("recovery_unavailable");
+			if (attempt > 0) request = { ...request, ...(await this.dependencies.measureSource()) };
+			if (
+				manager.ensureContextWindow().windowId !== request.windowId ||
+				manager.getLatestContextCoordinates().promptGeneration !== coordinates.promptGeneration
+			)
+				return block("source_changed");
+			const rollovers = manager.getBranch().filter((entry) => entry.type === "context_rollover");
+			if (
+				rollovers.some(
+					(entry) => entry.previousWindowId === request.windowId || entry.requestId === request.requestId,
+				)
+			)
+				return block("rollover_already_used");
+			if (rollovers.filter((entry) => entry.promptGeneration === coordinates.promptGeneration).length >= 8)
+				return block("rollover_limit");
+			const expected = revisions();
+			let recovery: ContextRecoveryReferences;
+			try {
+				recovery = validateContextRecovery(manager, expected);
+			} catch (error) {
+				return block(
+					error instanceof Error && error.message === "tool_transaction_incomplete"
+						? "tool_transaction_incomplete"
+						: "continuation_state_changed",
+				);
+			}
+			if (!this.dependencies.canRecover(recovery)) return block("recovery_unavailable");
+			const provisional: ContextRolloverEntry = {
+				type: "context_rollover",
+				id: rolloverId,
+				parentId: expected.sessionLeafId,
+				timestamp: "1970-01-01T00:00:00.000Z",
+				rolloverId,
+				dispatchId: "pending",
+				requestId: request.requestId,
+				cause: request.cause,
+				...identity,
+				promptGeneration: coordinates.promptGeneration,
+				sourceContextEpoch: coordinates.contextEpoch,
+				targetContextEpoch: coordinates.contextEpoch + 1,
+				recovery,
+				expectedRevisions: expected,
+				sourceTokens: request.budget.tokens,
+				preparedTokens: 0,
+				configuredContextWindow: agent.state.model.contextWindow,
+				sourceRequestFingerprint: request.requestFingerprint,
+				preparedRequestFingerprint: "pending",
+				preparationBaseFingerprint: "pending",
+				reservedDeliveryIds: [],
+			};
+			const messages = buildSessionContext([...manager.getEntries(), provisional], provisional.id).messages;
+			let preparation: PreparedContinuation;
+			try {
+				preparation = await agent.prepareContinuation(messages, {
+					toolNames: RECOVERY_TOOL_NAMES,
+					maxTokens: Math.min(RECOVERY_OUTPUT_TOKENS, agent.state.model.maxTokens),
+				});
+			} catch {
+				return block("invalid_continuation_context");
+			}
+			if (
+				preparation.budget.decision !== "fits" ||
+				contextRemaining(
+					preparation.budget,
+					{
+						windowId: identity.windowId,
+						measuredAtEntryId: expected.sessionLeafId,
+						requestConfigRevision: expected.requestConfigFingerprint,
+					},
+					this.dependencies.workThresholdPercent(),
+				).phase !== "normal"
+			) {
+				agent.releasePreparedContinuation(preparation);
+				return block("prepared_context_limit");
+			}
+			if (
+				preparation.requestFingerprint === request.requestFingerprint ||
+				preparation.budget.tokens >= request.budget.tokens
+			) {
+				agent.releasePreparedContinuation(preparation);
+				return block("unchanged_request");
+			}
+			if (
+				isCancelled() ||
+				isBusy() ||
+				!this.dependencies.canRecover(recovery) ||
+				JSON.stringify(revisions()) !== JSON.stringify(expected)
+			) {
+				agent.releasePreparedContinuation(preparation);
+				if (isCancelled()) return { outcome: "cancelled" };
+				if (attempt === 0) continue;
+				return block("source_changed");
+			}
+			let worksetBudget: ContextBudget;
+			try {
+				const workset = JSON.stringify(recoveryWorkset(manager, recovery, coordinates.promptGeneration));
+				const minimumPages =
+					2 +
+					recovery.relatedNoteEventIds.length +
+					recovery.requiredHistoryRefs.length +
+					recovery.requirementSourceRefs.length +
+					recovery.todoIds.length;
+				const pageCount = Math.max(minimumPages, Math.ceil(estimateTextTokens(workset) / 2048));
+				worksetBudget = await agent.measurePreparedContinuation(
+					preparation,
+					[
+						{
+							role: "custom",
+							customType: "context-recovery-workset-preflight",
+							content: `${workset}\n${"[recovery page metadata and cursor] ".repeat(pageCount * 16)}`,
+							display: false,
+							timestamp: 0,
+						},
+						{
+							role: "custom",
+							customType: "context-recovery-complete",
+							content:
+								"Required continuation sources are present in the preceding provider request. Continue the current task from next_action/current.",
+							display: false,
+							timestamp: 0,
+						},
+					],
+					{
+						toolNames: agent.state.tools.map((tool) => tool.name),
+						maxTokens: agent.state.model.maxTokens,
+					},
+				);
+			} catch {
+				agent.releasePreparedContinuation(preparation);
+				return block("recovery_workset_too_large", {
+					configuredContextWindow: agent.state.model.contextWindow,
+				});
+			}
+			const worksetRemaining = contextRemaining(
+				worksetBudget,
+				{
+					windowId: identity.windowId,
+					measuredAtEntryId: expected.sessionLeafId,
+					requestConfigRevision: expected.requestConfigFingerprint,
+				},
+				this.dependencies.workThresholdPercent(),
+			);
+			const worksetDiagnostics = {
+				recoveryWorksetTokens: worksetBudget.tokens,
+				configuredContextWindow: worksetBudget.contextWindow,
+				outputReserveTokens: worksetBudget.outputReserveTokens,
+				safetyTokens: worksetBudget.safetyTokens,
+			};
+			if (worksetBudget.decision !== "fits" || worksetRemaining.phase !== "normal") {
+				agent.releasePreparedContinuation(preparation);
+				return block("recovery_workset_too_large", worksetDiagnostics);
+			}
+			if (
+				isCancelled() ||
+				isBusy() ||
+				!this.dependencies.canRecover(recovery) ||
+				JSON.stringify(revisions()) !== JSON.stringify(expected)
+			) {
+				agent.releasePreparedContinuation(preparation);
+				if (isCancelled()) return { outcome: "cancelled" };
+				if (attempt === 0) continue;
+				return block("source_changed");
+			}
+			const { type: _type, id: _id, parentId: _parentId, timestamp: _timestamp, ...input } = provisional;
+			const record = {
+				...input,
+				dispatchId: createContextRolloverDispatchId(rolloverId, preparation.requestFingerprint),
+				preparedTokens: preparation.budget.tokens,
+				preparedRequestFingerprint: preparation.requestFingerprint,
+				preparationBaseFingerprint: preparation.baseContextFingerprint,
+				reservedDeliveryIds: [...preparation.reservedQueueItemIds],
+			};
+			try {
+				manager.appendContextRollover(record);
+			} catch {
+				agent.releasePreparedContinuation(preparation);
+				return block("source_changed");
+			}
+			onTrace({
+				...base,
+				phase: "rollover",
+				outcome: "committed",
+				targetContextEpoch: record.targetContextEpoch,
+				sourceTokens: request.budget.tokens,
+				preparedTokens: preparation.budget.tokens,
+				reservedDeliveryCount: record.reservedDeliveryIds.length,
+			});
+			if (
+				fingerprintContextRolloverValue(manager.buildSessionContext().messages) !==
+				fingerprintContextRolloverValue(messages)
+			) {
+				agent.releasePreparedContinuation(preparation);
+				manager.appendContextRolloverDispatch({
+					dispatchId: record.dispatchId,
+					rolloverId,
+					state: "blocked",
+					requestFingerprint: record.preparedRequestFingerprint,
+					reason: "post_commit_mismatch",
+				});
+				return block("post_commit_mismatch");
+			}
+			return await this.dispatch(record, preparation);
+		}
+		return block("source_changed");
+	}
+	private async dispatch(
+		record: Omit<ContextRolloverEntry, "type" | "id" | "parentId" | "timestamp">,
+		preparation: PreparedContinuation,
+	): Promise<ContextRolloverOutcome> {
+		const { agent, manager, isCancelled, pendingDeliveryIds } = this.dependencies;
+		const data = {
+			dispatchId: record.dispatchId,
+			rolloverId: record.rolloverId,
+			requestFingerprint: record.preparedRequestFingerprint,
+		};
+		if (isCancelled() || record.reservedDeliveryIds.some((id) => !pendingDeliveryIds().includes(id))) {
+			agent.releasePreparedContinuation(preparation);
+			manager.appendContextRolloverDispatch({ ...data, state: "cancelled" });
+			return { outcome: "cancelled" };
+		}
+		try {
+			manager.appendContextRolloverDispatch({
+				...data,
+				state: "started",
+				reservedDeliveryIds: record.reservedDeliveryIds,
+			});
+		} catch {
+			agent.releasePreparedContinuation(preparation);
+			return { outcome: "blocked", reason: "source_changed" };
+		}
+		return await this.runStartedDispatch(
+			record,
+			preparation.preparationId,
+			async () => await agent.dispatchPreparedContinuation(preparation),
+		);
+	}
+	private async runStartedDispatch(
+		record: Omit<ContextRolloverEntry, "type" | "id" | "parentId" | "timestamp">,
+		preparationId: string | undefined,
+		run: () => Promise<void>,
+	): Promise<ContextRolloverOutcome> {
+		const { agent, manager, onDispatch, onTrace } = this.dependencies;
+		const data = {
+			dispatchId: record.dispatchId,
+			rolloverId: record.rolloverId,
+			requestFingerprint: record.preparedRequestFingerprint,
+		};
+		const trace = {
+			rolloverId: record.rolloverId,
+			windowId: record.windowId,
+			cause: record.cause,
+			dispatchId: record.dispatchId,
+			promptGeneration: record.promptGeneration,
+			sourceContextEpoch: record.sourceContextEpoch,
+			targetContextEpoch: record.targetContextEpoch,
+			phase: "dispatch" as const,
+		};
+		onDispatch(preparationId);
+		onTrace({ ...trace, outcome: "started" });
+		try {
+			await run();
+			const state = agent.state.runState;
+			const outcome = state.status === "idle" ? state.lastOutcome?.type : undefined;
+			const failureMessage =
+				state.status === "idle" && state.lastOutcome?.type === "failed" ? state.lastOutcome.message : undefined;
+			const last = agent.state.messages.at(-1);
+			const rejected =
+				last?.role === "assistant" &&
+				last.stopReason === "error" &&
+				last.content.every((block) => block.type !== "toolCall") &&
+				isContextOverflow(last, agent.state.model.contextWindow);
+			if (outcome === "failed" && !rejected && !failureMessage?.startsWith("recovery_")) {
+				onTrace({ ...trace, outcome: "outcome_unknown", reasonCode: "dispatch_outcome_unknown" });
+				return { outcome: "blocked", reason: "dispatch_outcome_unknown" };
+			}
+			manager.appendContextRolloverDispatch({
+				...data,
+				state: "finished",
+				outcome: rejected
+					? "context_limit"
+					: outcome === "context_limit" ||
+							outcome === "context_transition" ||
+							outcome === "aborted" ||
+							outcome === "failed"
+						? outcome
+						: "completed",
+			});
+			onTrace({ ...trace, outcome: "finished" });
+			return { outcome: "dispatched" };
+		} finally {
+			onDispatch(undefined);
+		}
+	}
+	async resumeInterrupted(
+		record: ContextRolloverEntry,
+		options: { continueRun: boolean; recovering: boolean },
+	): Promise<ContextRolloverOutcome> {
+		const { agent, manager, isBusy, isCancelled, onTrace } = this.dependencies;
+		const data = {
+			dispatchId: record.dispatchId,
+			rolloverId: record.rolloverId,
+			requestFingerprint: record.preparedRequestFingerprint,
+		};
+		if (isCancelled()) return { outcome: "cancelled" };
+		if (isBusy()) return { outcome: "blocked", reason: "operation_in_flight" };
+		if (!options.continueRun) {
+			manager.appendContextRolloverDispatch({ ...data, state: "finished", outcome: "completed" });
+			onTrace({
+				rolloverId: record.rolloverId,
+				windowId: record.windowId,
+				cause: record.cause,
+				dispatchId: record.dispatchId,
+				promptGeneration: record.promptGeneration,
+				sourceContextEpoch: record.sourceContextEpoch,
+				targetContextEpoch: record.targetContextEpoch,
+				phase: "dispatch",
+				outcome: "finished",
+			});
+			return { outcome: "dispatched" };
+		}
+		manager.appendContextRolloverDispatch({ ...data, state: "started", reservedDeliveryIds: [] });
+		return await this.runStartedDispatch(record, undefined, async () => {
+			await agent.continue(
+				options.recovering
+					? {
+							toolNames: RECOVERY_TOOL_NAMES,
+							maxTokens: Math.min(RECOVERY_OUTPUT_TOKENS, agent.state.model.maxTokens),
+						}
+					: {},
+			);
+		});
+	}
+	async resume(): Promise<ContextRolloverOutcome | undefined> {
+		const { agent, manager } = this.dependencies;
+		const state = manager.getContextRolloverState();
+		if (state.dispatchState === "outcome_unknown") return { outcome: "blocked", reason: "dispatch_outcome_unknown" };
+		if (state.dispatchState !== "prepared") return undefined;
+		const record = manager
+			.getBranch()
+			.reverse()
+			.find((entry) => entry.type === "context_rollover" && entry.rolloverId === state.rolloverId);
+		if (record?.type !== "context_rollover") return undefined;
+		if (this.dependencies.isBusy()) return { outcome: "blocked", reason: "operation_in_flight" };
+		if (
+			!this.dependencies.canRecover() ||
+			record.dispatchId !== createContextRolloverDispatchId(record.rolloverId, record.preparedRequestFingerprint)
+		)
+			return { outcome: "blocked", reason: "dispatch_prepare_mismatch" };
+		let preparation: PreparedContinuation;
+		try {
+			preparation = await agent.prepareContinuation(manager.buildSessionContext().messages, {
+				requiredQueueItemIds: record.reservedDeliveryIds,
+				toolNames: RECOVERY_TOOL_NAMES,
+				maxTokens: Math.min(RECOVERY_OUTPUT_TOKENS, agent.state.model.maxTokens),
+			});
+		} catch {
+			return { outcome: "blocked", reason: "dispatch_prepare_mismatch" };
+		}
+		if (
+			preparation.requestFingerprint !== record.preparedRequestFingerprint ||
+			preparation.baseContextFingerprint !== record.preparationBaseFingerprint ||
+			preparation.budget.tokens !== record.preparedTokens ||
+			JSON.stringify(preparation.reservedQueueItemIds) !== JSON.stringify(record.reservedDeliveryIds)
+		) {
+			agent.releasePreparedContinuation(preparation);
+			manager.appendContextRolloverDispatch({
+				dispatchId: record.dispatchId,
+				rolloverId: record.rolloverId,
+				requestFingerprint: record.preparedRequestFingerprint,
+				state: "blocked",
+				reason: "dispatch_prepare_mismatch",
+			});
+			return { outcome: "blocked", reason: "dispatch_prepare_mismatch" };
+		}
+		return await this.dispatch(record, preparation);
+	}
 }

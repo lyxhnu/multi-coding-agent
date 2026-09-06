@@ -32,7 +32,16 @@ describe("createAgentSession session manager defaults", () => {
 		const { session } = await createAgentSession({ cwd, agentDir, model: model! });
 		const active = session.getActiveToolNames();
 
-		expect(active).toEqual(["read", "bash", "edit", "write", "history_get", "context_note"]);
+		expect(active).toEqual([
+			"read",
+			"bash",
+			"edit",
+			"write",
+			"history",
+			"context_note",
+			"get_context_remaining",
+			"new_context",
+		]);
 		await session.dispose();
 	});
 
